@@ -82,8 +82,9 @@ from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_strin
 from crdt_cad.geometry.constraints import Constraint, Sketch
 from crdt_cad.geometry.mesh_validity import check_mesh_validity
 from crdt_cad.geometry.validity import GeometryError, validate_new_point
-from crdt_cad.persistence.store import DocumentStore, SQLiteStore
+from crdt_cad.persistence.store import DocumentStore, PostgresStore, SQLiteStore
 from crdt_cad.server import metrics
+from crdt_cad.server import pubsub
 from crdt_cad.server import security
 
 logger = logging.getLogger("crdt_cad.server")
@@ -100,8 +101,19 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # explicitly where the demo assets were placed (the Dockerfile sets it).
 DEMO_STATIC_DIR = Path(os.environ.get("CRDT_CAD_STATIC_DIR", str(REPO_ROOT / "demo" / "static")))
 DB_PATH = os.environ.get("CRDT_CAD_DB_PATH", str(REPO_ROOT / "data" / "crdt_cad.db"))
+DATABASE_URL = os.environ.get("CRDT_CAD_DATABASE_URL")
 
-store: DocumentStore = SQLiteStore(DB_PATH)
+# CRDT_CAD_DATABASE_URL opts into Postgres -- the one persistence backend
+# that lets more than one server *process* share room state (see
+# PostgresStore's docstring). Unset (the default), every room lives in
+# the per-process SQLite file at DB_PATH, same as before this existed.
+store: DocumentStore = PostgresStore(DATABASE_URL) if DATABASE_URL else SQLiteStore(DB_PATH)
+
+# CRDT_CAD_REDIS_URL opts into cross-process broadcast fan-out (see
+# pubsub.py) -- the other half of true horizontal scaling alongside
+# PostgresStore above. Unset (the default), this is None and
+# Room.broadcast never touches Redis at all.
+redis_client = pubsub.create_redis_client()
 
 
 class Room:
@@ -119,12 +131,21 @@ class Room:
         doc_class,
         op_from_dict: Callable[[dict], object],
         store: DocumentStore,
+        redis_client=None,
+        _origin: str | None = None,
     ) -> None:
         self.room_id = room_id
         self.kind = kind
         self.doc_class = doc_class
         self.op_from_dict = op_from_dict
         self.store = store
+        self.redis_client = redis_client
+        # Real usage always defaults to the process-wide pubsub.PROCESS_ID.
+        # The override exists solely so a single-process test can
+        # construct two Room instances that behave, for fan-out purposes,
+        # like they belong to two different server processes sharing one
+        # Redis -- see tests/test_redis_fanout.py.
+        self._origin = _origin or pubsub.PROCESS_ID
         self.clock = LamportClock(actor=f"__server__:{kind}:{room_id}")
 
         persisted = store.load(kind, room_id)
@@ -136,6 +157,7 @@ class Room:
 
         self.clients: dict[str, WebSocket] = {}
         self._snapshot_task: asyncio.Task | None = None
+        self._redis_task: asyncio.Task | None = None
         self._dirty_since_snapshot = False
         self.ops_rate_limiter = security.new_room_ops_bucket()
 
@@ -193,7 +215,25 @@ class Room:
     def snapshot_message(self) -> dict:
         return {"type": "snapshot", "doc": self.doc.to_dict(), "frontier": self.doc.frontier().to_dict()}
 
+    def _redis_channel(self) -> str:
+        return f"room:{self.kind}:{self.room_id}"
+
     async def broadcast(self, message: dict, exclude: str | None = None) -> None:
+        """Delivers `message` to every client on *this* process, and --
+        if Redis fan-out is configured -- publishes it so every other
+        process subscribed to this room's channel relays it to their own
+        local clients too. `exclude` only makes sense locally (a given
+        actor's WebSocket lives on exactly one process at a time), so it
+        isn't part of the published envelope."""
+        await self._deliver_local(message, exclude)
+        if self.redis_client is not None:
+            envelope = json.dumps({"origin": self._origin, "message": message})
+            try:
+                await self.redis_client.publish(self._redis_channel(), envelope)
+            except Exception:
+                logger.exception("room %s/%s: failed to publish to redis", self.kind, self.room_id)
+
+    async def _deliver_local(self, message: dict, exclude: str | None = None) -> None:
         dead = []
         for actor, ws in list(self.clients.items()):
             if actor == exclude:
@@ -204,6 +244,64 @@ class Room:
                 dead.append(actor)
         for actor in dead:
             self.clients.pop(actor, None)
+
+    def start_redis_relay_loop(self) -> None:
+        if self.redis_client is None:
+            return
+        if self._redis_task is None or self._redis_task.done():
+            self._redis_task = asyncio.create_task(self._redis_relay_loop())
+
+    async def _redis_relay_loop(self) -> None:
+        """Subscribes to this room's Redis channel and relays anything
+        published by *other* processes to this process's local clients.
+        Messages this same process published are recognized via
+        `pubsub.PROCESS_ID` and skipped -- `broadcast` already delivered
+        them locally, so relaying them again would double-deliver every
+        locally-originated op to this process's own clients. Lives only
+        as long as the room has local clients, same as `_snapshot_loop`,
+        so an idle room's Redis subscription doesn't linger forever.
+
+        Critically, an incoming `"ops"` message isn't *just* forwarded to
+        local WebSocket clients -- it's also applied to *this* process's
+        own `self.doc`. Skipping that would leave this process's
+        server-side document silently stale: any new client that joins
+        this process afterwards would get a snapshot missing the other
+        process's edits, and this process's own next periodic/explicit
+        persist would write that stale state back to the shared store,
+        clobbering the newer data the other process already saved. This
+        exact gap was caught live (not by a unit test) via a real
+        two-process verification run -- see the Redis fan-out section
+        in the README."""
+        conn = self.redis_client.pubsub()
+        channel = self._redis_channel()
+        await conn.subscribe(channel)
+        try:
+            while self.clients:
+                raw = await conn.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if raw is None:
+                    continue
+                try:
+                    envelope = json.loads(raw["data"])
+                except (TypeError, ValueError):
+                    continue
+                if envelope.get("origin") == self._origin:
+                    continue
+                message = envelope["message"]
+                if message.get("type") == "ops":
+                    touched_topology = False
+                    for op_dict in message["ops"]:
+                        op = self.op_from_dict(op_dict)
+                        self.doc.apply(op)
+                        touched_topology = touched_topology or _touches_mesh_topology(op)
+                    self.mark_dirty()
+                    await self.persist_async()
+                    await _check_and_broadcast_mesh_validity(self, touched_topology)
+                await self._deliver_local(message)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await conn.unsubscribe(channel)
+            await conn.aclose()
 
     async def commit_ops_batched(self, ops: list, actor: str, batch_size: int = 150) -> int:
         """Applies and broadcasts a (potentially large) list of
@@ -245,11 +343,13 @@ class RoomManager:
         doc_class,
         op_from_dict: Callable[[dict], object],
         store: DocumentStore,
+        redis_client=None,
     ) -> None:
         self.kind = kind
         self.doc_class = doc_class
         self.op_from_dict = op_from_dict
         self.store = store
+        self.redis_client = redis_client
         self.rooms: dict[str, Room] = {}
         self._lock = asyncio.Lock()
 
@@ -261,7 +361,7 @@ class RoomManager:
                     raise security.RoomLimitExceeded(
                         f"server room limit reached ({security.max_rooms_per_server()})"
                     )
-                room = Room(room_id, self.kind, self.doc_class, self.op_from_dict, self.store)
+                room = Room(room_id, self.kind, self.doc_class, self.op_from_dict, self.store, self.redis_client)
                 self.rooms[room_id] = room
             return room
 
@@ -269,8 +369,8 @@ class RoomManager:
         return sum(len(r.clients) for r in self.rooms.values())
 
 
-drawing_room_manager = RoomManager("drawing", DrawingDocument, DocOp.from_dict, store)
-mesh_room_manager = RoomManager("mesh", MeshCRDT, MeshOp.from_dict, store)
+drawing_room_manager = RoomManager("drawing", DrawingDocument, DocOp.from_dict, store, redis_client)
+mesh_room_manager = RoomManager("mesh", MeshCRDT, MeshOp.from_dict, store, redis_client)
 room_manager = drawing_room_manager  # backwards-compatible alias
 
 app = FastAPI(title="crdt-cad collaboration server")
@@ -695,6 +795,7 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
     actor = str(hello["actor"])
     room.clients[actor] = websocket
     room.start_snapshot_loop()
+    room.start_redis_relay_loop()
     metrics.connections_total.inc()
     logger.info("room %s/%s: actor %s connected (%d clients)", room.kind, room_id, actor, len(room.clients))
 

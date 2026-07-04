@@ -36,7 +36,7 @@ over gaps.
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
 | Bounded periodic self-heal traffic (frontier ping, not a full snapshot) | **Done** -- O(actor count), not O(document size), see below |
 | Security hardening (opt-in room tokens, CORS lockdown, rate limits, resource ceilings) | **Done** -- off/wide-open by default, see below |
-| Durable persistence (SQLite snapshots, survives restart) | **Done** |
+| Durable persistence (SQLite snapshots, survives restart) | **Done**; optional `PostgresStore` for multi-process sharing, see below |
 | Save / download (JSON, SVG, DXF for 2D; JSON, STL for 3D) | **Done** |
 | Import (SVG, DXF reference geometry) | **Done** (straight-segment subset -- see below) |
 | WebRTC P2P direct sync, WS-relayed signaling, relay fallback | **Done**, verified with a real two-tab RTCPeerConnection/DataChannel |
@@ -48,7 +48,7 @@ over gaps.
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP/IGES import/export (`pythonOCC`) | **Not built** -- no usable PyPI wheel (conda-only in practice); see below |
-| True horizontal scaling of room state (multi-pod) | **Not built** -- room state is in-process per pod today; needs a shared broker (Redis/Kafka) -- see `k8s/README.md` |
+| True horizontal scaling of room state (multi-pod) | **Done** -- optional `PostgresStore` + Redis pub/sub fan-out, opt-in via env vars, live-verified with two real server processes -- see below and `k8s/README.md` |
 | Pyodide/WASM client-side engine | **Not built** -- deliberate; see rationale below |
 
 ## Quickstart
@@ -309,18 +309,80 @@ client-side prediction is authoritative.
 
 ## Persistence (`src/crdt_cad/persistence/`)
 
-`DocumentStore` is a three-method interface (`save`/`load`/`list_rooms`)
-implemented today by `SQLiteStore` -- one row per `(room kind, room id)`
-holding the latest MessagePack snapshot. Rooms hydrate from their last
+`DocumentStore` is a four-method interface (`save`/`load`/`list_rooms`/
+`delete`) implemented by `SQLiteStore` -- one row per `(room kind, room
+id)` holding the latest MessagePack snapshot, zero required
+infrastructure to run this locally. Rooms hydrate from their last
 snapshot when a server (re)starts, and every accepted ops batch triggers
 an (awaited, not fire-and-forget -- see the note in `Room.persist_async`
 about why that distinction mattered) persist. A client can also force
 one via the **Save** button (`{"type": "save"}` -> `{"type": "saved", ...}`).
 
-The brief asks for "PostgreSQL (JSONB) or an append-only event log";
-SQLite was chosen for zero required infrastructure to run this locally.
-Swapping in Postgres is implementing the same `DocumentStore` interface
-against `asyncpg`/JSONB -- nothing above that layer changes.
+### Horizontal scaling seam: `PostgresStore` + Redis pub/sub
+
+The brief asks for "PostgreSQL (JSONB) or an append-only event log" and a
+pub/sub broker for room broadcast -- the two things that let more than one
+server *process* (several k8s replicas behind one Service, say) share the
+same room state, which `SQLiteStore` and single-process `Room.broadcast`
+fundamentally can't do. Both are now real and opt-in via environment
+variable; unset either one and behavior is exactly what it was before
+this existed.
+
+**`PostgresStore`** (set `CRDT_CAD_DATABASE_URL`) implements the same
+`DocumentStore` interface against a real Postgres table (`BYTEA` snapshot
+column) via `asyncpg`. `asyncpg` is async-only; the interface above it is
+synchronous by design (so `Room`/`RoomManager`/the REST routes don't need
+to change or even know which backend is active), so `PostgresStore`
+bridges the two with a dedicated background thread running its own event
+loop, forwarding every call through `asyncio.run_coroutine_threadsafe(...)
+.result()`. That blocks the calling thread until the query completes --
+the same trade-off `SQLiteStore` already makes (a blocking call during
+room hydration and every persist), just against a network round-trip
+instead of local disk. `asyncpg` is intentionally not a core dependency
+(install with `pip install crdt-cad[postgres]`) -- the zero-config local
+demo has no reason to pull in a Postgres driver it will never use, same
+reasoning `pymeshlab` already gets.
+
+**Redis pub/sub fan-out** (set `CRDT_CAD_REDIS_URL`) fills the other gap:
+even with Postgres, a client connected to process A would never see a
+process B client's edits, because `Room.broadcast()` only iterated its
+own process's local `self.clients`. Now, `broadcast()` also publishes to
+`room:{kind}:{room_id}`; every process's `Room` for that same room
+subscribes to that channel and, on receiving another process's publish,
+both applies the ops to its *own* `self.doc` (not just forwards the raw
+message to its local clients -- more on why that distinction matters
+below) and relays them locally. Each process tags its own publishes with
+a process-unique id so its own relay loop recognizes and skips messages
+it already delivered directly, instead of double-delivering every
+locally-originated op to its own clients. `redis-py` is likewise not a
+core dependency (`pip install crdt-cad[redis]`).
+
+**A real bug this caught, not a hypothetical:** the first version of the
+Redis relay only forwarded the raw WebSocket message to local clients,
+without applying the ops to the *receiving* process's own `self.doc`.
+Verified purely with the mocked-Room unit tests, that looked fine.
+Verified live -- two genuinely separate `uvicorn` processes, a real
+Postgres, a real Redis, and a real WebSocket client on each -- it broke
+immediately: a *new* client connecting to process B after process A's
+edit got a stale snapshot, because process B's server-side document had
+never actually changed. Fixed by having the relay loop apply incoming ops
+to its own document (and persist, and re-run the mesh validity check)
+before relaying, exactly like `_handle_message` does for ops arriving
+directly over a client's own WebSocket. This is the concrete reason this
+project insists on live verification beyond unit tests for anything
+crossing a real process/network boundary, not just anything
+browser-facing.
+
+Live-verified end to end (see `tests/test_postgres_store.py` and
+`tests/test_redis_fanout.py` for the committed, skip-if-unavailable unit
+suite, and the design note above for the two-process run that caught the
+bug): two real `uvicorn` processes on different ports, both pointed at
+one Postgres and one Redis container, each driven by its own raw
+WebSocket client. An edit sent to process A's client arrived at process
+B's client via Redis; a fresh third connection to process B afterward
+correctly saw the data process A had persisted to the shared Postgres
+store. See `k8s/README.md` for what this means for the included
+Kubernetes manifests and exactly what was/wasn't validated there.
 
 ## Import / export (`src/crdt_cad/export/`)
 
@@ -649,7 +711,7 @@ conflict-free way a vertex move does.
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-218 tests: unit tests per CRDT type and geometry module, serialization
+227 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -683,7 +745,17 @@ back a collaborator's simultaneous, unrelated vertex move. Also
 `check_mesh_validity` problem class in isolation, a real concurrent
 two-replica merge reproducing the "Extrusion Nightmare" end to end, and
 the server-side `validity_warning` broadcast actually firing (or, for a
-pure vertex move, correctly *not* firing) over a real WebSocket.
+pure vertex move, correctly *not* firing) over a real WebSocket. Also
+`tests/test_postgres_store.py` (7 tests) and `tests/test_redis_fanout.py`
+(2 tests): both skip cleanly (a fast, sub-second TCP reachability probe,
+not a slow per-test connection-failure retry) if no local Postgres/Redis
+is reachable, so a plain `pytest tests/` from a fresh checkout never
+needs either -- point `CRDT_CAD_TEST_DATABASE_URL`/
+`CRDT_CAD_TEST_REDIS_URL` at real ones (e.g. via `docker run`) to
+actually exercise save/load/list/delete round-trips, two `PostgresStore`
+instances sharing state against the same DSN, and two `Room` instances
+(standing in for two processes) actually relaying and applying each
+other's ops through a real Redis.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -706,13 +778,19 @@ undo); the "Extrusion Nightmare" validity warning end-to-end (tab A
 extrudes a face, tab B deletes one of that face's shared boundary
 vertices, both tabs render the red outline and a banner naming the
 exact face and problem, and dismissing it on one tab clears only that
-tab's outline); and the Docker image built, run, and checked for
-persistence-across-container-restart. Real bugs were caught this way
-that no unit test had covered (a fire-and-forget background task that
-hung the process at exit, "offline" not tearing down an already-open
-P2P channel, and a URL-token re-prompt loop where a proven-bad token
-never actually left the address bar) -- all fixed and specifically
-regression-tested.
+tab's outline); the Docker image built, run, and checked for
+persistence-across-container-restart; and the horizontal scaling seam
+(two real `uvicorn` processes, a real Postgres, a real Redis, one raw
+WebSocket client per process) with a genuine op sent to process A
+arriving at process B and a fresh connection to process B afterward
+correctly seeing what process A had persisted. Real bugs were caught
+this way that no unit test had covered (a fire-and-forget background
+task that hung the process at exit, "offline" not tearing down an
+already-open P2P channel, a URL-token re-prompt loop where a proven-bad
+token never actually left the address bar, and the Redis relay loop
+initially forwarding an incoming op to local clients without ever
+applying it to the receiving process's own document -- see "Horizontal
+scaling seam" above) -- all fixed and specifically regression-tested.
 
 A third, more interesting one turned up while browser-verifying the
 face color/material editor: `LocalClock` (`common.js`, shared by both
@@ -770,10 +848,13 @@ named volume.
 **Kubernetes**: manifests exist under `k8s/` (`kubectl kustomize k8s/`
 builds cleanly) but were **not applied to a live cluster** -- none was
 reachable in the environment they were written in. Read `k8s/README.md`
-before touching `replicas` or `hpa.yaml`: room state and the SQLite file
-both currently live on one pod, so scaling past 1 replica today would
-silently split users across pods that can't see each other, not
-actually scale anything.
+before touching `replicas` or `hpa.yaml`: the *default* configuration
+(SQLite, no Redis) still keeps room state on one pod, so scaling past 1
+replica in that configuration would silently split users across pods
+that can't see each other, not actually scale anything. `PostgresStore` +
+Redis pub/sub (see "Horizontal scaling seam" above) now make replicas > 1
+legitimate once both are configured -- `k8s/README.md` has the exact
+steps and what was/wasn't live-verified.
 
 **Metrics**: `/metrics` is real `prometheus_client` output (connection
 counts, ops relayed, geometry rejections, merge-apply latency), so a
@@ -877,11 +958,16 @@ building this round -- and is called out in Roadmap below.
 1. **STEP/IGES export** -- blocked on a B-Rep representation in
    `MeshCRDT` and a usable `pythonOCC` install path; see the Import/export
    section above.
-2. **Shared room-state broker for true horizontal scaling** -- Redis
-   pub/sub or the Kafka event log the brief mentions, so `Room.broadcast()`
-   reaches clients connected to *other* pods. Today's persistence layer
-   (SQLite snapshots) is fine as-is or swappable to Postgres
-   independently of this.
+2. ~~**Shared room-state broker for true horizontal scaling**~~ --
+   **Done.** `PostgresStore` (shared persistence) and Redis pub/sub
+   (`Room.broadcast()` now reaches clients connected to *other*
+   processes) are both real, opt-in, and live-verified with two actual
+   server processes -- see "Horizontal scaling seam" in the Persistence
+   section above. What's still open: applying any of this to a real
+   Kubernetes cluster (`k8s/README.md`'s manifests remain unvalidated
+   against a live cluster, same caveat as before), and a Kafka-style
+   event log was not built (Redis pub/sub satisfies the same requirement
+   the brief poses it as an alternative for).
 3. **Interactive constraint-assignment sketch UI** -- the solver and its
    `/api/solve` endpoint are real and tested; a UI for "select two
    existing path endpoints, click 'make parallel'" on top of the

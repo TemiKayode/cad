@@ -1,8 +1,9 @@
 # NOT part of the default `kubectl apply -k k8s/` set (see kustomization.yaml
-# and k8s/README.md) -- applying this against today's single-process room
-# state / SQLite store would partition users across pods that can't see
-# each other. Apply manually only after moving to a shared persistence
-# backend and a pub/sub broker for room broadcast.
+# and k8s/README.md) -- applying this against the default single-process
+# config (SQLite store, no Redis) would partition users across pods that
+# can't see each other. Apply manually only once CRDT_CAD_DATABASE_URL and
+# CRDT_CAD_REDIS_URL are both set on the Deployment (see deployment.yaml's
+# commented-out env entries and k8s/README.md's "Scaling to replicas > 1").
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

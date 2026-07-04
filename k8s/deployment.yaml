@@ -5,11 +5,16 @@ metadata:
   labels:
     app: crdt-cad
 spec:
-  # Keep this at 1 until room state and SQLite are backed by something
-  # shared across pods (Postgres + a pub/sub broker) -- see k8s/README.md.
+  # Safe default: replicas: 1, local SQLite file, no shared broker -- this
+  # is the zero-config path and always works. Bumping replicas > 1 is only
+  # correct once CRDT_CAD_DATABASE_URL and CRDT_CAD_REDIS_URL are both set
+  # below (uncomment the env entries and the `replicas`/`strategy` lines
+  # further down) -- see k8s/README.md for exactly what each one buys you
+  # and what was/wasn't live-verified.
   replicas: 1
   strategy:
     type: Recreate  # avoids two pods briefly both holding the SQLite file
+    # type: RollingUpdate  # safe instead, once Postgres+Redis are configured
   selector:
     matchLabels:
       app: crdt-cad
@@ -28,6 +33,16 @@ spec:
           env:
             - name: CRDT_CAD_DB_PATH
               value: /data/crdt_cad.db
+            # Uncomment both of these (and remove CRDT_CAD_DB_PATH above,
+            # and the PVC/volumeMount below) to run replicas > 1 -- see
+            # k8s/README.md's "Scaling to replicas > 1" section.
+            # - name: CRDT_CAD_DATABASE_URL
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: crdt-cad-database
+            #       key: url
+            # - name: CRDT_CAD_REDIS_URL
+            #   value: redis://crdt-cad-redis:6379/0
           resources:
             requests:
               cpu: 100m
