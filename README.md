@@ -33,6 +33,7 @@ over gaps.
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
+| Bounded periodic self-heal traffic (frontier ping, not a full snapshot) | **Done** -- O(actor count), not O(document size), see below |
 | Security hardening (opt-in room tokens, CORS lockdown, rate limits, resource ceilings) | **Done** -- off/wide-open by default, see below |
 | Durable persistence (SQLite snapshots, survives restart) | **Done** |
 | Save / download (JSON, SVG, DXF for 2D; JSON, STL for 3D) | **Done** |
@@ -57,7 +58,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 199 tests, ~8s
+./.venv/Scripts/python -m pytest tests/ -v   # 203 tests, ~8s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -477,19 +478,51 @@ One FastAPI WebSocket room per document (`/ws/{room_id}` for 2D,
 
 ```
 client -> server   {"type": "hello", "actor": "<id>", "token": "<signed token>" | null, "known_frontier": {...} | null}
-server -> client   {"type": "snapshot", "doc": {...}, "frontier": {...}}   # new client
-server -> client   {"type": "delta", "ops": [...], "frontier": {...}}     # reconnecting client
+server -> client   {"type": "snapshot", "doc": {...}, "frontier": {...}}   # new client, or resync last resort
+server -> client   {"type": "delta", "ops": [...], "frontier": {...}}     # reconnect, or resync catch-up
 either direction    {"type": "ops", "ops": [...], "from": "<actor id>"}    # live broadcast
 either direction    {"type": "signal", "to": "<actor>", "data": {...}}     # WebRTC signaling relay
 client -> server    {"type": "save"}               -> {"type": "saved", "at": <unix time>}
 server -> client     {"type": "rejected", "reason": "...", "op": {...}}    # geometry validity gate, malformed op, or rate limit refused this op
+server -> client     {"type": "frontier", "frontier": {...}}              # lightweight periodic self-heal ping
+client -> server      {"type": "resync", "known_frontier": {...} | null}  # "catch me up" -- see below
 ```
 
-The server also re-broadcasts a full snapshot to every client in a room
-every 30s, so a late joiner or a client that missed something for any
-reason self-heals. The server is a **relay with one pre-commit gate**,
+The server also broadcasts a lightweight `frontier` ping to every client
+in a room every `CRDT_CAD_SNAPSHOT_INTERVAL_SECONDS` (default 30s, only
+when something changed since the last one), so a late joiner or a client
+that missed something for any reason self-heals -- see "Snapshot ->
+frontier ping" below for why this used to be a full document snapshot
+and no longer is. The server is a **relay with one pre-commit gate**,
 not an OT-style authority: it never rewrites or reorders client ops
 (the validity gate only *rejects*, never modifies).
+
+### Snapshot -> frontier ping (bounded periodic traffic)
+
+The periodic self-heal broadcast used to be a full `{"type": "snapshot",
+"doc": {...}}` -- correct, but O(document size) x O(connected clients)
+of traffic every interval, for *every* room, regardless of whether
+anything was actually missed. It's now a `{"type": "frontier", ...}`
+ping carrying just the room's current `VectorClock` -- O(actor count),
+not O(document size). Each client compares it against its own recorded
+frontier (`FrontierTracker.isBehind()` in `common.js`) and only asks for
+a real catch-up -- a `{"type": "resync", "known_frontier": {...} |
+null}` request -- on an actual mismatch; the server replies with a
+`delta` (via the same `ops_since()` used for reconnects) or, if the
+client has no recorded frontier at all yet, a full `snapshot` as the
+response of last resort. A resync's `delta` reply flows through the
+exact same client-side handling a reconnect delta does, Time-Travel
+Merge preview included -- an already-online client's outbox is normally
+empty, so in the common case it's just applied directly; the merge
+preview only appears in the same rare case it always did.
+
+Tested server-side (`tests/test_frontier_resync.py`): a quiescent room
+sends nothing on its periodic tick; a dirty room's tick is a `frontier`
+ping, never a `doc`; and a client that missed a live broadcast (a
+network blip is simulated by briefly removing it from the room's
+in-memory client list while another actor edits, then "reconnecting"
+it) receives the next `frontier` ping and correctly self-heals via
+`resync` -> `delta`, converging without ever needing a full snapshot.
 
 ## Security hardening (`src/crdt_cad/server/security.py`)
 
@@ -590,7 +623,7 @@ conflict-free way a vertex move does.
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-199 tests: unit tests per CRDT type and geometry module, serialization
+203 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL

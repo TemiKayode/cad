@@ -149,6 +149,15 @@ class FrontierTracker {
       }
     }
   }
+  /** True if `otherDict` (typically a server-broadcast frontier) has any
+   * actor/counter pair this tracker hasn't caught up to yet -- i.e. there's
+   * something out there this replica hasn't seen. */
+  isBehind(otherDict) {
+    for (const [actor, counter] of Object.entries(otherDict || {})) {
+      if (!this.counters[actor] || this.counters[actor] < counter) return true;
+    }
+    return false;
+  }
   toDict() {
     return { ...this.counters };
   }
@@ -374,6 +383,20 @@ class RelayConnection {
     } else if (msg.type === "ops") {
       for (const op of msg.ops) this._recordOpFrontier(op);
       this.onOps(msg.ops, msg.from);
+    } else if (msg.type === "frontier") {
+      // The lightweight periodic ping (see Room._snapshot_loop): if it's
+      // ahead of what this replica has recorded, ask for a catch-up.
+      // Reuses the exact same "resync" -> "delta"/"snapshot" round trip a
+      // reconnect already uses, so it's handled by the branches above with
+      // no special-casing -- an online client's outbox is normally empty,
+      // so this never triggers a Time-Travel Merge preview in the common
+      // case, only in the (correct) rare one where it isn't.
+      if (this.frontier.isBehind(msg.frontier) && this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: "resync",
+          known_frontier: Object.keys(this.frontier.counters).length ? this.frontier.toDict() : null,
+        }));
+      }
     } else if (msg.type === "rejected") {
       this.onRejected(msg.reason, msg.op);
     } else if (msg.type === "signal") {

@@ -34,10 +34,21 @@ Either direction, at any time afterwards::
     {"type": "rejected", "reason": "...", "op": {...}}              # server ->
         client only: a submitted op failed the geometry validity gate
         (see ``_validate_op``) and was not applied or relayed.
+    {"type": "frontier", "frontier": {...}}                         # server ->
+        client only: a lightweight periodic ping (see below) -- not a
+        request, just the room's current VectorClock.
+    {"type": "resync", "known_frontier": {...} | null}              # client ->
+        server only: "catch me up" after noticing a "frontier" ping ahead
+        of what this client has recorded. Server replies with a "delta"
+        (known_frontier given) or a full "snapshot" (null -- the response
+        of last resort, meaning this client never got an initial one).
 
-The server also re-broadcasts a full ``snapshot`` to every client in a
-room on a fixed interval, so a late joiner or a client that missed
-something for any reason resyncs without a special request.
+The server also broadcasts a lightweight ``frontier`` ping to every
+client in a room on a fixed interval (only when something changed since
+the last one), so a late joiner or a client that missed something for
+any reason resyncs without a special request -- but unlike a full
+``snapshot``, this periodic ping is O(actor count), not O(document
+size), regardless of how large the room's document has grown.
 
 This module is a relay, not an authority in the OT sense: it never
 rewrites or reorders client ops (aside from the pre-commit validity
@@ -77,7 +88,7 @@ from crdt_cad.server import security
 logger = logging.getLogger("crdt_cad.server")
 logging.basicConfig(level=logging.INFO)
 
-SNAPSHOT_INTERVAL_SECONDS = 30
+SNAPSHOT_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_SNAPSHOT_INTERVAL_SECONDS", "30"))
 GENERATION_TIMEOUT_SECONDS = float(os.environ.get("CRDT_CAD_GENERATION_TIMEOUT_SECONDS", "60"))
 GENERATION_OPS_BATCH_SIZE = int(os.environ.get("CRDT_CAD_GENERATION_BATCH_SIZE", "150"))
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -155,14 +166,25 @@ class Room:
                 # a late joiner already gets a fresh snapshot on connect, so
                 # this loop exists purely as a self-healing backstop for
                 # missed/reordered live ops. An idle room has nothing to
-                # heal, and a snapshot's payload size scales with the whole
-                # document, not with what changed -- worth skipping.
+                # heal, so there's nothing to send either way.
                 if self.clients and self._dirty_since_snapshot:
                     logger.info(
-                        "room %s/%s: broadcasting periodic snapshot to %d clients",
+                        "room %s/%s: broadcasting periodic frontier to %d clients",
                         self.kind, self.room_id, len(self.clients),
                     )
-                    await self.broadcast(self.snapshot_message())
+                    # A full snapshot's payload scales with the whole
+                    # document regardless of what changed -- for a
+                    # self-healing backstop that fires on a timer for every
+                    # room, that's O(doc size x clients) of traffic even
+                    # when nothing was actually missed. Broadcasting just
+                    # the current VectorClock is tiny and lets each client
+                    # compare against its own known frontier, requesting a
+                    # real delta (via the existing ops_since/"resync" path)
+                    # only on an actual mismatch. A full snapshot remains
+                    # the response of last resort -- see _handle_message's
+                    # "resync" handling for when a client asks for one
+                    # outright (no known frontier yet).
+                    await self.broadcast({"type": "frontier", "frontier": self.doc.frontier().to_dict()})
                     self._dirty_since_snapshot = False
         except asyncio.CancelledError:
             pass
@@ -764,6 +786,26 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
         ws = room.clients.get(actor)
         if ws is not None:
             await ws.send_json({"type": "saved", "at": time.time()})
+        return
+
+    if msg_type == "resync":
+        # A client that received a periodic "frontier" ping ahead of its
+        # own recorded frontier asks for a catch-up this way, reusing the
+        # exact reply shape (and client-side handling) a reconnect delta
+        # already uses. No known frontier at all -> full snapshot, the
+        # response of last resort.
+        ws = room.clients.get(actor)
+        if ws is None:
+            return
+        known_frontier = message.get("known_frontier")
+        if not known_frontier:
+            await ws.send_json(room.snapshot_message())
+            return
+        vc = VectorClock.from_dict(known_frontier)
+        delta = room.doc.ops_since(vc)
+        await ws.send_json(
+            {"type": "delta", "ops": [op.to_dict() for op in delta], "frontier": room.doc.frontier().to_dict()}
+        )
         return
 
     if msg_type != "ops":
