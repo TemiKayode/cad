@@ -32,6 +32,15 @@ const ui = {
 const undoStack = [];
 const redoStack = [];
 let pendingPolygon = [];
+// -- interactive constraint solver UI (Phase 9) -----------------------------
+// Up to 2 {pathId, nodeId, pos} entries -- see the "constrain" tool's click
+// handler and applyConstraint() below. The already-tested `/api/solve`
+// endpoint (crdt_cad.geometry.constraints) does the actual solving; this
+// is purely a client-side workflow on top of it, same as every other
+// edit here -- points move via the exact same delete+insert path_geom
+// ops any other point move would use (see movePathPoint), broadcast the
+// normal way so everyone in the room sees it.
+let constraintSelection = [];
 let lastMousePt = null;
 
 // -- wire <-> local state -----------------------------------------------------
@@ -524,6 +533,19 @@ canvas.addEventListener("click", (e) => {
       render();
       renderToolHint();
     }
+  } else if (ui.tool === "constrain") {
+    const hit = hitTestPoint(pt);
+    if (!hit) return;
+    const already = constraintSelection.findIndex((s) => s.pathId === hit.pathId && idEq(s.nodeId, hit.nodeId));
+    if (already !== -1) {
+      constraintSelection.splice(already, 1);
+    } else if (constraintSelection.length >= 2) {
+      constraintSelection = [hit];
+    } else {
+      constraintSelection.push(hit);
+    }
+    render();
+    renderConstraintPanel();
   }
 });
 
@@ -560,6 +582,149 @@ function hitTestPath(pt) {
   return best;
 }
 
+/** Finds the closest *individual point* (not segment) across every
+ * visible path, within a small pixel radius -- the constrain tool
+ * relates specific points, not whole paths. */
+function hitTestPoint(pt) {
+  let best = null, bestDist = 10;
+  for (const pathId of state.pathIndex) {
+    if (ui.hiddenLayers.has((state.pathProps.get(pathId) || {}).layer_id)) continue;
+    for (const entry of liveEntries(state.pathNodes.get(pathId))) {
+      const d = Math.hypot(pt[0] - entry.v[0], pt[1] - entry.v[1]);
+      if (d < bestDist) { bestDist = d; best = { pathId, nodeId: entry.id, pos: entry.v }; }
+    }
+  }
+  return best;
+}
+
+function livePosOf(pathId, nodeId) {
+  const entry = liveEntries(state.pathNodes.get(pathId)).find((n) => idEq(n.id, nodeId));
+  return entry ? entry.v : null;
+}
+
+/** Parallel/perpendicular constraints relate two *lines*, not two bare
+ * points -- for a point the user actually clicked, its "line" is the
+ * segment to whichever live neighbor it has (the next point if there is
+ * one, else the previous one). Returns null for a single-point path,
+ * which has no line to define. */
+function findAdjacentPoint(pathId, nodeId) {
+  const entries = liveEntries(state.pathNodes.get(pathId));
+  const idx = entries.findIndex((e) => idEq(e.id, nodeId));
+  if (idx === -1) return null;
+  if (idx + 1 < entries.length) return { pathId, nodeId: entries[idx + 1].id, pos: entries[idx + 1].v };
+  if (idx - 1 >= 0) return { pathId, nodeId: entries[idx - 1].id, pos: entries[idx - 1].v };
+  return null;
+}
+
+/** Moves an existing path point to a new position. RGA values are
+ * immutable once inserted (no in-place "set" the way MeshCRDT's vertex
+ * LWWMap has), so this is CRDT-safe delete-then-reinsert at the same
+ * slot -- the point's node id changes as a result. If a curve segment
+ * (Phase 8) was attached to the old id, it's orphaned (harmless dead
+ * weight in path_props, but the visual effect is that segment reverts
+ * to a straight line) -- an accepted trade-off for the common case this
+ * solver targets (straight-line CAD-style sketches), not attempted to
+ * be avoided here. */
+function movePathPoint(pathId, oldNodeId, newPos) {
+  const entries = liveEntries(state.pathNodes.get(pathId));
+  const idx = entries.findIndex((e) => idEq(e.id, oldNodeId));
+  if (idx === -1) return;
+  const prevId = idx > 0 ? entries[idx - 1].id : null;
+  const delOp = { target: "path_geom", scope: pathId, payload: rgaDeleteOp(oldNodeId, clock.tick()) };
+  applyOp(delOp);
+  const insOp = { target: "path_geom", scope: pathId, payload: rgaInsertOp(clock.tick(), prevId, newPos) };
+  applyOp(insOp);
+  sendOps([delOp, insOp]);
+}
+
+/** Solves the chosen constraint against the two currently-selected
+ * points (see the "constrain" tool's click handler) via the existing,
+ * already-tested `/api/solve` endpoint, then moves whichever points it
+ * returned a changed position for. Parallel/perpendicular need two
+ * *lines*, inferred from each selected point's neighbor (see
+ * findAdjacentPoint) -- coincident/fixed_distance work directly on the
+ * two selected points. */
+async function applyConstraint(kind, param) {
+  if (constraintSelection.length !== 2) return;
+  const [sel1, sel2] = constraintSelection;
+  const points = {};
+  const refs = {};
+  let pointIds;
+  if (kind === "parallel" || kind === "perpendicular") {
+    const adj1 = findAdjacentPoint(sel1.pathId, sel1.nodeId);
+    const adj2 = findAdjacentPoint(sel2.pathId, sel2.nodeId);
+    if (!adj1 || !adj2) {
+      showToast("Both selected points need a neighboring point to define a line", "error");
+      return;
+    }
+    refs.p1a = sel1; refs.p1b = adj1; refs.p2a = sel2; refs.p2b = adj2;
+    for (const [key, ref] of Object.entries(refs)) points[key] = livePosOf(ref.pathId, ref.nodeId);
+    pointIds = ["p1a", "p1b", "p2a", "p2b"];
+  } else {
+    refs.p1 = sel1; refs.p2 = sel2;
+    for (const [key, ref] of Object.entries(refs)) points[key] = livePosOf(ref.pathId, ref.nodeId);
+    pointIds = ["p1", "p2"];
+  }
+  if (Object.values(points).some((p) => !p)) {
+    showToast("A selected point no longer exists (concurrent edit) -- try again", "error");
+    constraintSelection = [];
+    renderAll();
+    return;
+  }
+
+  let resp;
+  try {
+    resp = await fetch("/api/solve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ points, constraints: [{ kind, point_ids: pointIds, param: param || 0 }] }),
+    });
+  } catch {
+    showToast("Could not reach the solver", "error");
+    return;
+  }
+  if (!resp.ok) { showToast("Solve request failed", "error"); return; }
+  const result = await resp.json();
+  if (!result.converged) {
+    showToast("Solver did not converge -- no changes applied", "error");
+    return;
+  }
+  for (const [key, ref] of Object.entries(refs)) {
+    const [nx, ny] = result.positions[key];
+    const [ox, oy] = points[key];
+    if (Math.abs(nx - ox) > 1e-6 || Math.abs(ny - oy) > 1e-6) {
+      movePathPoint(ref.pathId, ref.nodeId, [nx, ny]);
+    }
+  }
+  constraintSelection = [];
+  renderAll();
+  showToast("Constraint applied", "success");
+}
+
+function renderConstraintPanel() {
+  const panel = document.getElementById("constraintPanel");
+  if (!panel) return;
+  if (constraintSelection.length < 2) {
+    const remaining = 2 - constraintSelection.length;
+    panel.innerHTML = `<div class="empty-hint">Constrain tool: click ${remaining} more point(s) to relate them.</div>`;
+    return;
+  }
+  const [a, b] = constraintSelection;
+  const dist = Math.hypot(a.pos[0] - b.pos[0], a.pos[1] - b.pos[1]);
+  panel.innerHTML = `
+    <div class="field-row"><label>Distance</label><input id="constraintDistance" type="number" step="0.1" value="${dist.toFixed(2)}" style="width:70px"/></div>
+    <button id="constrainCoincident" style="width:100%;margin-bottom:4px">Coincident</button>
+    <button id="constrainParallel" style="width:100%;margin-bottom:4px">Parallel</button>
+    <button id="constrainPerpendicular" style="width:100%;margin-bottom:4px">Perpendicular</button>
+    <button id="constrainFixedDistance" style="width:100%">Fixed distance</button>
+  `;
+  document.getElementById("constrainCoincident").onclick = () => applyConstraint("coincident");
+  document.getElementById("constrainParallel").onclick = () => applyConstraint("parallel");
+  document.getElementById("constrainPerpendicular").onclick = () => applyConstraint("perpendicular");
+  document.getElementById("constrainFixedDistance").onclick = () =>
+    applyConstraint("fixed_distance", parseFloat(document.getElementById("constraintDistance").value) || 0);
+}
+
 function distToSegment(p, a, b) {
   const [px, py] = p, [ax, ay] = a, [bx, by] = b;
   const dx = bx - ax, dy = by - ay;
@@ -573,13 +738,17 @@ function distToSegment(p, a, b) {
 document.getElementById("toolPen").onclick = () => setTool("pen");
 document.getElementById("toolSelect").onclick = () => setTool("select");
 document.getElementById("toolPolygon").onclick = () => setTool("polygon");
+document.getElementById("toolConstrain").onclick = () => setTool("constrain");
 function setTool(tool) {
   if (ui.tool === "polygon" && tool !== "polygon") cancelPolygon();
+  if (ui.tool === "constrain" && tool !== "constrain") { constraintSelection = []; renderConstraintPanel(); }
   ui.tool = tool;
   document.getElementById("toolPen").classList.toggle("active", tool === "pen");
   document.getElementById("toolSelect").classList.toggle("active", tool === "select");
   document.getElementById("toolPolygon").classList.toggle("active", tool === "polygon");
+  document.getElementById("toolConstrain").classList.toggle("active", tool === "constrain");
   canvas.style.cursor = tool === "select" ? "default" : "crosshair";
+  render();
   renderToolHint();
 }
 
@@ -592,6 +761,8 @@ function renderToolHint() {
       : "Click to place vertices of a strict polygon. Self-intersecting or zero-length edges are rejected by the server.";
   } else if (ui.tool === "pen") {
     hint.textContent = "Drag to draw a freehand stroke.";
+  } else if (ui.tool === "constrain") {
+    hint.textContent = "Click two points (any paths) to relate them -- coincident, parallel, perpendicular, or a fixed distance apart.";
   } else {
     hint.textContent = "Click a path to select it.";
   }
@@ -675,6 +846,20 @@ function render() {
       ctx.arc(pt[0], pt[1], i === 0 ? 6 : 4, 0, Math.PI * 2);
       ctx.fillStyle = i === 0 ? "#ffd43b" : "#ffe89b";
       ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  if (ui.tool === "constrain" && constraintSelection.length) {
+    ctx.save();
+    ctx.strokeStyle = "#ffd43b";
+    ctx.lineWidth = 2;
+    for (const sel of constraintSelection) {
+      const pos = livePosOf(sel.pathId, sel.nodeId);
+      if (!pos) continue;
+      ctx.beginPath();
+      ctx.arc(pos[0], pos[1], 7, 0, Math.PI * 2);
+      ctx.stroke();
     }
     ctx.restore();
   }
@@ -810,6 +995,7 @@ function renderAll() {
   renderLayerList();
   renderPathList();
   renderSelectionPanel();
+  renderConstraintPanel();
   renderPresenceList();
 }
 

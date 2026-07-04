@@ -32,6 +32,8 @@ over gaps.
 | AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done** -- Claude Fable 5 prompt interpretation (heuristic fallback, no API key required) + deterministic procedural geometry + optional `pymeshlab` print-repair, injected as batched CRDT ops -- see below for exact scope |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
+| Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9) -- coincident/parallel/perpendicular/fixed-distance, live-verified with real point convergence, see below |
+| Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
 | Bounded periodic self-heal traffic (frontier ping, not a full snapshot) | **Done** -- O(actor count), not O(document size), see below |
@@ -44,10 +46,10 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 4 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 7 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
-| STEP/IGES import/export (`pythonOCC`) | **Not built** -- no usable PyPI wheel (conda-only in practice); see below |
+| STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
 | True horizontal scaling of room state (multi-pod) | **Done** -- optional `PostgresStore` + Redis pub/sub fan-out, opt-in via env vars, live-verified with two real server processes -- see below and `k8s/README.md` |
 | Pyodide/WASM client-side engine | **Not built** -- deliberate; see rationale below |
 
@@ -59,10 +61,19 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 203 tests, ~8s
+./.venv/Scripts/python -m pytest tests/ -v   # 260 tests, ~15s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
+
+Everything above works with zero extra configuration. A few genuinely
+optional, heavier capabilities are separate extras so the default
+install stays lean: `pip install crdt-cad[postgres]` (shared room state
+across processes), `[redis]` (cross-process broadcast fan-out), `[step]`
+(STEP export -- a large `build123d`/OpenCascade dependency tree),
+`[meshy]` (the hosted ML mesh-gen adapter's `requests` dependency, plus
+`MESHY_API_KEY` set in the environment). None of them change default
+behavior when omitted.
 
 ### Docker
 
@@ -284,9 +295,41 @@ zero": constraining only the two legs of a right triangle (via
 that can only pass if the constraint semantics mean what they claim.
 
 This is also exposed as `POST /api/solve` (stateless -- send points +
-constraints, get back solved positions), ready for a future interactive
-"select two entities, apply a constraint" sketch tool; that UI itself
-isn't built yet (see Roadmap).
+constraints, get back solved positions).
+
+### Interactive constraint UI (Phase 9)
+
+The 2D demo's **Constrain** tool is a client-side workflow on top of
+`/api/solve` -- no new server-side state or CRDT primitive. Click two
+points (any paths, same or different); the panel offers **Coincident**,
+**Parallel**, **Perpendicular**, and **Fixed distance**. Parallel/
+perpendicular relate two *lines*, not bare points, so each selected
+point's line is inferred from its live neighbor (the next point if it
+has one, else the previous one) -- `findAdjacentPoint` in `sketch.js`.
+The solved positions come back from the same tested solver; applying
+them is where it gets interesting: `path_geom` (an `RGA`) has no
+in-place "move" the way `MeshCRDT`'s vertex `LWWMap` does -- a value is
+immutable once inserted -- so `movePathPoint` moves a point via
+delete-then-reinsert at the same slot, same as `MeshCRDT` vertices
+*would* have to if they were RGA-backed too. The point's node id changes
+as a result; if a curve segment (Phase 8) was attached to the old id,
+it's orphaned (harmless dead weight in `path_props`, but that segment
+visually reverts to a straight line) -- an accepted, documented
+trade-off for the common case this solver targets (straight-line
+CAD-style sketches), not one worth solving here.
+
+Live-verified with two independently-checkable scenarios: a Coincident
+pair converging to the same position (checked via the server's own
+`/export/json`, not just visually, and confirmed synced to a second
+tab in the same room), and a Parallel pair's resulting direction
+vectors reaching a cross product of ~0. Both exercise a genuinely
+different code path (2-point vs. the 4-point/adjacent-inference
+branch), and a regression from the first attempt is worth recording:
+the first Parallel verification run used a drag gesture that
+synthesized an extra intermediate point, so "the adjacent point" wasn't
+what the test assumed -- not a solver or CRDT bug, a test-fixture
+artifact, caught by checking the actual math (cross product) rather
+than eyeballing "did the line look about right."
 
 ### Validity gate (`validity.py`)
 
@@ -433,18 +476,38 @@ Kubernetes manifests and exactly what was/wasn't validated there.
 - **STL**: ASCII export for the 3D mesh, fan-triangulated per face (same
   technique the Three.js renderer uses client-side -- correct for the
   convex/simple polygons the Face tool and Extrude produce).
-- **STEP/IGES: not built.** Both need a real B-Rep kernel
-  (`pythonOCC`), which has no usable PyPI wheel in practice (it's a
-  conda-forge package, and pulling in a conda environment just for this
-  felt like the wrong tradeoff for a pip-based project) -- and
-  `MeshCRDT` has no B-Rep representation yet for a STEP writer to
-  target regardless. The export plugin structure (`crdt_cad.export`) is
-  set up so adding one later is additive.
+- **STEP (Phase 9, re-evaluated): built.** The README used to say
+  `pythonOCC`/`cadquery` had no usable PyPI wheel and was conda-only in
+  practice -- re-checked rather than left as a stale assumption, and it
+  turns out `build123d` (which pulls in `cadquery-ocp-novtk`, a real
+  wheel) installs and works fine via `pip install crdt-cad[step]` in
+  this environment (Windows, Python 3.14), confirmed by actually
+  building and exporting a real STEP (AP214) file, not assumed.
+  `crdt_cad.export.step_export.mesh_to_step_bytes` turns each
+  `MeshCRDT` face loop into one planar `Face`; nothing in this project
+  enforces face planarity (see `crdt_cad.geometry.mesh_validity`'s
+  module docstring), so a face that's drifted non-planar falls back to
+  a fan triangulation (confirmed directly: `build123d`'s `Face`
+  constructor raises `ValueError: Cannot build face(s): wires not
+  planar` for a non-planar loop, rather than silently misbuilding it).
+  If every face joins into one closed, positive-volume solid, that's
+  written as a real `MANIFOLD_SOLID_BREP`; an incomplete/WIP mesh
+  (`Solid(Shell(...))` silently gives volume `0.0` for an open shell
+  instead of raising -- confirmed directly, not assumed) is written as
+  an open `Compound` of faces instead of falsely claiming a closed
+  solid. `build123d` is a genuinely heavy optional dependency (pulls in
+  `scipy`/`scikit-learn`/`sympy`/`ipython`), so it's an opt-in extra,
+  not a core dependency, and deliberately not part of the `dev` extra
+  either (unlike the much lighter `asyncpg`/`redis`) -- a contributor
+  who wants to exercise `tests/test_step_export.py` for real installs it
+  separately. STEP *import* and IGES (either direction) remain
+  unbuilt -- not asked for by the brief's re-evaluation.
 
 All of this is reachable from the UI: **Save** (explicit durable
-snapshot), **.json/.svg/.dxf/.stl** download buttons, and an **Import
-SVG/DXF** file picker that broadcasts the imported paths to everyone
-currently in the room.
+snapshot), download buttons for every format above (the 2D demo:
+**.json/.svg/.dxf**; the 3D demo: **.json/.stl/.step**), and (2D only)
+an **Import SVG/DXF** file picker that broadcasts the imported paths to
+everyone currently in the room.
 
 ## AI text-to-3D generation (`src/crdt_cad/ai/`)
 
@@ -454,14 +517,13 @@ collaboratively-editable house mesh appears in the scene for everyone
 in the room -- built and synced through the exact same CRDT machinery
 as a hand-placed vertex.
 
-**Scope, stated honestly up front:** this does *not* wrap TripoSR,
-Hunyuan3D, Meshy, or any other multi-GB GPU mesh-diffusion model. This
-project runs in a sandboxed, CPU-only environment with no way to
-responsibly download, run, or verify a several-gigabyte GPU checkpoint
--- claiming that integration while unable to test it would be exactly
-the kind of unverifiable, faked feature this README explicitly tries
-not to ship. What's built instead is a genuinely working split of the
-same problem into its two real sub-problems:
+**Scope, stated honestly up front:** the always-available, fully-tested
+pipeline does *not* run TripoSR, Hunyuan3D, or any other multi-GB GPU
+mesh-diffusion model locally -- this project runs in a sandboxed,
+CPU-only environment with no way to responsibly download, run, or
+verify a several-gigabyte GPU checkpoint. What's built instead is a
+genuinely working split of the same problem into its two real
+sub-problems:
 
 1. **Language understanding** -- turning "a 4 bedroom house with a
    wooden floor" into bounded structured parameters (`bedrooms=4`,
@@ -527,6 +589,43 @@ already correct -- the right trade for genuinely messy/incomplete input
 (a hypothetical scanned or ML-hallucinated mesh), not for a
 procedurally-exact one. Falls back to dependency-free fan triangulation
 if `pymeshlab` isn't installed or its pipeline raises for any reason.
+
+### Optional hosted ML mesh-gen adapter (Phase 9, `meshy_adapter.py`)
+
+**Not verified against the live API** -- read this before trusting it.
+Setting `MESHY_API_KEY` makes `generate_mesh_ops` try Meshy AI's hosted
+text-to-3D API first: create a generation task, poll until it succeeds,
+download the resulting GLB, parse it with `trimesh` (already a core
+dependency) into the same vertex/face dict shape the procedural
+pipeline produces, then inject it through the identical
+`commit_ops_batched` path -- same batching, same actor identity, same
+everything downstream of "here is a mesh." No Meshy API key was
+available in the environment this was built in, so the request/response
+handling is implemented against my best understanding of Meshy's
+documented API, not confirmed with a real call. If that understanding is
+wrong, the most likely failure is an HTTP error or a `KeyError` reading
+an unexpected JSON shape -- both are caught by a broad `except
+Exception` in `generate_mesh_via_meshy`, logged, and treated exactly
+like "not configured": generation falls back to the deterministic
+procedural pipeline, the same as today, never raising up to the user.
+
+What genuinely *is* verified (`tests/test_meshy_adapter.py`,
+`tests/test_generator.py`): the key-unset path takes zero network
+action; every failure mode (HTTP error, a `FAILED` task status, an
+unexpected JSON shape) returns `None` rather than raising, exercised via
+a mocked `requests` module standing in for the real one; and mesh-file
+parsing itself is checked against a *real* GLB -- built and exported by
+`trimesh` directly, not a hand-typed fixture -- so the one fully-local,
+fully-checkable piece of this pipeline (turning mesh bytes into a
+vertex/face dict) has no unverified gap. `generate_mesh_ops`'s own
+wiring (use Meshy's mesh when the adapter returns one, fall back to
+procedural when it returns `None`) is tested directly by monkeypatching
+the adapter call, independent of whether Meshy's real API cooperates.
+The result's new `mesh_source` field (`"meshy"` or `"procedural"`) is
+surfaced in the AI Generate panel's status line so it's never ambiguous
+which one actually produced what's on screen. `requests` (the `meshy`
+extra) is a light dependency, included in `dev` alongside `asyncpg`/
+`redis`; `trimesh` needs nothing extra since it's already core.
 
 ## WebRTC P2P (`demo/static/common.js: P2PManager`)
 
@@ -749,7 +848,7 @@ conflict-free way a vertex move does.
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-242 tests: unit tests per CRDT type and geometry module, serialization
+260 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -803,7 +902,18 @@ the actual `DrawingDocument`/`add_path`/`path_list` pipeline (not just
 `svg_io.py` in isolation), two replicas concurrently curving *different*
 segments of the same path both surviving a real merge, and DXF's curve
 flattening producing a visibly-bulging denser polyline rather than a
-straight line between anchors.
+straight line between anchors. Also 18 new Phase 9 tests:
+`tests/test_step_export.py` (6) and two more in `tests/test_server_features.py`
+skip cleanly via `pytest.importorskip("build123d")` if the optional
+`step` extra isn't installed, covering the planar/non-planar-fallback/
+open-mesh-vs-closed-solid behavior described above; `tests/test_meshy_adapter.py`
+(7) and three more in `tests/test_generator.py` cover the Meshy
+adapter's key-unset and every-failure-mode-degrades-gracefully paths
+(mocked HTTP layer) plus real GLB parsing (via a mesh `trimesh` itself
+built and exported, not a hand-typed fixture) and `generate_mesh_ops`'s
+own meshy-vs-procedural wiring -- none of this exercises Meshy's actual
+live API, see the AI generation section's honest accounting of what
+that means.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -849,6 +959,19 @@ was initially invisible against the canvas's own near-black default
 color, not because the curve itself was wrong) -- all fixed (or, for
 the pre-existing color gap, documented rather than silently left for
 the next person to rediscover) and specifically regression-tested.
+Phase 9's stretch items got the same treatment: the Constrain tool
+(draw two lines with the Pen tool, select an endpoint from each, apply
+Coincident -- confirmed converged via `/export/json`, not just visually,
+and synced to a second tab; separately, Parallel -- confirmed via the
+resulting direction vectors' cross product, which is what actually
+caught the `steps=2`-drag-produces-an-extra-point test artifact
+mentioned above), STEP export (built a real triangular face via the 3D
+demo's Vertex/Face tools, clicked **.step**, confirmed the downloaded
+file starts with `ISO-10303-21;` and contains real `ADVANCED_FACE`
+records), and the AI Generate panel's new `mesh_source` label (generated
+a house with `MESHY_API_KEY` unset -- the only configuration available
+here -- and confirmed the status line correctly reads "mesh via the
+procedural builder").
 
 A third, more interesting one turned up while browser-verifying the
 face color/material editor: `LocalClock` (`common.js`, shared by both
@@ -870,7 +993,7 @@ local op.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (6 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (7 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -882,11 +1005,15 @@ draft of this test used the wrong gesture entirely and silently created
 no path at all); the `LocalClock.observe()` regression above,
 reproduced end-to-end (generate a house via AI, have a fresh client
 edit a face's material, confirm the edit actually persists server-side);
-and the offline-outbox-survives-a-hard-refresh behavior
+the offline-outbox-survives-a-hard-refresh behavior
 (`test_offline_durability_e2e.py`) -- go offline, draw, `page.reload()`,
 confirm the edit is both visible locally and actually landed
 server-side, plus a check that a room nobody ever went offline in shows
-no recovery toast (persistence is additive, not a new default).
+no recovery toast (persistence is additive, not a new default); and
+(Phase 9) `test_constraint_ui_e2e.py` -- draw two lines, select an
+endpoint from each with the Constrain tool, apply Coincident, and
+confirm via the server's own `/export/json` (on *both* tabs) that the
+two points actually converged, not just that the UI looked right.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process
@@ -1013,9 +1140,15 @@ building this round -- and is called out in Roadmap below.
 
 ## Roadmap / what's not built yet
 
-1. **STEP/IGES export** -- blocked on a B-Rep representation in
-   `MeshCRDT` and a usable `pythonOCC` install path; see the Import/export
-   section above.
+1. ~~**STEP/IGES export**~~ -- **STEP done** (Phase 9), re-evaluating the
+   old "conda-only in practice" blocker: `build123d` (which pulls in
+   `cadquery-ocp-novtk`, a real PyPI wheel) turned out to install and
+   work in this environment after all -- confirmed by actually building
+   and exporting a real STEP file, not assumed. See "STEP export" in the
+   Import/export section above for the faceted-B-Rep scope and what a
+   non-planar face falls back to. IGES remains unbuilt (not asked for by
+   the brief's re-evaluation, and `build123d`/OCP's IGES support wasn't
+   investigated).
 2. ~~**Shared room-state broker for true horizontal scaling**~~ --
    **Done.** `PostgresStore` (shared persistence) and Redis pub/sub
    (`Room.broadcast()` now reaches clients connected to *other*
@@ -1026,10 +1159,24 @@ building this round -- and is called out in Roadmap below.
    against a live cluster, same caveat as before), and a Kafka-style
    event log was not built (Redis pub/sub satisfies the same requirement
    the brief poses it as an alternative for).
-3. **Interactive constraint-assignment sketch UI** -- the solver and its
-   `/api/solve` endpoint are real and tested; a UI for "select two
-   existing path endpoints, click 'make parallel'" on top of the
-   freehand/polygon tools isn't built yet.
+3. ~~**Interactive constraint-assignment sketch UI**~~ -- **Done**
+   (Phase 9). A new **Constrain** tool in the 2D demo: click two points
+   (any paths, same or different) and apply Coincident, Parallel,
+   Perpendicular, or Fixed Distance -- the existing, already-tested
+   `/api/solve` endpoint does the actual solving; the client just moves
+   the affected points via ordinary delete+reinsert `path_geom` ops
+   (RGA values are immutable once inserted, so a "moved" point is a new
+   node id under the hood -- see `movePathPoint` in `sketch.js`), synced
+   to everyone the normal way. Parallel/perpendicular relate each
+   selected point's *segment* (inferred from its live neighbor), not
+   just the bare point. Live-verified: a Coincident pair converging to
+   the same position and a Parallel pair's direction vectors reaching a
+   zero cross product, both via the server's own JSON export (not just
+   a visual effect), and synced to a second tab in the same room. One
+   accepted trade-off: moving a point this way orphans any curve segment
+   (Phase 8) attached to its old node id, reverting that segment to a
+   straight line -- documented in `movePathPoint`'s docstring, not
+   silently ignored.
 4. **Pyodide/WASM client-side engine** -- the brief allows this as an
    enhancement. Deliberately not done: it would mean running the same
    package twice, and a thin JS renderer that reuses the *tested* server
@@ -1054,10 +1201,21 @@ building this round -- and is called out in Roadmap below.
    merge more predictably. Not attempted here: too large a data-model
    change to make safely without a much larger dedicated verification
    pass.
-7. **Real ML mesh generation (TripoSR/Hunyuan3D/Meshy)** -- deliberately
-   out of scope for this environment; see the AI text-to-3D generation
-   section above for exactly what's built instead (Claude Fable 5 +
-   deterministic procedural geometry) and why.
+7. ~~**Real ML mesh generation (TripoSR/Hunyuan3D/Meshy)**~~ -- **Built,
+   but not verified** (Phase 9). `crdt_cad.ai.meshy_adapter` calls
+   Meshy's hosted text-to-3D API when `MESHY_API_KEY` is set, parses the
+   result with `trimesh`, and injects it through the same
+   `generate_mesh_ops`/`commit_ops_batched` path the procedural pipeline
+   already uses. No Meshy API key was available in this environment, so
+   the actual live-API request/response handling is implemented against
+   my best understanding of Meshy's documented API, **not confirmed
+   against a real call** -- exactly the caveat the brief asks for in
+   this situation. What *is* verified: the key-unset path (unchanged,
+   procedural), every failure mode gracefully falling back to
+   procedural instead of raising (mocked HTTP layer), and mesh-format
+   parsing against a real GLB file built by `trimesh` itself. See
+   `crdt_cad.ai.meshy_adapter`'s module docstring for the full honest
+   accounting of what's real vs. assumed.
 
 ## Project layout
 

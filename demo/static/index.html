@@ -27,6 +27,7 @@
           <button id="toolPen" class="active">✏ Pen</button>
           <button id="toolSelect">↖ Select</button>
           <button id="toolPolygon">⬠ Polygon (strict)</button>
+          <button id="toolConstrain">📐 Constrain</button>
         </div>
         <div class="empty-hint" id="toolHint">Drag to draw a freehand stroke.</div>
         <div class="tool-row" style="margin-top:6px">
@@ -64,6 +65,9 @@
       <div class="panel right">
         <div class="section-title">Selection</div>
         <div id="selectionPanel"><div class="empty-hint">Select a path to edit its color, stroke width, or leave a comment.</div></div>
+
+        <div class="section-title">Constraints</div>
+        <div id="constraintPanel"><div class="empty-hint">Constrain tool: click two points (in any path, same or different) to relate them.</div></div>
 
         <div class="section-title">Comments</div>
         <div id="commentList"><div class="empty-hint">No path selected.</div></div>

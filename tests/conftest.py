@@ -21,6 +21,18 @@ def isolated_store(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_meshy_api_key_by_default(monkeypatch):
+    """Every test starts with MESHY_API_KEY unset, regardless of the
+    real shell environment -- otherwise a developer's own environment
+    variable would make generate_mesh_ops (and every test that calls it)
+    silently start attempting real network calls to Meshy during a plain
+    test run. Tests that specifically want it set (see
+    tests/test_meshy_adapter.py) set it explicitly via monkeypatch,
+    which layers fine on top of this."""
+    monkeypatch.delenv("MESHY_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def isolated_rate_limiter(monkeypatch):
     """The per-IP /generate rate limiter (crdt_cad.server.security.
     generate_rate_limiter) is a process-lifetime singleton by design in

@@ -51,6 +51,12 @@ postgres = [
 redis = [
     "redis>=5.0",
 ]
+step = [
+    "build123d>=0.11",
+]
+meshy = [
+    "requests>=2.31",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -61,6 +67,7 @@ dev = [
     "ruff>=0.11",
     "asyncpg>=0.29",
     "redis>=5.0",
+    "requests>=2.31",
 ]
 
 [tool.pytest.ini_options]

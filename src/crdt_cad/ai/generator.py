@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from crdt_cad.ai.house_spec import HouseSpec
 from crdt_cad.ai.interpreter import interpret_prompt
+from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy, meshy_api_key
 from crdt_cad.ai.procedural_house import build_house_mesh
 from crdt_cad.crdt.clock import LamportClock
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
@@ -46,6 +47,7 @@ class GenerationResult:
     ops: list[MeshOp]
     spec: HouseSpec
     interpretation_source: str  # "llm" | "heuristic"
+    mesh_source: str  # "meshy" | "procedural"
     vertex_count: int
     face_count: int
     triangle_count: int
@@ -54,10 +56,28 @@ class GenerationResult:
 def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> GenerationResult:
     """Synchronous end-to-end pipeline. Safe to call from a worker
     thread (``asyncio.to_thread``); does no networking of its own beyond
-    whatever ``interpret_prompt``'s LLM path performs internally.
+    whatever ``interpret_prompt``'s LLM path and (if ``MESHY_API_KEY`` is
+    set) ``generate_mesh_via_meshy`` perform internally.
+
+    The prompt is always interpreted into a :class:`HouseSpec` (for the
+    response's informational ``spec``/``interpretation_source``, and as
+    the deterministic fallback), independent of which mesh actually gets
+    used: if ``MESHY_API_KEY`` is set and Meshy's hosted text-to-3D API
+    returns a real mesh, that mesh is injected instead of the procedural
+    one -- see ``crdt_cad.ai.meshy_adapter``'s module docstring for why
+    that whole path is unverified against the live API and always
+    degrades safely to the procedural pipeline below on any failure.
     """
     spec, source = interpret_prompt(prompt)
-    mesh = build_house_mesh(spec)
+
+    mesh = None
+    mesh_source = "procedural"
+    if meshy_api_key():
+        mesh = generate_mesh_via_meshy(prompt)
+        if mesh is not None:
+            mesh_source = "meshy"
+    if mesh is None:
+        mesh = build_house_mesh(spec)
 
     # Built against a throwaway MeshCRDT (not the live room's document) so
     # every op is minted with a fresh, correctly-ordered OpId from one
@@ -86,6 +106,7 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
         ops=ops,
         spec=spec,
         interpretation_source=source,
+        mesh_source=mesh_source,
         vertex_count=len(mesh.vertices),
         face_count=len(mesh.faces),
         triangle_count=mesh.triangle_count(),

@@ -94,7 +94,7 @@ def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
     def slow(prompt, *, actor_id="ai_generator_bot"):
         time.sleep(0.3)
         return GenerationResult(
-            ops=[], spec=HouseSpec(), interpretation_source="heuristic",
+            ops=[], spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
             vertex_count=0, face_count=0, triangle_count=0,
         )
 
@@ -108,7 +108,7 @@ def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
 def test_generate_endpoint_returns_422_on_empty_mesh(monkeypatch):
     def empty(prompt, *, actor_id="ai_generator_bot"):
         return GenerationResult(
-            ops=[], spec=HouseSpec(), interpretation_source="heuristic",
+            ops=[], spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
             vertex_count=0, face_count=0, triangle_count=0,
         )
 

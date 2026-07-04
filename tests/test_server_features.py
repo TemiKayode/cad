@@ -90,6 +90,40 @@ def test_export_mesh_json_and_stl():
     assert stl_resp.text.count("facet normal") == 1
 
 
+def test_export_mesh_step():
+    """STEP export (Phase 9) needs the optional `build123d` dependency --
+    skip cleanly if it isn't installed, same pattern as
+    tests/test_step_export.py."""
+    import pytest
+
+    pytest.importorskip("build123d")
+
+    client = _client()
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    v1 = mesh.add_vertex("v1", (0.0, 0.0, 0.0))
+    v2 = mesh.add_vertex("v2", (1.0, 0.0, 0.0))
+    v3 = mesh.add_vertex("v3", (0.0, 1.0, 0.0))
+    face_ops = mesh.add_face("f1", ["v1", "v2", "v3"])
+    with client.websocket_connect("/ws/mesh/meshstepexport") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in [v1, v2, v3, *face_ops]]})
+
+    resp = client.get("/api/mesh/meshstepexport/export/step")
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"ISO-10303-21;")
+
+
+def test_export_mesh_step_with_no_faces_returns_400():
+    import pytest
+
+    pytest.importorskip("build123d")
+
+    client = _client()
+    resp = client.get("/api/mesh/emptymeshstep/export/step")
+    assert resp.status_code == 400
+
+
 # -- import ---------------------------------------------------------------------
 
 

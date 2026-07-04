@@ -347,6 +347,36 @@ document.getElementById("downloadJsonBtn").onclick = () =>
 document.getElementById("downloadStlBtn").onclick = () =>
   triggerDownload(withToken(`/api/mesh/${encodeURIComponent(room)}/export/stl`, "mesh", room));
 
+// Unlike the two above (which always succeed), STEP export needs the
+// optional `build123d` dependency server-side and fails for an empty
+// mesh -- a plain triggerDownload() would silently "download" the JSON
+// error body as if it were a .step file, so this checks the response
+// first and surfaces a real error via toast instead.
+document.getElementById("downloadStepBtn").onclick = async () => {
+  const url = withToken(`/api/mesh/${encodeURIComponent(room)}/export/step`, "mesh", room);
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch {
+    showToast("Could not reach the server for STEP export", "error");
+    return;
+  }
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    showToast(body.detail || "STEP export failed", "error");
+    return;
+  }
+  const blob = await resp.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = blobUrl;
+  a.download = `${room}.step`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(blobUrl);
+};
+
 document.getElementById("shareBtn").onclick = async () => {
   let url = `${location.origin}/3d?room=${encodeURIComponent(room)}`;
   const token = roomTokenFor("mesh", room);
@@ -389,11 +419,17 @@ async function generateMesh() {
     }
     const result = await resp.json();
     const via = result.interpretation_source === "llm" ? "Claude Fable 5" : "the offline heuristic parser";
-    showToast(`Generated ${result.vertex_count} vertices / ${result.face_count} faces via ${via}`, "success");
+    // mesh_source (Phase 9, unverified against a live Meshy account --
+    // see crdt_cad.ai.meshy_adapter's module docstring): "meshy" only
+    // when MESHY_API_KEY was set *and* the hosted API actually returned
+    // a mesh; any failure there silently falls back to "procedural",
+    // same as it always was.
+    const meshVia = result.mesh_source === "meshy" ? "Meshy" : "the procedural builder";
+    showToast(`Generated ${result.vertex_count} vertices / ${result.face_count} faces via ${meshVia}`, "success");
     genStatus.textContent =
       `Last generation: ${result.spec.bedrooms} bedroom(s), ${result.spec.floors} floor(s), ` +
-      `${escapeHtml(result.spec.floor_material)} floor, ${escapeHtml(result.spec.style)} style (via ${via}, ` +
-      `${result.batches} batch(es)).`;
+      `${escapeHtml(result.spec.floor_material)} floor, ${escapeHtml(result.spec.style)} style (interpreted via ${via}, ` +
+      `mesh via ${meshVia}, ${result.batches} batch(es)).`;
   } catch (err) {
     showToast(`Generation failed: ${err.message}`, "error");
     genStatus.textContent = `Generation failed: ${err.message}`;

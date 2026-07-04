@@ -13,6 +13,51 @@ def test_generate_mesh_ops_uses_heuristic_without_credentials():
     assert result.ops
 
 
+def test_generate_mesh_ops_reports_procedural_mesh_source_by_default():
+    """MESHY_API_KEY is unset by the autouse fixture in conftest.py --
+    this must be the unchanged, always-available path."""
+    result = generate_mesh_ops("a small cabin")
+    assert result.mesh_source == "procedural"
+
+
+def test_generate_mesh_ops_uses_meshy_mesh_when_the_adapter_succeeds(monkeypatch):
+    """Phase 9's Meshy adapter is unverified against the live API (see
+    crdt_cad.ai.meshy_adapter's module docstring) -- this only confirms
+    generate_mesh_ops's own wiring: when MESHY_API_KEY is set and the
+    adapter returns a mesh, that mesh (not the procedural one) is what
+    gets used and reported."""
+    import crdt_cad.ai.generator as generator_module
+    from crdt_cad.ai.procedural_house import GeneratedMesh
+
+    fake_mesh = GeneratedMesh(
+        vertices={"a": (0.0, 0.0, 0.0), "b": (1.0, 0.0, 0.0), "c": (0.0, 1.0, 0.0)},
+        faces={"f1": ["a", "b", "c"]},
+    )
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key-for-testing")
+    monkeypatch.setattr(generator_module, "generate_mesh_via_meshy", lambda prompt: fake_mesh)
+
+    result = generate_mesh_ops("a small wooden chair")
+    assert result.mesh_source == "meshy"
+    assert result.vertex_count == 3
+    assert result.face_count == 1
+
+
+def test_generate_mesh_ops_falls_back_to_procedural_when_meshy_returns_none(monkeypatch):
+    """MESHY_API_KEY set, but the adapter itself degrades (unreachable,
+    bad response, etc. -- see test_meshy_adapter.py) -- generate_mesh_ops
+    must still produce a usable mesh via the procedural pipeline, not an
+    empty result."""
+    import crdt_cad.ai.generator as generator_module
+
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key-for-testing")
+    monkeypatch.setattr(generator_module, "generate_mesh_via_meshy", lambda prompt: None)
+
+    result = generate_mesh_ops("a 2 bedroom cottage")
+    assert result.mesh_source == "procedural"
+    assert result.vertex_count > 0
+    assert result.face_count > 0
+
+
 def test_generated_ops_apply_cleanly_to_a_fresh_room_document():
     """The whole point of the CRDT mapping rule: these ops must be
     injectable into a live document (as a remote replica would receive

@@ -77,6 +77,7 @@ from crdt_cad.crdt.clock import LamportClock, VectorClock
 from crdt_cad.crdt.document import DocOp, DrawingDocument
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
 from crdt_cad.export.dxf_io import drawing_from_dxf_bytes, drawing_to_dxf_bytes
+from crdt_cad.export.step_export import mesh_to_step_bytes
 from crdt_cad.export.stl_export import mesh_to_stl
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 from crdt_cad.geometry.constraints import Constraint, Sketch
@@ -603,6 +604,26 @@ async def export_mesh_stl(room_id: str) -> Response:
     return _attachment(stl, "model/stl", f"{room_id}.stl")
 
 
+@app.get("/api/mesh/{room_id}/export/step", dependencies=[Depends(require_room_access("mesh"))])
+async def export_mesh_step(room_id: str) -> Response:
+    """`build123d` (the `step` extra) is a heavy, optional dependency --
+    see step_export.py's module docstring for why this re-evaluates the
+    README's older "pythonOCC is conda-only" note. Runs off the event
+    loop (real OpenCascade geometry construction, not free) via
+    asyncio.to_thread, same as the mesh validity check."""
+    room = await mesh_room_manager.get_or_create(room_id)
+    try:
+        data = await asyncio.to_thread(mesh_to_step_bytes, room.doc.vertex_positions(), room.doc.face_loops())
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=f"STEP export needs the optional 'step' extra -- install with `pip install crdt-cad[step]`: {exc}",
+        ) from exc
+    if not data:
+        raise HTTPException(status_code=400, detail="nothing to export -- no face has 3 or more live vertices")
+    return _attachment(data, "application/step", f"{room_id}.step")
+
+
 # ---------------------------------------------------------------------------
 # AI text-to-3D generation (3D mesh rooms)
 # ---------------------------------------------------------------------------
@@ -615,6 +636,7 @@ class GenerateMeshRequest(BaseModel):
 class GenerateMeshResult(BaseModel):
     actor: str
     interpretation_source: str  # "llm" | "heuristic"
+    mesh_source: str  # "meshy" | "procedural"
     spec: dict
     vertex_count: int
     face_count: int
@@ -673,13 +695,15 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
 
     batches = await room.commit_ops_batched(result.ops, actor=DEFAULT_ACTOR_ID, batch_size=GENERATION_OPS_BATCH_SIZE)
     logger.info(
-        "room mesh/%s: generated %d ops (%d vertices, %d faces) from prompt %r via %s, sent in %d batches",
-        room_id, len(result.ops), result.vertex_count, result.face_count, req.prompt, result.interpretation_source, batches,
+        "room mesh/%s: generated %d ops (%d vertices, %d faces) from prompt %r via %s/%s, sent in %d batches",
+        room_id, len(result.ops), result.vertex_count, result.face_count, req.prompt,
+        result.interpretation_source, result.mesh_source, batches,
     )
 
     return GenerateMeshResult(
         actor=DEFAULT_ACTOR_ID,
         interpretation_source=result.interpretation_source,
+        mesh_source=result.mesh_source,
         spec=result.spec.model_dump(),
         vertex_count=result.vertex_count,
         face_count=result.face_count,
