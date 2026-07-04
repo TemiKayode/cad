@@ -38,6 +38,7 @@ over gaps.
 | Import (SVG, DXF reference geometry) | **Done** (straight-segment subset -- see below) |
 | WebRTC P2P direct sync, WS-relayed signaling, relay fallback | **Done**, verified with a real two-tab RTCPeerConnection/DataChannel |
 | "Time-Travel Merge" branch-preview UI | **Done** |
+| Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
 | Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 4 tests |
@@ -628,18 +629,23 @@ local op.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (4 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (6 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
-passes) makes four of those scenarios permanent, regression-tested code
-instead of tribal knowledge: two tabs drawing concurrently and
+passes) makes several of those scenarios permanent, regression-tested
+code instead of tribal knowledge: two tabs drawing concurrently and
 converging; the full offline -> edit both sides -> reconnect ->
 Time-Travel Merge -> converge sequence; the strict Polygon tool's
 self-intersection rejection (a genuine bowtie shape, verified against
 the *real* click-to-place-vertex interaction, not a drag -- an earlier
 draft of this test used the wrong gesture entirely and silently created
-no path at all); and the `LocalClock.observe()` regression above,
+no path at all); the `LocalClock.observe()` regression above,
 reproduced end-to-end (generate a house via AI, have a fresh client
-edit a face's material, confirm the edit actually persists server-side).
+edit a face's material, confirm the edit actually persists server-side);
+and the offline-outbox-survives-a-hard-refresh behavior
+(`test_offline_durability_e2e.py`) -- go offline, draw, `page.reload()`,
+confirm the edit is both visible locally and actually landed
+server-side, plus a check that a room nobody ever went offline in shows
+no recovery toast (persistence is additive, not a new default).
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process
@@ -681,19 +687,29 @@ and it's checkable directly in the code: `RelayConnection` in
 optimistically *before* anything is sent anywhere (see `addVertex`,
 `finishFace`, etc. in `mesh3d.js` -- the op is applied locally, then
 `sendOps()` is called). Going "offline" doesn't disable editing; it
-queues emitted ops in an in-memory `outbox` and keeps working
-normally, which is exactly what the Time-Travel Merge feature
-demonstrates. The real, honest gap is narrower than "offline is fake":
-the outbox is **in-memory, not durable** -- a hard refresh or closed
-tab while offline loses queued-but-unsent ops. A Pyodide-hosted engine
-would fix that (and was considered), but it means running the CRDT
-logic twice in two languages, with the attendant risk of the two
-implementations silently drifting apart -- for a project whose entire
-premise is "the merge logic is provably correct," a second,
-unverified implementation of it felt like a worse trade than a
-documented gap. Fixing the durability gap without duplicating the
-engine (e.g. persisting the outbox to `IndexedDB`) is legitimate,
-scoped future work -- see Roadmap.
+queues emitted ops in an outbox and keeps working normally, which is
+exactly what the Time-Travel Merge feature demonstrates. The one real,
+narrower gap this claim did have a point about -- the outbox was
+**in-memory only**, so a hard refresh or closed tab while offline lost
+queued-but-unsent ops -- is now fixed: `persistOutbox()`/
+`loadPersistedOutbox()` in `common.js` durably queue it in IndexedDB,
+keyed per room+actor, without duplicating any CRDT logic client-side (a
+Pyodide-hosted engine was considered and rejected for exactly that
+reason -- see the Roadmap entry below). The fix took one genuinely
+subtle wrong turn worth recording: the first version *also* persisted
+the frontier (vector clock) across a reload, on the theory that
+restoring it would let the reconnect flow through the normal
+Time-Travel Merge `delta` path. That's backwards -- a `delta` reply
+only contains ops the server thinks the client's *local state* is
+missing, which is a safe assumption when a dropped WebSocket left
+memory intact, but not after a hard reload wipes `state` to nothing.
+Restoring a stale frontier made the server send a correctly-near-empty
+delta, leaving the client's own view empty despite the server having
+everything. Fixed by never claiming a `known_frontier` on a connection's
+first connect (always request a full, correct `snapshot`) and replaying
+the recovered outbox locally on top of it instead -- caught and fixed
+before shipping, via the same live-browser verification discipline this
+README keeps asking of every feature.
 
 **2. "Tombstone accumulation / no garbage collection."** Real gap,
 now fixed at the safe level: `RGA.compact(safe_vc)` (`crdt/rga.py`)
@@ -756,8 +772,9 @@ left out.
    logic as the single source of truth was the more honest choice than
    an integration that's hard to verify reliably in this environment.
    A narrower version of this concern -- the in-memory offline outbox
-   not surviving a hard refresh -- is real and independently fixable
-   (persist the outbox to `IndexedDB`) without duplicating the engine.
+   not surviving a hard refresh -- **is now fixed** (persisted to
+   IndexedDB, see "Responses to the architecture critique" claim 1 above)
+   without duplicating the engine.
 5. **Cross-component mesh validity ("Validation Fork")** -- a
    manifoldness/winding check over the *merged* result of concurrent
    mesh edits (e.g. a face-boundary edit racing an extrude of that

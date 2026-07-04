@@ -154,6 +154,90 @@ class FrontierTracker {
   }
 }
 
+// -- offline outbox durability (IndexedDB) -------------------------------------
+//
+// The in-memory outbox (RelayConnection.outbox) already survives a dropped
+// WebSocket -- edits keep queuing locally and flush on reconnect. What it
+// doesn't survive is a hard refresh or closed tab: the queue lives only in
+// JS memory. This persists just the queued ops (not the frontier -- see
+// below) to IndexedDB, keyed per room+actor, so a reload while offline
+// recovers the queue instead of silently dropping it. Not a CRDT of its
+// own -- just durability for the same op list that was always going to be
+// sent once reconnected.
+//
+// Deliberately does NOT also persist/restore the frontier (the vector
+// clock RelayConnection uses to ask the server for a `delta` instead of a
+// full `snapshot`) even though that was the first thing tried here. The
+// reasoning doesn't carry over from "network dropped, JS memory intact"
+// to "hard reload, JS memory wiped": a `delta` reply only contains ops
+// the server thinks this frontier hasn't seen yet, which is correct when
+// local `state` already has everything up to that frontier in memory --
+// but after a reload, local `state` starts from nothing. Restoring a
+// stale frontier makes the server send an (correctly) near-empty delta,
+// and the client ends up with an empty room in view despite the server
+// having everything. Always requesting a full `snapshot` after a reload
+// (by never claiming a `known_frontier`) is what actually rebuilds state
+// correctly; the recovered outbox is then replayed *locally* on top of
+// that snapshot (see loadSnapshot's caller in sketch.js/mesh3d.js) before
+// being flushed to the server for real.
+
+const OFFLINE_DB_NAME = "crdt_cad_offline";
+const OFFLINE_STORE = "state";
+
+function _offlineDbKey(kind, room, actorId) {
+  return `${kind}:${room}:${actorId}`;
+}
+
+function _openOfflineDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(OFFLINE_DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(OFFLINE_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/** Returns the persisted outbox (a list of ops), or `[]` if nothing was
+ * persisted (the common case) or IndexedDB is unavailable. */
+async function loadPersistedOutbox(kind, room, actorId) {
+  try {
+    const db = await _openOfflineDb();
+    const value = await new Promise((resolve, reject) => {
+      const tx = db.transaction(OFFLINE_STORE, "readonly");
+      const req = tx.objectStore(OFFLINE_STORE).get(_offlineDbKey(kind, room, actorId));
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return value || [];
+  } catch (err) {
+    console.warn("crdt-cad: could not read persisted offline outbox from IndexedDB", err);
+    return [];
+  }
+}
+
+/** Persists (or, once empty again, deletes) the current offline outbox.
+ * Best-effort: a failure here degrades to today's in-memory-only
+ * behavior, never blocks sending. */
+async function persistOutbox(kind, room, actorId, outbox) {
+  try {
+    const db = await _openOfflineDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(OFFLINE_STORE, "readwrite");
+      if (outbox.length) {
+        tx.objectStore(OFFLINE_STORE).put(outbox, _offlineDbKey(kind, room, actorId));
+      } else {
+        tx.objectStore(OFFLINE_STORE).delete(_offlineDbKey(kind, room, actorId));
+      }
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  } catch (err) {
+    console.warn("crdt-cad: could not persist offline outbox to IndexedDB", err);
+  }
+}
+
 /**
  * Handles the hello/snapshot/delta/ops WebSocket protocol against a
  * crdt_cad relay room, including offline queueing and auto-reconnect.
@@ -171,6 +255,24 @@ class FrontierTracker {
  *     changed something while we were apart. Call proceed() to continue
  *     (apply their ops, then flush ours) whenever the caller is ready --
  *     the CRDT converges either way, this is purely a review step.
+ *
+ * Options:
+ *   token               -- room auth token, or null (see security.py)
+ *   kind, room           -- identify the offline-outbox IndexedDB row;
+ *     omit both to disable outbox persistence (falls back to the old
+ *     in-memory-only behavior)
+ *   initialOutbox        -- ops loaded via loadPersistedOutbox() *before*
+ *     constructing this connection, so a client that went offline,
+ *     queued edits, and was hard-refreshed (or had its tab closed)
+ *     resumes with its queued ops intact. This connection always
+ *     requests a fresh full `snapshot` on the *first* connect of its
+ *     lifetime (a fresh page load never claims a `known_frontier`) so
+ *     local state rebuilds correctly regardless of what's recovered --
+ *     see the long comment above loadPersistedOutbox() for why a
+ *     restored frontier would be unsound here. The caller is
+ *     responsible for re-applying `initialOutbox` to its own local
+ *     state after `onSnapshot` fires (this class only resends it to the
+ *     server; it has no rendering of its own to update).
  */
 // WebSocket close codes the server uses for its optional security hardening
 // (crdt_cad.server.app, WS_CLOSE_* constants) -- mirrored here so the client
@@ -178,10 +280,19 @@ class FrontierTracker {
 const WS_CLOSE_UNAUTHORIZED = 4401;
 
 class RelayConnection {
-  constructor(wsPath, actorId, { onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onMergePreview, token }) {
+  constructor(
+    wsPath,
+    actorId,
+    { onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onMergePreview, token, kind, room, initialOutbox },
+  ) {
     this.wsPath = wsPath;
     this.actorId = actorId;
     this.token = token || null;
+    // `kind`/`room` identify the offline-outbox IndexedDB row; omit them
+    // (both null) to opt out of persistence entirely and get the old
+    // in-memory-only behavior.
+    this.kind = kind || null;
+    this.room = room || null;
     this.onSnapshot = onSnapshot || (() => {});
     this.onDelta = onDelta || (() => {});
     this.onOps = onOps || (() => {});
@@ -192,10 +303,15 @@ class RelayConnection {
     this.onMergePreview = onMergePreview || null;
     this.frontier = new FrontierTracker();
     this.ws = null;
-    this.outbox = [];
+    this.outbox = initialOutbox ? initialOutbox.slice() : [];
     this.userWantsOffline = false;
     this._reconnectDelay = 1000;
     this._connect();
+  }
+
+  _persistOutbox() {
+    if (!this.kind || !this.room) return;
+    persistOutbox(this.kind, this.room, this.actorId, this.outbox);
   }
 
   _wsUrl() {
@@ -276,6 +392,7 @@ class RelayConnection {
     if (!this.outbox.length || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ type: "ops", ops: this.outbox }));
     this.outbox = [];
+    this._persistOutbox(); // clears the now-empty persisted queue
   }
 
   /** Send (or, if offline, queue) one or more ops that were already
@@ -284,6 +401,7 @@ class RelayConnection {
     for (const op of ops) this._recordOpFrontier(op);
     if (this.userWantsOffline || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.outbox.push(...ops);
+      this._persistOutbox(); // survives a hard refresh/closed tab while offline
       return;
     }
     this.ws.send(JSON.stringify({ type: "ops", ops }));

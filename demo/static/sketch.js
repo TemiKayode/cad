@@ -171,8 +171,21 @@ let conn, p2p;
 
 (async () => {
   const token = await ensureRoomAccess("drawing", room);
+  const persistedOutbox = await loadPersistedOutbox("drawing", room, actorId);
+  if (persistedOutbox.length) {
+    showToast(`Recovered ${persistedOutbox.length} offline edit(s) from before this page loaded`, "info");
+  }
   conn = new RelayConnection(`/ws/${encodeURIComponent(room)}`, actorId, {
-    onSnapshot: (doc) => { loadSnapshot(doc); },
+    onSnapshot: (doc) => {
+      loadSnapshot(doc);
+      // Replay recovered-but-unsent edits on top of the fresh snapshot --
+      // the server never echoes ops back to the actor that sent them, so
+      // without this, edits recovered from before a hard refresh would be
+      // silently missing from view even though they get flushed and
+      // correctly persisted server-side.
+      for (const op of persistedOutbox) applyOp(op);
+      if (persistedOutbox.length) renderAll();
+    },
     onDelta: (ops) => applyIncomingOps(ops),
     onOps: (ops) => applyIncomingOps(ops),
     onStatus: (status) => setStatus(status),
@@ -184,6 +197,9 @@ let conn, p2p;
     onSaved: () => showToast("Saved", "success"),
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeDocOps, proceed),
     token,
+    kind: "drawing",
+    room,
+    initialOutbox: persistedOutbox,
   });
 
   p2p = new P2PManager(conn, actorId, {

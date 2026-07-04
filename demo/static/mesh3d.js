@@ -147,14 +147,28 @@ let conn, p2p;
 
 (async () => {
   const token = await ensureRoomAccess("mesh", room);
+  const persistedOutbox = await loadPersistedOutbox("mesh", room, actorId);
+  if (persistedOutbox.length) {
+    showToast(`Recovered ${persistedOutbox.length} offline edit(s) from before this page loaded`, "info");
+  }
   conn = new RelayConnection(`/ws/mesh/${encodeURIComponent(room)}`, actorId, {
-    onSnapshot: (doc) => loadSnapshot(doc),
+    onSnapshot: (doc) => {
+      loadSnapshot(doc);
+      // See the identical comment in sketch.js: the server never echoes
+      // ops back to the actor that sent them, so recovered-but-unsent
+      // edits need to be replayed locally after the fresh snapshot loads.
+      for (const op of persistedOutbox) applyOp(op);
+      if (persistedOutbox.length) syncScene();
+    },
     onDelta: (ops) => applyIncomingOps(ops),
     onOps: (ops) => applyIncomingOps(ops),
     onStatus: (status) => setStatus(status),
     onSaved: () => showToast("Saved", "success"),
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
     token,
+    kind: "mesh",
+    room,
+    initialOutbox: persistedOutbox,
   });
 
   p2p = new P2PManager(conn, actorId, {
