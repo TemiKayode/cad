@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>crdt-cad — 2D Sketch</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div class="brand">crdt-cad <a href="/3d">→ 3D mesh demo</a></div>
+      <div class="spacer"></div>
+      <label style="font-size:12px;color:var(--text-dim)">room</label>
+      <input id="roomInput" type="text" style="width:120px" />
+      <button id="shareBtn" title="Copy an invite link to this room">🔗 Share</button>
+      <span id="statusPill" class="status-pill connecting"><span class="status-dot"></span><span id="statusText">connecting</span></span>
+      <span id="p2pPill" class="status-pill" style="display:none"><span class="status-dot"></span><span id="p2pText">P2P</span></span>
+      <button id="offlineToggle">Go offline</button>
+    </div>
+
+    <div class="body">
+      <div class="panel left">
+        <div class="section-title">Tool</div>
+        <div class="tool-row">
+          <button id="toolPen" class="active">✏ Pen</button>
+          <button id="toolSelect">↖ Select</button>
+          <button id="toolPolygon">⬠ Polygon (strict)</button>
+        </div>
+        <div class="empty-hint" id="toolHint">Drag to draw a freehand stroke.</div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="undoBtn">⟲ Undo</button>
+          <button id="redoBtn">⟳ Redo</button>
+        </div>
+
+        <div class="section-title">File</div>
+        <div class="tool-row">
+          <button id="saveBtn" style="flex:1">💾 Save</button>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="downloadJsonBtn" style="flex:1">.json</button>
+          <button id="downloadSvgBtn" style="flex:1">.svg</button>
+          <button id="downloadDxfBtn" style="flex:1">.dxf</button>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="importBtn" style="width:100%">⇪ Import SVG/DXF</button>
+        </div>
+        <input id="importFileInput" type="file" accept=".svg,.dxf" style="display:none" />
+
+        <div class="section-title">Layers</div>
+        <div id="layerList"></div>
+        <div style="margin-top:6px"><button id="addLayerBtn" style="width:100%">+ Add layer</button></div>
+
+        <div class="section-title">Paths</div>
+        <div id="pathList"></div>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="canvas"></canvas>
+        <div id="cursorLayer"></div>
+      </div>
+
+      <div class="panel right">
+        <div class="section-title">Selection</div>
+        <div id="selectionPanel"><div class="empty-hint">Select a path to edit its color, stroke width, or leave a comment.</div></div>
+
+        <div class="section-title">Comments</div>
+        <div id="commentList"><div class="empty-hint">No path selected.</div></div>
+
+        <div class="section-title">Presence (<span id="presenceCount">0</span>)</div>
+        <div id="presenceList"></div>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <span>actor: <b id="actorLabel"></b></span>
+      <span id="opsCounter">0 ops relayed</span>
+      <span id="offlineCounter"></span>
+      <span style="flex:1"></span>
+      <span>crdt_cad — pure-Python CRDT engine, server-authoritative merge</span>
+    </div>
+  </div>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/sketch.js"></script>
+</body>
+</html>

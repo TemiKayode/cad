@@ -1,0 +1,62 @@
+[project]
+name = "crdt-cad"
+version = "0.1.0"
+description = "Real-time collaborative CAD engine built on pure-Python CRDTs"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+keywords = [
+    "cad",
+    "crdt",
+    "collaborative-editing",
+    "real-time-collaboration",
+    "conflict-free-replicated-data-type",
+    "webrtc",
+    "websocket",
+    "fastapi",
+    "3d-mesh",
+    "vector-graphics",
+    "offline-first",
+    "distributed-systems",
+    "text-to-3d",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: FastAPI",
+]
+dependencies = [
+    "numpy>=1.26",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "websockets>=12.0",
+    "msgpack>=1.0",
+    "pydantic>=2.7",
+    "numba>=0.60",
+    "ezdxf>=1.3",
+    "prometheus_client>=0.20",
+    "aiortc>=1.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "hypothesis>=6.100",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

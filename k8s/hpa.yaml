@@ -1,0 +1,29 @@
+# NOT part of the default `kubectl apply -k k8s/` set (see kustomization.yaml
+# and k8s/README.md) -- applying this against today's single-process room
+# state / SQLite store would partition users across pods that can't see
+# each other. Apply manually only after moving to a shared persistence
+# backend and a pub/sub broker for room broadcast.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: crdt-cad
+  labels:
+    app: crdt-cad
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: crdt-cad
+  minReplicas: 1
+  maxReplicas: 6
+  metrics:
+    # A real "scale on WebSocket connection count" policy needs a custom
+    # metric sourced from crdt_cad_active_connections (see /metrics) via
+    # something like the Prometheus Adapter; CPU is the placeholder that
+    # works with only the metrics-server most clusters already have.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crdt-cad
+  labels:
+    app: crdt-cad
+spec:
+  # Keep this at 1 until room state and SQLite are backed by something
+  # shared across pods (Postgres + a pub/sub broker) -- see k8s/README.md.
+  replicas: 1
+  strategy:
+    type: Recreate  # avoids two pods briefly both holding the SQLite file
+  selector:
+    matchLabels:
+      app: crdt-cad
+  template:
+    metadata:
+      labels:
+        app: crdt-cad
+    spec:
+      containers:
+        - name: crdt-cad
+          image: crdt-cad:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: CRDT_CAD_DB_PATH
+              value: /data/crdt_cad.db
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: crdt-cad-data

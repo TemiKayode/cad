@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crdt-cad-data
+  labels:
+    app: crdt-cad
+spec:
+  # ReadWriteOnce: correct today because SQLite requires a single writer
+  # and the Deployment is pinned to replicas: 1 -- see k8s/README.md
+  # before changing either of those.
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

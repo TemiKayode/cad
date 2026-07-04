@@ -1,0 +1,23 @@
+services:
+  crdt-cad:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Durable SQLite snapshots survive `docker compose down`/`up` and
+      # image rebuilds. Swap this service for Postgres/Kafka later by
+      # implementing crdt_cad.persistence.store.DocumentStore against
+      # them -- nothing else in the app needs to change.
+      - crdt-cad-data:/data
+    environment:
+      - CRDT_CAD_DB_PATH=/data/crdt_cad.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  crdt-cad-data:

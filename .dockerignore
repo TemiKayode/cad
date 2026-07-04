@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+*.log
+node_modules/
+data/
+.git/
+tests/
+k8s/

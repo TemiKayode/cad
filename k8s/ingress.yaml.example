@@ -1,0 +1,22 @@
+# Example only -- not applied by kustomization.yaml. Ingress controller
+# annotations for WebSocket support vary by controller; the ones below are
+# for ingress-nginx. Rename to ingress.yaml and adjust `host` to use it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: crdt-cad
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  rules:
+    - host: crdt-cad.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: crdt-cad
+                port:
+                  name: http

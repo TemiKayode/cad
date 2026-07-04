@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>crdt-cad — 3D Mesh</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div class="brand">crdt-cad <a href="/">→ 2D sketch demo</a></div>
+      <div class="spacer"></div>
+      <label style="font-size:12px;color:var(--text-dim)">room</label>
+      <input id="roomInput" type="text" style="width:120px" />
+      <button id="shareBtn" title="Copy an invite link to this room">🔗 Share</button>
+      <span id="statusPill" class="status-pill connecting"><span class="status-dot"></span><span id="statusText">connecting</span></span>
+      <span id="p2pPill" class="status-pill" style="display:none"><span class="status-dot"></span><span id="p2pText">P2P</span></span>
+      <button id="offlineToggle">Go offline</button>
+    </div>
+
+    <div class="body">
+      <div class="panel left">
+        <div class="section-title">Tool</div>
+        <div class="tool-row">
+          <button id="toolVertex" class="active">⊕ Vertex</button>
+          <button id="toolFace">▲ Face</button>
+          <button id="toolMove">↖ Move</button>
+        </div>
+        <div class="empty-hint" id="toolHint">Click the ground grid to place a vertex.</div>
+
+        <div class="section-title">File</div>
+        <div class="tool-row">
+          <button id="saveBtn" style="flex:1">💾 Save</button>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="downloadJsonBtn" style="flex:1">.json</button>
+          <button id="downloadStlBtn" style="flex:1">.stl</button>
+        </div>
+
+        <div class="section-title">✨ AI Generate</div>
+        <div class="tool-row">
+          <input id="genPromptInput" type="text" style="flex:1" placeholder="e.g. a 4 bedroom house with a wooden floor" />
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="genBtn" style="flex:1">Generate</button>
+        </div>
+        <div class="empty-hint" id="genStatus">
+          Describe a house in plain English. Interpreted by Claude Fable 5
+          into a bounded floor plan (bedrooms/floors/material/style), or by
+          an offline heuristic parser if no API key is configured — then
+          built into a real watertight mesh and synced as CRDT ops, just
+          like any other edit.
+        </div>
+
+        <div class="section-title">Selected Face</div>
+        <div id="facePanel"><div class="empty-hint">Select a face (click one of its edges/fill in Move tool) to extrude it.</div></div>
+
+        <div class="section-title">Vertices (<span id="vertexCount">0</span>)</div>
+        <div id="vertexList" style="max-height:160px;overflow:auto"></div>
+
+        <div class="section-title">Faces (<span id="faceCount">0</span>)</div>
+        <div id="faceList"></div>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="canvas3d"></canvas>
+        <div id="cursorLayer"></div>
+      </div>
+
+      <div class="panel right">
+        <div class="section-title">Presence (<span id="presenceCount">0</span>)</div>
+        <div id="presenceList"></div>
+
+        <div class="section-title">How this demo works</div>
+        <div class="empty-hint">
+          Every vertex move, edge, and face boundary edit is a CRDT op synced over
+          the same relay used by the 2D demo, just pointed at a
+          <code>MeshCRDT</code> room instead of a <code>DrawingDocument</code>
+          room. Toggle "Go offline", edit the mesh, then reconnect — your
+          changes merge with anything collaborators did in the meantime with
+          no conflicts.
+        </div>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <span>actor: <b id="actorLabel"></b></span>
+      <span id="opsCounter">0 ops relayed</span>
+      <span id="offlineCounter"></span>
+      <span style="flex:1"></span>
+      <span>drag to orbit · scroll to zoom · right-drag to pan</span>
+    </div>
+  </div>
+
+  <script src="/static/common.js"></script>
+  <script type="module" src="/static/mesh3d.js"></script>
+</body>
+</html>
