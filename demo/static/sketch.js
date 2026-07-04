@@ -36,7 +36,29 @@ let lastMousePt = null;
 
 // -- wire <-> local state -----------------------------------------------------
 
+/** Bumps `clock` past every OpId found in a freshly-loaded snapshot -- see
+ * the identical helper (and the LWW tie-break bug it fixes) in mesh3d.js /
+ * LocalClock.observe() in common.js for the full rationale. Without this, a
+ * fresh client's first edit to something another actor already touched at a
+ * higher counter (e.g. a bulk SVG/DXF import) would silently lose. */
+function observeSnapshotCounters(doc) {
+  let maxCounter = 0;
+  const bump = (idPair) => { if (idPair && idPair[0] > maxCounter) maxCounter = idPair[0]; };
+  const scanEntries = (lww) => { if (lww) for (const e of lww.entries) bump(e.id); };
+  scanEntries(doc.layers);
+  for (const m of Object.values(doc.layer_props || {})) scanEntries(m);
+  scanEntries(doc.path_index);
+  for (const m of Object.values(doc.path_props || {})) scanEntries(m);
+  for (const rga of Object.values(doc.paths || {})) {
+    for (const n of rga.nodes) { bump(n.id); bump(n.db); }
+  }
+  scanEntries(doc.comments);
+  scanEntries(doc.presence);
+  clock.observe(maxCounter);
+}
+
 function loadSnapshot(doc) {
+  observeSnapshotCounters(doc);
   state.layers.clear();
   state.layerOrder = [];
   for (const e of doc.layers.entries) {
@@ -75,6 +97,7 @@ function loadSnapshot(doc) {
 
 function applyOp(op) {
   const p = op.payload;
+  if (p && p.id) clock.observe(p.id[0]);
   if (op.target === "layer") {
     if (!p.d) {
       if (!state.layers.has(p.k)) {

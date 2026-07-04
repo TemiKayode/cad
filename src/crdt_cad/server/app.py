@@ -249,8 +249,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class _NoCacheStaticFiles(StaticFiles):
+    """Forces browsers to always revalidate (via the ETag/Last-Modified
+    conditional GET Starlette already sets) instead of trusting a local
+    heuristic cache for these files. Without this, editing demo JS/CSS
+    during active development can silently keep serving an old version
+    to an already-open tab even after a plain refresh -- there's no
+    build step or cache-busted filename to force a fetch otherwise."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 if DEMO_STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(DEMO_STATIC_DIR)), name="static")
+    app.mount("/static", _NoCacheStaticFiles(directory=str(DEMO_STATIC_DIR)), name="static")
 
 
 @app.get("/")

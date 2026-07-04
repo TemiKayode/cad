@@ -480,11 +480,15 @@ connection.
 
 **3D mesh (`/3d`)**: click the ground grid to place vertices, click 3+
 vertices in order (then the first one again, or "Finish") to build a
-face, drag vertices to move them, select a face and **Extrude** to turn
-it into a prism, the same **Save**/download(**.json/.stl**)/**Share**/
+face, drag a vertex to move it (or type exact X/Y/Z into the vertex
+list), select a face to **recolor it, tag its material, extrude it
+into a prism, or delete it**, the same **Save**/download(**.json/.stl**)/**Share**/
 offline toggle set, plus an **AI Generate** box -- describe a house in
 plain English and a real procedurally-built mesh streams into the scene
-as CRDT ops, exactly like any other collaborator's edit.
+as CRDT ops, exactly like any other collaborator's edit. Every one of
+these -- including a face's color and material -- is a `face_prop`
+`LWWMap` write, so recoloring a face you didn't create merges the same
+conflict-free way a vertex move does.
 
 ## Testing
 
@@ -517,11 +521,27 @@ reconnecting through a real Time-Travel Merge panel; a real
 `RTCPeerConnection` negotiating between two headless Chrome tabs; the
 strict Polygon tool's rejection round-trip; every download/import/save
 button; and the Docker image built, run, and checked for
-persistence-across-container-restart. Two real bugs were caught this
-way that no unit test had covered (a fire-and-forget background task
-that hung the process at exit, and "offline" not tearing down an
-already-open P2P channel) -- both are now fixed and specifically
+persistence-across-container-restart. Real bugs were caught this way
+that no unit test had covered (a fire-and-forget background task that
+hung the process at exit, and "offline" not tearing down an
+already-open P2P channel) -- both fixed and specifically
 regression-tested.
+
+A third, more interesting one turned up while browser-verifying the
+face color/material editor: `LocalClock` (`common.js`, shared by both
+demos) minted OpIds by incrementing a plain local counter from zero,
+without ever *observing* the counters on incoming ops the way the
+Python `LamportClock.observe()` already does server-side. A fresh
+client joining a room the AI generator (or an import, or any other
+actor) had already populated with higher-numbered ops would have its
+own edits silently lose the LWW `(counter, actor)` tie-break -- not an
+error, just a change that never visibly took effect, exactly the kind
+of bug a unit test wouldn't catch (it requires two real actors and a
+real reconnect sequence) but a live two-actor Playwright run surfaces
+immediately. Fixed by adding `LocalClock.observe()` and calling it from
+both demos' `loadSnapshot()`/`applyOp()`, so a replica's clock always
+catches up to the highest counter it has seen before minting its next
+local op.
 
 ## Deployment
 

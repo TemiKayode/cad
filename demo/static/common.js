@@ -235,6 +235,15 @@ class LocalClock {
     this.counter += 1;
     return [this.counter, this.actor];
   }
+  /** Lamport clock rule: bump past any counter this replica has observed,
+   * so a later local edit is guaranteed a higher OpId than anything it has
+   * already seen (including a big batch from another actor, e.g. an AI
+   * generator or an import) and doesn't lose an LWW tie-break it should
+   * win just because this replica's own counter started fresh at 0.
+   * Mirrors LamportClock.observe() on the Python server side. */
+  observe(counter) {
+    if (counter > this.counter) this.counter = counter;
+  }
 }
 
 function lwwOp(id, key, value, deleted = false) {

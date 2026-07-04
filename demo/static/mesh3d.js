@@ -33,7 +33,29 @@ let pendingFaceLoop = [];
 
 // -- wire <-> local state -----------------------------------------------------
 
+/** Bumps `clock` past every OpId found in a freshly-loaded snapshot, so this
+ * replica's own next local edit is guaranteed to out-rank anything already in
+ * the document -- otherwise a fresh page load of a room an AI generator (or
+ * anyone else) already populated with high-counter ops would leave this
+ * client's clock at 0, and its first edits would silently lose LWW
+ * tie-breaks against that existing content. See LocalClock.observe(). */
+function observeSnapshotCounters(doc) {
+  let maxCounter = 0;
+  const bump = (idPair) => { if (idPair && idPair[0] > maxCounter) maxCounter = idPair[0]; };
+  const scanEntries = (lww) => { if (lww) for (const e of lww.entries) bump(e.id); };
+  scanEntries(doc.vertices);
+  scanEntries(doc.edges);
+  scanEntries(doc.face_index);
+  for (const rga of Object.values(doc.faces || {})) {
+    for (const n of rga.nodes) { bump(n.id); bump(n.db); }
+  }
+  for (const m of Object.values(doc.face_props || {})) scanEntries(m);
+  scanEntries(doc.presence);
+  clock.observe(maxCounter);
+}
+
 function loadSnapshot(doc) {
+  observeSnapshotCounters(doc);
   state.vertices.clear();
   for (const e of doc.vertices.entries) if (!e.d) state.vertices.set(e.k, e.v);
   state.edges = new Set(doc.edges.entries.filter((e) => !e.d).map((e) => e.k));
@@ -55,6 +77,7 @@ function loadSnapshot(doc) {
 
 function applyOp(op) {
   const p = op.payload;
+  if (p && p.id) clock.observe(p.id[0]);
   if (op.target === "vertex") {
     if (!p.d) state.vertices.set(p.k, p.v); else state.vertices.delete(p.k);
   } else if (op.target === "edge") {
@@ -102,6 +125,9 @@ function addFaceOps(faceId, loop) {
 }
 function removeFaceOp(faceId) {
   return { target: "face_index", payload: lwwOp(clock.tick(), faceId, null, true) };
+}
+function setFacePropOp(faceId, key, value) {
+  return { target: "face_prop", face_id: faceId, payload: lwwOp(clock.tick(), key, value, false) };
 }
 
 // -- relay connection -----------------------------------------------------------
@@ -260,6 +286,13 @@ function removeFace(id) {
   applyOp(op);
   sendOps([op]);
   if (ui.selectedFace === id) ui.selectedFace = null;
+  syncScene();
+}
+
+function setFaceProp(faceId, key, value) {
+  const op = setFacePropOp(faceId, key, value);
+  applyOp(op);
+  sendOps([op]);
   syncScene();
 }
 
@@ -501,12 +534,31 @@ function raycastFaces() {
 let dragState = null;
 let lastMoveSent = 0;
 
+/** Starts dragging an existing vertex. Plain drag moves it across the
+ * horizontal plane at its current height (X/Z, the common case -- resizing
+ * a footprint). Shift+drag instead moves it only vertically (Y), using a
+ * plane through the vertex facing the camera so mouse-up/down maps to
+ * world-up/down regardless of viewing angle -- there's no 3-axis gizmo
+ * here, so a modifier key is the lightweight way to reach the third axis. */
+function startVertexDrag(vid, vertical) {
+  const pos = state.vertices.get(vid);
+  if (vertical) {
+    const camDir = new THREE.Vector3();
+    camera.getWorldDirection(camDir);
+    camDir.y = 0;
+    if (camDir.lengthSq() < 1e-6) camDir.set(0, 0, 1);
+    camDir.normalize();
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camDir, new THREE.Vector3(...pos));
+    dragState = { vertexId: vid, plane, vertical: true, fixedX: pos[0], fixedZ: pos[2] };
+  } else {
+    dragState = { vertexId: vid, plane: new THREE.Plane(new THREE.Vector3(0, 1, 0), -pos[1]), vertical: false };
+  }
+  controls.enabled = false;
+}
+
 renderer.domElement.addEventListener("pointerdown", (e) => {
   updateMouse(e);
-  if (ui.tool === "vertex") {
-    const pt = raycastGround();
-    if (pt) addVertex([round(pt.x), 0, round(pt.z)]);
-  } else if (ui.tool === "face") {
+  if (ui.tool === "face") {
     const vmesh = raycastVertices();
     if (vmesh) {
       const vid = vmesh.userData.vertexId;
@@ -518,18 +570,26 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
         syncScene();
       }
     }
+    return;
+  }
+
+  // Vertex and Move tools both let you grab and drag an existing vertex --
+  // previously this only worked in the Move tool, so a user on the default
+  // Vertex tool had no way to reposition a point they'd just placed without
+  // first discovering the separate Move tool.
+  const vmesh = raycastVertices();
+  if (vmesh) {
+    startVertexDrag(vmesh.userData.vertexId, e.shiftKey);
+    return;
+  }
+
+  if (ui.tool === "vertex") {
+    const pt = raycastGround();
+    if (pt) addVertex([round(pt.x), 0, round(pt.z)]);
   } else if (ui.tool === "move") {
-    const vmesh = raycastVertices();
-    if (vmesh) {
-      const vid = vmesh.userData.vertexId;
-      const y = state.vertices.get(vid)[1];
-      dragState = { vertexId: vid, plane: new THREE.Plane(new THREE.Vector3(0, 1, 0), -y) };
-      controls.enabled = false;
-    } else {
-      const fmesh = raycastFaces();
-      ui.selectedFace = fmesh ? fmesh.userData.faceId : null;
-      renderPanels();
-    }
+    const fmesh = raycastFaces();
+    ui.selectedFace = fmesh ? fmesh.userData.faceId : null;
+    renderPanels();
   }
 });
 
@@ -541,7 +601,9 @@ renderer.domElement.addEventListener("pointermove", (e) => {
   const ok = raycaster.ray.intersectPlane(dragState.plane, hit);
   if (!ok) return;
   const current = state.vertices.get(dragState.vertexId);
-  const pos = [round(hit.x), current[1], round(hit.z)];
+  const pos = dragState.vertical
+    ? [dragState.fixedX, round(hit.y), dragState.fixedZ]
+    : [round(hit.x), current[1], round(hit.z)];
   state.vertices.set(dragState.vertexId, pos);
   const mesh = vertexMeshes.get(dragState.vertexId);
   if (mesh) mesh.position.set(pos[0], pos[1], pos[2]);
@@ -572,9 +634,9 @@ function setTool(tool) {
     document.getElementById(id).classList.toggle("active", tool === t);
   }
   const hints = {
-    vertex: "Click the ground grid to place a vertex.",
+    vertex: "Click the ground grid to place a vertex, or drag an existing one to move it (hold Shift to move it up/down instead).",
     face: "Click 3+ vertices in order, then click the first one again (or use Finish) to create a face.",
-    move: "Drag a vertex to move it. Click empty space on a face to select it for extrusion.",
+    move: "Drag a vertex to move it (hold Shift to move it up/down; or type exact X/Y/Z below). Click empty space on a face to select it for extrusion, recoloring, or a material tag.",
   };
   document.getElementById("toolHint").textContent = hints[tool];
   if (tool !== "face" && pendingFaceLoop.length) cancelFace();
@@ -620,16 +682,27 @@ function renderToolHint() {
 
 function renderFacePanel() {
   const panel = document.getElementById("facePanel");
+  // Don't clobber an in-progress color/material edit if a concurrent op
+  // (another user's edit, or even our own color `input` events) triggers a
+  // re-render while this panel still has focus -- a full innerHTML rebuild
+  // would otherwise reset the field and drop keystrokes/cursor position.
+  if (panel.contains(document.activeElement)) return;
   if (!ui.selectedFace || !state.faceIndex.has(ui.selectedFace)) {
-    panel.innerHTML = '<div class="empty-hint">Select a face (Move tool, click its fill) to extrude it.</div>';
+    panel.innerHTML = '<div class="empty-hint">Select a face (Move tool, click its fill) to extrude or restyle it.</div>';
     return;
   }
   const faceId = ui.selectedFace;
+  const props = state.faceProps.get(faceId) || {};
+  const currentColor = /^#[0-9a-fA-F]{6}$/.test(props.color) ? props.color : `#${faceColor(faceId).toString(16).padStart(6, "0")}`;
   panel.innerHTML = `
+    <div class="field-row"><label>Color</label><input id="faceColorInput" type="color" value="${currentColor}" style="width:56px;height:28px;padding:2px"/></div>
+    <div class="field-row"><label>Material</label><input id="faceMaterialInput" type="text" value="${escapeHtml(props.material || "")}" placeholder="e.g. wood" style="width:130px"/></div>
     <div class="field-row"><label>Height</label><input id="extrudeHeight" type="number" step="0.25" value="1" style="width:70px"/></div>
     <button id="extrudeBtn" style="width:100%">Extrude</button>
     <button class="danger" id="deleteFaceBtn" style="width:100%;margin-top:6px">Delete face</button>
   `;
+  document.getElementById("faceColorInput").addEventListener("input", (e) => setFaceProp(faceId, "color", e.target.value));
+  document.getElementById("faceMaterialInput").addEventListener("change", (e) => setFaceProp(faceId, "material", e.target.value.trim()));
   document.getElementById("extrudeBtn").onclick = () => {
     const h = parseFloat(document.getElementById("extrudeHeight").value) || 1;
     extrudeFace(faceId, h);
@@ -640,11 +713,32 @@ function renderFacePanel() {
 function renderVertexList() {
   const list = document.getElementById("vertexList");
   document.getElementById("vertexCount").textContent = state.vertices.size;
+  // Same in-progress-edit guard as renderFacePanel -- typing a coordinate
+  // shouldn't get wiped out by a re-render triggered elsewhere (e.g. a
+  // collaborator's concurrent edit) before you've finished.
+  if (list.contains(document.activeElement)) return;
   list.innerHTML = "";
   for (const [id, pos] of state.vertices) {
     const row = document.createElement("div");
     row.className = "path-row";
-    row.innerHTML = `<span class="path-swatch" style="background:#d7dbe0"></span><span class="name">${pos.map((n) => n.toFixed(2)).join(", ")}</span><button class="ghost-btn" data-act="del">✕</button>`;
+    row.innerHTML =
+      `<span class="path-swatch" style="background:#d7dbe0"></span>` +
+      `<span class="name">` +
+      [0, 1, 2].map((axis) => `<input class="vertex-coord" data-axis="${axis}" type="number" step="0.1" value="${pos[axis].toFixed(2)}"/>`).join(" ") +
+      `</span>` +
+      `<button class="ghost-btn" data-act="del">✕</button>`;
+    for (const input of row.querySelectorAll(".vertex-coord")) {
+      input.addEventListener("change", (e) => {
+        const current = state.vertices.get(id);
+        if (!current) return;
+        const next = current.slice();
+        next[parseInt(e.target.dataset.axis, 10)] = parseFloat(e.target.value) || 0;
+        const op = addVertexOp(id, next);
+        applyOp(op);
+        sendOps([op]);
+        syncScene();
+      });
+    }
     row.querySelector('[data-act="del"]').onclick = () => removeVertex(id);
     list.appendChild(row);
   }
@@ -660,8 +754,17 @@ function renderFaceList() {
     const label = material ? `${loop.length}-gon · ${escapeHtml(material)}` : `${loop.length}-gon`;
     const row = document.createElement("div");
     row.className = "path-row" + (id === ui.selectedFace ? " active" : "");
+    row.style.cursor = "pointer";
+    row.title = "Select this face to recolor, tag, extrude, or delete it";
     row.innerHTML = `<span class="path-swatch" style="background:#${faceColor(id).toString(16).padStart(6, "0")}"></span><span class="name">${label}</span><button class="ghost-btn" data-act="del">✕</button>`;
-    row.querySelector(".name").onclick = () => { ui.selectedFace = id; renderPanels(); };
+    // The whole row selects the face -- not just the text label -- since
+    // clicking the color swatch itself is the most natural first thing to
+    // try when looking for a color control, and that used to do nothing.
+    row.addEventListener("click", (e) => {
+      if (e.target.closest('[data-act="del"]')) return;
+      ui.selectedFace = id;
+      renderPanels();
+    });
     row.querySelector('[data-act="del"]').onclick = () => removeFace(id);
     list.appendChild(row);
   }

@@ -47,6 +47,28 @@ input[type="text"], input[type="number"] {
   padding: 5px 8px;
 }
 
+input[type="color"] {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.vertex-coord {
+  width: 56px;
+  padding: 5px 4px;
+  text-align: center;
+  /* drop the spin-button arrows so 5-6 character values (e.g. "12.34",
+     "-0.05") aren't squeezed and clipped in this narrow sidebar list */
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.vertex-coord::-webkit-outer-spin-button,
+.vertex-coord::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
 .app {
   display: grid;
   grid-template-rows: 48px 1fr 26px;
