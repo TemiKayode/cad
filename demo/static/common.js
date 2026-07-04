@@ -47,6 +47,87 @@ function colorForActor(actorId) {
   return ACTOR_COLORS[hash % ACTOR_COLORS.length];
 }
 
+// -- optional shared-secret room auth ------------------------------------------
+//
+// Mirrors crdt_cad.server.security: entirely opt-in. GET /api/auth/required
+// reports whether the server has CRDT_CAD_SECRET configured at all; when it
+// doesn't (the zero-config default), ensureRoomAccess() resolves to null
+// immediately and nothing below ever runs. When it does, a room-scoped
+// signed token is required for both the WS "hello" handshake and every
+// REST call that touches a room -- see the Share button wiring in
+// sketch.js/mesh3d.js for how a token gets embedded in an invite link so
+// the recipient skips re-entering the secret.
+
+function _tokenStorageKey(kind, room) {
+  return `crdt_cad_token:${kind}:${room}`;
+}
+
+function roomTokenFor(kind, room) {
+  return localStorage.getItem(_tokenStorageKey(kind, room));
+}
+
+function clearRoomToken(kind, room) {
+  localStorage.removeItem(_tokenStorageKey(kind, room));
+}
+
+/** Appends `?token=`/`&token=` to a REST URL if this room has one stored --
+ * a no-op (returns `url` unchanged) when auth isn't configured, since
+ * roomTokenFor() then has nothing stored to return. Every REST call the
+ * demos make against a `{room_id}`-scoped endpoint needs this, mirroring
+ * require_room_access() on the server side. */
+function withToken(url, kind, room) {
+  const token = roomTokenFor(kind, room);
+  if (!token) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}token=${encodeURIComponent(token)}`;
+}
+
+/** Resolves to a valid room token, or null if this server has no secret
+ * configured. Checks (in order): a `?token=` query param (invite link),
+ * a previously-stored token for this room, then -- only if the server
+ * actually requires one -- prompts for the shared secret and exchanges it
+ * for a token via POST /api/auth/token, retrying on a wrong guess. */
+async function ensureRoomAccess(kind, room) {
+  const params = new URLSearchParams(location.search);
+  const urlToken = params.get("token");
+  if (urlToken) {
+    localStorage.setItem(_tokenStorageKey(kind, room), urlToken);
+    return urlToken;
+  }
+
+  const stored = roomTokenFor(kind, room);
+  if (stored) return stored;
+
+  let required = false;
+  try {
+    const resp = await fetch("/api/auth/required");
+    required = (await resp.json()).required;
+  } catch (err) {
+    return null; // fail open to "no auth" -- matches the server's own zero-config default
+  }
+  if (!required) return null;
+
+  for (;;) {
+    const secret = window.prompt("This room requires a shared secret to join. Enter it:");
+    if (secret === null) continue; // no usable "cancel" once auth is actually required -- keep asking
+    try {
+      const resp = await fetch("/api/auth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ secret, kind, room_id: room }),
+      });
+      if (resp.ok) {
+        const { token } = await resp.json();
+        localStorage.setItem(_tokenStorageKey(kind, room), token);
+        return token;
+      }
+      window.alert("Incorrect secret -- try again.");
+    } catch (err) {
+      window.alert(`Could not reach the server: ${err.message}`);
+    }
+  }
+}
+
 /** Poor-man's vector clock: actor -> highest op counter seen. Just a
  * pointwise-max tracker (the same one-line rule VectorClock.record uses
  * server-side) -- not a merge algorithm, so it's safe to keep this tiny. */
@@ -91,10 +172,16 @@ class FrontierTracker {
  *     (apply their ops, then flush ours) whenever the caller is ready --
  *     the CRDT converges either way, this is purely a review step.
  */
+// WebSocket close codes the server uses for its optional security hardening
+// (crdt_cad.server.app, WS_CLOSE_* constants) -- mirrored here so the client
+// can react appropriately instead of treating them as an ordinary drop.
+const WS_CLOSE_UNAUTHORIZED = 4401;
+
 class RelayConnection {
-  constructor(wsPath, actorId, { onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onMergePreview }) {
+  constructor(wsPath, actorId, { onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onMergePreview, token }) {
     this.wsPath = wsPath;
     this.actorId = actorId;
+    this.token = token || null;
     this.onSnapshot = onSnapshot || (() => {});
     this.onDelta = onDelta || (() => {});
     this.onOps = onOps || (() => {});
@@ -126,11 +213,20 @@ class RelayConnection {
       ws.send(JSON.stringify({
         type: "hello",
         actor: this.actorId,
+        token: this.token,
         known_frontier: Object.keys(this.frontier.counters).length ? this.frontier.toDict() : null,
       }));
     };
     ws.onmessage = (event) => this._handleMessage(JSON.parse(event.data));
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      if (event.code === WS_CLOSE_UNAUTHORIZED) {
+        // The room's shared secret changed, our token expired, or it was
+        // never valid -- retrying with the same bad token forever would
+        // just spam reconnect attempts that can never succeed. Surface a
+        // distinct status so the UI can prompt for a fresh secret instead.
+        this.onStatus("unauthorized");
+        return;
+      }
       this.onStatus("offline");
       if (!this.userWantsOffline) {
         setTimeout(() => this._connect(), this._reconnectDelay);

@@ -17,6 +17,10 @@ geometry_rejections_total = Counter(
     "crdt_cad_geometry_rejections_total",
     "Ops rejected by the pre-commit geometry validity gate (zero-length/self-intersecting)",
 )
+rate_limited_total = Counter(
+    "crdt_cad_rate_limited_total",
+    "Ops messages rejected by a rate limit (per-connection, per-room, or per-IP)",
+)
 active_connections = Gauge(
     "crdt_cad_active_connections", "Currently open WebSocket connections"
 )

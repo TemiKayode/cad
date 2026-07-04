@@ -162,24 +162,35 @@ function applyIncomingOps(ops) {
 
 // -- relay connection -----------------------------------------------------------
 
-const conn = new RelayConnection(`/ws/${encodeURIComponent(room)}`, actorId, {
-  onSnapshot: (doc) => { loadSnapshot(doc); },
-  onDelta: (ops) => applyIncomingOps(ops),
-  onOps: (ops) => applyIncomingOps(ops),
-  onStatus: (status) => setStatus(status),
-  onRejected: (reason, op) => {
-    revertRejectedOp(op);
-    renderAll();
-    showToast(`Rejected: ${reason}`, "error");
-  },
-  onSaved: () => showToast("Saved", "success"),
-  onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeDocOps, proceed),
-});
+// `conn`/`p2p` are assigned inside the async bootstrap below (ensureRoomAccess
+// awaits an /api/auth/required check, and possibly a passphrase prompt,
+// before a token -- or null, on the zero-config default -- is available).
+// Every reference elsewhere in this file is inside a function or event
+// handler, so it only runs well after this has resolved.
+let conn, p2p;
 
-const p2p = new P2PManager(conn, actorId, {
-  onPeerData: (_peerActorId, ops) => applyIncomingOps(ops),
-  onPeerStatus: () => updateP2pPill(),
-});
+(async () => {
+  const token = await ensureRoomAccess("drawing", room);
+  conn = new RelayConnection(`/ws/${encodeURIComponent(room)}`, actorId, {
+    onSnapshot: (doc) => { loadSnapshot(doc); },
+    onDelta: (ops) => applyIncomingOps(ops),
+    onOps: (ops) => applyIncomingOps(ops),
+    onStatus: (status) => setStatus(status),
+    onRejected: (reason, op) => {
+      revertRejectedOp(op);
+      renderAll();
+      showToast(`Rejected: ${reason}`, "error");
+    },
+    onSaved: () => showToast("Saved", "success"),
+    onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeDocOps, proceed),
+    token,
+  });
+
+  p2p = new P2PManager(conn, actorId, {
+    onPeerData: (_peerActorId, ops) => applyIncomingOps(ops),
+    onPeerStatus: () => updateP2pPill(),
+  });
+})();
 
 function updateP2pPill() {
   const pill = document.getElementById("p2pPill");
@@ -204,6 +215,23 @@ function setStatus(status) {
   pill.className = `status-pill ${status}`;
   document.getElementById("statusText").textContent = status;
   document.getElementById("offlineToggle").textContent = status === "offline" ? "Reconnect" : "Go offline";
+  if (status === "unauthorized") {
+    // The token we had (or lack thereof) was rejected -- clear it and
+    // re-prompt rather than let RelayConnection keep retrying with the
+    // same bad token forever (see the WS_CLOSE_UNAUTHORIZED handling in
+    // common.js). Also strip any ?token= from the URL first: otherwise
+    // ensureRoomAccess() would just re-adopt the same just-proven-bad
+    // token from the URL again instead of ever reaching the re-prompt.
+    clearRoomToken("drawing", room);
+    const url = new URL(location.href);
+    url.searchParams.delete("token");
+    history.replaceState({}, "", url);
+    showToast("Incorrect or expired room secret -- please try again", "error");
+    ensureRoomAccess("drawing", room).then((token) => {
+      conn.token = token;
+      conn._connect();
+    });
+  }
 }
 
 document.getElementById("offlineToggle").onclick = () => {
@@ -236,11 +264,11 @@ function triggerDownload(url) {
   a.remove();
 }
 document.getElementById("downloadJsonBtn").onclick = () =>
-  triggerDownload(`/api/rooms/${encodeURIComponent(room)}/export/json`);
+  triggerDownload(withToken(`/api/rooms/${encodeURIComponent(room)}/export/json`, "drawing", room));
 document.getElementById("downloadSvgBtn").onclick = () =>
-  triggerDownload(`/api/rooms/${encodeURIComponent(room)}/export/svg`);
+  triggerDownload(withToken(`/api/rooms/${encodeURIComponent(room)}/export/svg`, "drawing", room));
 document.getElementById("downloadDxfBtn").onclick = () =>
-  triggerDownload(`/api/rooms/${encodeURIComponent(room)}/export/dxf`);
+  triggerDownload(withToken(`/api/rooms/${encodeURIComponent(room)}/export/dxf`, "drawing", room));
 
 document.getElementById("importBtn").onclick = () => document.getElementById("importFileInput").click();
 document.getElementById("importFileInput").addEventListener("change", async (e) => {
@@ -254,7 +282,7 @@ document.getElementById("importFileInput").addEventListener("change", async (e) 
   }
   const body = ext === "svg" ? await file.text() : await file.arrayBuffer();
   try {
-    const resp = await fetch(`/api/rooms/${encodeURIComponent(room)}/import/${ext}`, { method: "POST", body });
+    const resp = await fetch(withToken(`/api/rooms/${encodeURIComponent(room)}/import/${ext}`, "drawing", room), { method: "POST", body });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.detail || `HTTP ${resp.status}`);
@@ -268,7 +296,9 @@ document.getElementById("importFileInput").addEventListener("change", async (e) 
 });
 
 document.getElementById("shareBtn").onclick = async () => {
-  const url = `${location.origin}/?room=${encodeURIComponent(room)}`;
+  let url = `${location.origin}/?room=${encodeURIComponent(room)}`;
+  const token = roomTokenFor("drawing", room);
+  if (token) url += `&token=${encodeURIComponent(token)}`;
   try {
     await navigator.clipboard.writeText(url);
     showToast("Invite link copied to clipboard", "success");

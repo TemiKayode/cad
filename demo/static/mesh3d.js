@@ -138,19 +138,30 @@ function applyIncomingOps(ops) {
   syncScene();
 }
 
-const conn = new RelayConnection(`/ws/mesh/${encodeURIComponent(room)}`, actorId, {
-  onSnapshot: (doc) => loadSnapshot(doc),
-  onDelta: (ops) => applyIncomingOps(ops),
-  onOps: (ops) => applyIncomingOps(ops),
-  onStatus: (status) => setStatus(status),
-  onSaved: () => showToast("Saved", "success"),
-  onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
-});
+// `conn`/`p2p` are assigned inside the async bootstrap below (ensureRoomAccess
+// awaits an /api/auth/required check, and possibly a passphrase prompt,
+// before a token -- or null, on the zero-config default -- is available).
+// Every reference elsewhere in this file is inside a function or event
+// handler, so it only runs well after this has resolved.
+let conn, p2p;
 
-const p2p = new P2PManager(conn, actorId, {
-  onPeerData: (_peerActorId, ops) => applyIncomingOps(ops),
-  onPeerStatus: () => updateP2pPill(),
-});
+(async () => {
+  const token = await ensureRoomAccess("mesh", room);
+  conn = new RelayConnection(`/ws/mesh/${encodeURIComponent(room)}`, actorId, {
+    onSnapshot: (doc) => loadSnapshot(doc),
+    onDelta: (ops) => applyIncomingOps(ops),
+    onOps: (ops) => applyIncomingOps(ops),
+    onStatus: (status) => setStatus(status),
+    onSaved: () => showToast("Saved", "success"),
+    onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
+    token,
+  });
+
+  p2p = new P2PManager(conn, actorId, {
+    onPeerData: (_peerActorId, ops) => applyIncomingOps(ops),
+    onPeerStatus: () => updateP2pPill(),
+  });
+})();
 
 function updateP2pPill() {
   const pill = document.getElementById("p2pPill");
@@ -175,6 +186,25 @@ function setStatus(status) {
   pill.className = `status-pill ${status}`;
   document.getElementById("statusText").textContent = status;
   document.getElementById("offlineToggle").textContent = status === "offline" ? "Reconnect" : "Go offline";
+  if (status === "unauthorized") {
+    // See the identical comment in sketch.js -- the token we had (or lack
+    // thereof) was rejected; clear it and re-prompt rather than let
+    // RelayConnection retry forever with the same bad token. Also strip
+    // any ?token= from the URL first: ensureRoomAccess() trusts a URL
+    // token unconditionally (that's what makes invite links friction-free
+    // for a legitimate recipient), so leaving a just-proven-bad one in
+    // place would make it re-adopt the same bad token forever instead of
+    // ever reaching the actual re-prompt.
+    clearRoomToken("mesh", room);
+    const url = new URL(location.href);
+    url.searchParams.delete("token");
+    history.replaceState({}, "", url);
+    showToast("Incorrect or expired room secret -- please try again", "error");
+    ensureRoomAccess("mesh", room).then((token) => {
+      conn.token = token;
+      conn._connect();
+    });
+  }
 }
 document.getElementById("offlineToggle").onclick = () => {
   if (conn.userWantsOffline) {
@@ -200,12 +230,14 @@ function triggerDownload(url) {
   a.remove();
 }
 document.getElementById("downloadJsonBtn").onclick = () =>
-  triggerDownload(`/api/mesh/${encodeURIComponent(room)}/export/json`);
+  triggerDownload(withToken(`/api/mesh/${encodeURIComponent(room)}/export/json`, "mesh", room));
 document.getElementById("downloadStlBtn").onclick = () =>
-  triggerDownload(`/api/mesh/${encodeURIComponent(room)}/export/stl`);
+  triggerDownload(withToken(`/api/mesh/${encodeURIComponent(room)}/export/stl`, "mesh", room));
 
 document.getElementById("shareBtn").onclick = async () => {
-  const url = `${location.origin}/3d?room=${encodeURIComponent(room)}`;
+  let url = `${location.origin}/3d?room=${encodeURIComponent(room)}`;
+  const token = roomTokenFor("mesh", room);
+  if (token) url += `&token=${encodeURIComponent(token)}`;
   try {
     await navigator.clipboard.writeText(url);
     showToast("Invite link copied to clipboard", "success");
@@ -233,7 +265,7 @@ async function generateMesh() {
   genBtn.textContent = "Generating…";
   genStatus.textContent = "Generating mesh — this can take a few seconds…";
   try {
-    const resp = await fetch(`/api/mesh/${encodeURIComponent(room)}/generate`, {
+    const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/generate`, "mesh", room), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),

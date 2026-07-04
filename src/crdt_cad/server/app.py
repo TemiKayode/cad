@@ -55,7 +55,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -72,6 +72,7 @@ from crdt_cad.geometry.constraints import Constraint, Sketch
 from crdt_cad.geometry.validity import GeometryError, validate_new_point
 from crdt_cad.persistence.store import DocumentStore, SQLiteStore
 from crdt_cad.server import metrics
+from crdt_cad.server import security
 
 logger = logging.getLogger("crdt_cad.server")
 logging.basicConfig(level=logging.INFO)
@@ -124,6 +125,7 @@ class Room:
         self.clients: dict[str, WebSocket] = {}
         self._snapshot_task: asyncio.Task | None = None
         self._dirty_since_snapshot = False
+        self.ops_rate_limiter = security.new_room_ops_bucket()
 
     def mark_dirty(self) -> None:
         self._dirty_since_snapshot = True
@@ -229,6 +231,10 @@ class RoomManager:
         async with self._lock:
             room = self.rooms.get(room_id)
             if room is None:
+                if len(self.rooms) >= security.max_rooms_per_server():
+                    raise security.RoomLimitExceeded(
+                        f"server room limit reached ({security.max_rooms_per_server()})"
+                    )
                 room = Room(room_id, self.kind, self.doc_class, self.op_from_dict, self.store)
                 self.rooms[room_id] = room
             return room
@@ -244,7 +250,7 @@ room_manager = drawing_room_manager  # backwards-compatible alias
 app = FastAPI(title="crdt-cad collaboration server")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=security.cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -312,6 +318,66 @@ async def list_mesh_rooms() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Optional shared-secret room auth (opt-in via CRDT_CAD_SECRET; see
+# crdt_cad.server.security for the full design rationale)
+# ---------------------------------------------------------------------------
+
+
+class AuthRequiredResponse(BaseModel):
+    required: bool
+
+
+@app.get("/api/auth/required", response_model=AuthRequiredResponse)
+async def auth_required() -> AuthRequiredResponse:
+    return AuthRequiredResponse(required=security.auth_enabled())
+
+
+class TokenRequest(BaseModel):
+    secret: str
+    kind: str
+    room_id: str
+
+
+class TokenResponse(BaseModel):
+    token: str
+
+
+@app.post("/api/auth/token", response_model=TokenResponse)
+async def issue_token(req: TokenRequest) -> TokenResponse:
+    if not security.auth_enabled():
+        raise HTTPException(status_code=400, detail="authentication is not enabled on this server")
+    if req.kind not in ("drawing", "mesh"):
+        raise HTTPException(status_code=400, detail="kind must be 'drawing' or 'mesh'")
+    if not security.secret_matches(req.secret):
+        raise HTTPException(status_code=403, detail="incorrect secret")
+    return TokenResponse(token=security.mint_room_token(req.kind, req.room_id))
+
+
+def _extract_token(request: Request) -> Optional[str]:
+    token = request.query_params.get("token")
+    if token:
+        return token
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        return auth_header[7:]
+    return None
+
+
+def require_room_access(kind: str):
+    """A FastAPI dependency gating one REST endpoint's ``{room_id}`` behind
+    a valid room token -- a no-op (always passes) when
+    ``CRDT_CAD_SECRET`` isn't configured, matching every other auth check
+    in this module. FastAPI binds the returned callable's ``room_id``
+    parameter from the route's own path parameter automatically."""
+
+    async def _dep(room_id: str, request: Request) -> None:
+        if not security.verify_room_token(_extract_token(request), kind, room_id):
+            raise HTTPException(status_code=401, detail="missing or invalid room token")
+
+    return _dep
+
+
+# ---------------------------------------------------------------------------
 # Export / import (2D drawing rooms)
 # ---------------------------------------------------------------------------
 
@@ -324,20 +390,20 @@ def _attachment(content: str | bytes, media_type: str, filename: str) -> Respons
     )
 
 
-@app.get("/api/rooms/{room_id}/export/json")
+@app.get("/api/rooms/{room_id}/export/json", dependencies=[Depends(require_room_access("drawing"))])
 async def export_drawing_json(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     return _attachment(json.dumps(room.doc.to_dict(), indent=2), "application/json", f"{room_id}.json")
 
 
-@app.get("/api/rooms/{room_id}/export/svg")
+@app.get("/api/rooms/{room_id}/export/svg", dependencies=[Depends(require_room_access("drawing"))])
 async def export_drawing_svg(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     svg = drawing_to_svg_string(room.doc.path_list())
     return _attachment(svg, "image/svg+xml", f"{room_id}.svg")
 
 
-@app.get("/api/rooms/{room_id}/export/dxf")
+@app.get("/api/rooms/{room_id}/export/dxf", dependencies=[Depends(require_room_access("drawing"))])
 async def export_drawing_dxf(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     data = drawing_to_dxf_bytes(room.doc.path_list())
@@ -366,7 +432,7 @@ async def _import_paths(room_id: str, paths: list[list[tuple[float, float]]], la
     return ImportResult(layer_id=layer_id, path_count=count)
 
 
-@app.post("/api/rooms/{room_id}/import/svg", response_model=ImportResult)
+@app.post("/api/rooms/{room_id}/import/svg", response_model=ImportResult, dependencies=[Depends(require_room_access("drawing"))])
 async def import_drawing_svg(room_id: str, request: Request) -> ImportResult:
     body = await request.body()
     try:
@@ -376,7 +442,7 @@ async def import_drawing_svg(room_id: str, request: Request) -> ImportResult:
     return await _import_paths(room_id, paths, "Imported SVG")
 
 
-@app.post("/api/rooms/{room_id}/import/dxf", response_model=ImportResult)
+@app.post("/api/rooms/{room_id}/import/dxf", response_model=ImportResult, dependencies=[Depends(require_room_access("drawing"))])
 async def import_drawing_dxf(room_id: str, request: Request) -> ImportResult:
     body = await request.body()
     try:
@@ -391,13 +457,13 @@ async def import_drawing_dxf(room_id: str, request: Request) -> ImportResult:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/mesh/{room_id}/export/json")
+@app.get("/api/mesh/{room_id}/export/json", dependencies=[Depends(require_room_access("mesh"))])
 async def export_mesh_json(room_id: str) -> Response:
     room = await mesh_room_manager.get_or_create(room_id)
     return _attachment(json.dumps(room.doc.to_dict(), indent=2), "application/json", f"{room_id}.json")
 
 
-@app.get("/api/mesh/{room_id}/export/stl")
+@app.get("/api/mesh/{room_id}/export/stl", dependencies=[Depends(require_room_access("mesh"))])
 async def export_mesh_stl(room_id: str) -> Response:
     room = await mesh_room_manager.get_or_create(room_id)
     stl = mesh_to_stl(room.doc.vertex_positions(), room.doc.face_loops(), name=room_id.replace(" ", "_") or "mesh")
@@ -424,8 +490,12 @@ class GenerateMeshResult(BaseModel):
     batches: int
 
 
-@app.post("/api/mesh/{room_id}/generate", response_model=GenerateMeshResult)
-async def generate_mesh(room_id: str, req: GenerateMeshRequest) -> GenerateMeshResult:
+@app.post(
+    "/api/mesh/{room_id}/generate",
+    response_model=GenerateMeshResult,
+    dependencies=[Depends(require_room_access("mesh"))],
+)
+async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request) -> GenerateMeshResult:
     """Text -> 3D: interprets ``req.prompt`` into a :class:`HouseSpec`
     (Claude Fable 5 if available, a regex heuristic otherwise), builds a
     deterministic procedural mesh from it, mints a chronological batch of
@@ -435,10 +505,19 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest) -> GenerateMeshR
     The heavy work (LLM call + geometry construction) runs in a worker
     thread via ``asyncio.to_thread`` so it never blocks this room's (or
     any other room's) WebSocket loop, and is wrapped in a timeout so a
-    hung LLM call can't tie up a thread-pool slot forever.
+    hung LLM call can't tie up a thread-pool slot forever. Rate-limited
+    per client IP (``CRDT_CAD_GENERATE_PER_MINUTE``, default 6/min) since
+    each call burns real LLM spend and/or CPU time -- unlike the other
+    endpoints in this module, this limit applies unconditionally, even
+    when room auth is off, because the resource cost is real regardless
+    of whether the deployment cares about access control.
     """
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt must not be empty")
+
+    client_ip = request.client.host if request.client else "unknown"
+    if not security.generate_rate_limiter.allow(client_ip):
+        raise HTTPException(status_code=429, detail="generation rate limit exceeded -- try again shortly")
 
     room = await mesh_room_manager.get_or_create(room_id)
 
@@ -527,17 +606,64 @@ async def solve_endpoint(req: SolveRequest) -> SolveResponse:
 # ---------------------------------------------------------------------------
 
 
+# WebSocket close codes in the 4000-4999 private-use range (RFC 6455), chosen
+# to loosely echo familiar HTTP statuses so they're self-explanatory in logs.
+WS_CLOSE_BAD_HELLO = 4400
+WS_CLOSE_UNAUTHORIZED = 4401
+WS_CLOSE_TOO_MANY_CLIENTS = 4429
+WS_CLOSE_MESSAGE_TOO_LARGE = 4413
+WS_CLOSE_SERVER_AT_CAPACITY = 4503
+
+
+async def _receive_capped(websocket: WebSocket) -> Optional[dict]:
+    """Receives one JSON WS frame, enforcing security.max_ws_message_bytes()
+    on the raw text before any JSON parsing is attempted. Returns the
+    parsed dict, ``{}`` for a frame this JSON-only protocol doesn't
+    understand (binary, or malformed JSON -- silently ignored, same as
+    before this existed), or ``None`` if the client disconnected. Raises
+    ``security.MessageTooLarge`` for an oversized frame; the caller closes
+    the connection with a clear code rather than trying to process it."""
+    raw = await websocket.receive()
+    if raw.get("type") == "websocket.disconnect":
+        return None
+    text = raw.get("text")
+    if text is None:
+        return {}
+    if len(text.encode("utf-8")) > security.max_ws_message_bytes():
+        raise security.MessageTooLarge()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+
+
 async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) -> None:
     await websocket.accept()
-    room = await manager.get_or_create(room_id)
 
     try:
-        hello = await websocket.receive_json()
-    except WebSocketDisconnect:
+        room = await manager.get_or_create(room_id)
+    except security.RoomLimitExceeded:
+        await websocket.close(code=WS_CLOSE_SERVER_AT_CAPACITY)
+        return
+
+    if len(room.clients) >= security.max_clients_per_room():
+        await websocket.close(code=WS_CLOSE_TOO_MANY_CLIENTS)
+        return
+
+    try:
+        hello = await _receive_capped(websocket)
+    except security.MessageTooLarge:
+        await websocket.close(code=WS_CLOSE_MESSAGE_TOO_LARGE)
+        return
+    if hello is None:
         return
 
     if hello.get("type") != "hello" or not hello.get("actor"):
-        await websocket.close(code=4400)
+        await websocket.close(code=WS_CLOSE_BAD_HELLO)
+        return
+
+    if not security.verify_room_token(hello.get("token"), manager.kind, room_id):
+        await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
         return
 
     actor = str(hello["actor"])
@@ -561,10 +687,19 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
     else:
         await websocket.send_json(room.snapshot_message())
 
+    ops_bucket = security.new_ws_ops_bucket()
+
     try:
         while True:
-            message = await websocket.receive_json()
-            await _handle_message(room, actor, message)
+            try:
+                message = await _receive_capped(websocket)
+            except security.MessageTooLarge:
+                await websocket.close(code=WS_CLOSE_MESSAGE_TOO_LARGE)
+                return
+            if message is None:
+                break
+            if message:
+                await _handle_message(room, actor, message, ops_bucket)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -615,7 +750,7 @@ def _validate_op(room: Room, op) -> Optional[str]:
     return None
 
 
-async def _handle_message(room: Room, actor: str, message: dict) -> None:
+async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: security.TokenBucket) -> None:
     msg_type = message.get("type")
 
     if msg_type == "signal":
@@ -635,18 +770,61 @@ async def _handle_message(room: Room, actor: str, message: dict) -> None:
         return
 
     ops_wire = message.get("ops", [])
+
+    if len(ops_wire) > security.max_ops_per_message():
+        ws = room.clients.get(actor)
+        if ws is not None:
+            await ws.send_json(
+                {"type": "rejected", "reason": f"too many ops in one message (max {security.max_ops_per_message()})"}
+            )
+        return
+
+    if not ops_bucket.allow(cost=len(ops_wire)):
+        metrics.rate_limited_total.inc()
+        ws = room.clients.get(actor)
+        if ws is not None:
+            await ws.send_json({"type": "rejected", "reason": "rate limit exceeded -- slow down"})
+        return
+
+    if not room.ops_rate_limiter.allow(cost=len(ops_wire)):
+        metrics.rate_limited_total.inc()
+        ws = room.clients.get(actor)
+        if ws is not None:
+            await ws.send_json({"type": "rejected", "reason": "room-wide rate limit exceeded -- try again shortly"})
+        return
+
     start = time.perf_counter()
     accepted_wire = []
     for op_dict in ops_wire:
-        op = room.op_from_dict(op_dict)
-        reason = _validate_op(room, op)
+        # A malformed op (missing/wrong-shaped fields in the envelope
+        # itself, or in the sub-CRDT payload `apply()` only inspects
+        # lazily) is a client bug or bad-faith payload, not a server
+        # error -- reject it cleanly and keep the connection alive, the
+        # same as a geometry-invalid op. Before this, an exception raised
+        # anywhere in here propagated out of the whole receive loop,
+        # silently dropping the connection with no reply the client
+        # could react to (see test_malformed_op_is_rejected_cleanly...).
+        try:
+            op = room.op_from_dict(op_dict)
+            reason = _validate_op(room, op)
+        except Exception as exc:
+            ws = room.clients.get(actor)
+            if ws is not None:
+                await ws.send_json({"type": "rejected", "reason": f"malformed op: {exc}", "op": op_dict})
+            continue
         if reason is not None:
             metrics.geometry_rejections_total.inc()
             ws = room.clients.get(actor)
             if ws is not None:
                 await ws.send_json({"type": "rejected", "reason": reason, "op": op_dict})
             continue
-        room.doc.apply(op)
+        try:
+            room.doc.apply(op)
+        except Exception as exc:
+            ws = room.clients.get(actor)
+            if ws is not None:
+                await ws.send_json({"type": "rejected", "reason": f"malformed op: {exc}", "op": op_dict})
+            continue
         accepted_wire.append(op_dict)
     metrics.merge_latency_seconds.observe(time.perf_counter() - start)
     metrics.ops_relayed_total.inc(len(accepted_wire))

@@ -32,6 +32,7 @@ over gaps.
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
+| Security hardening (opt-in room tokens, CORS lockdown, rate limits, resource ceilings) | **Done** -- off/wide-open by default, see below |
 | Durable persistence (SQLite snapshots, survives restart) | **Done** |
 | Save / download (JSON, SVG, DXF for 2D; JSON, STL for 3D) | **Done** |
 | Import (SVG, DXF reference geometry) | **Done** (straight-segment subset -- see below) |
@@ -52,7 +53,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 162 tests, ~6s
+./.venv/Scripts/python -m pytest tests/ -v   # 189 tests, ~8s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -449,13 +450,13 @@ One FastAPI WebSocket room per document (`/ws/{room_id}` for 2D,
 `Room`/`RoomManager`).
 
 ```
-client -> server   {"type": "hello", "actor": "<id>", "known_frontier": {...} | null}
+client -> server   {"type": "hello", "actor": "<id>", "token": "<signed token>" | null, "known_frontier": {...} | null}
 server -> client   {"type": "snapshot", "doc": {...}, "frontier": {...}}   # new client
 server -> client   {"type": "delta", "ops": [...], "frontier": {...}}     # reconnecting client
 either direction    {"type": "ops", "ops": [...], "from": "<actor id>"}    # live broadcast
 either direction    {"type": "signal", "to": "<actor>", "data": {...}}     # WebRTC signaling relay
 client -> server    {"type": "save"}               -> {"type": "saved", "at": <unix time>}
-server -> client     {"type": "rejected", "reason": "...", "op": {...}}    # geometry validity gate refused this op
+server -> client     {"type": "rejected", "reason": "...", "op": {...}}    # geometry validity gate, malformed op, or rate limit refused this op
 ```
 
 The server also re-broadcasts a full snapshot to every client in a room
@@ -463,6 +464,71 @@ every 30s, so a late joiner or a client that missed something for any
 reason self-heals. The server is a **relay with one pre-commit gate**,
 not an OT-style authority: it never rewrites or reorders client ops
 (the validity gate only *rejects*, never modifies).
+
+## Security hardening (`src/crdt_cad/server/security.py`)
+
+The zero-config local demo (`git clone && pip install -e . && uvicorn ...`,
+no secrets to manage) is completely unchanged from every earlier section
+of this README -- everything below is **opt-in via environment
+variable**, off (or wide open, matching today's behavior) until a
+deployer configures it.
+
+**Shared-secret room tokens.** Set `CRDT_CAD_SECRET` to require a token
+to join any room. A token is a signed (`itsdangerous`), room-and-kind
+-scoped credential -- one minted for `(mesh, "roomA")` grants no access
+to `(mesh, "roomB")` or `(drawing, "roomA")` -- with a configurable
+expiry (`CRDT_CAD_TOKEN_MAX_AGE_SECONDS`, default 24h). `GET
+/api/auth/required` tells a client whether it needs one at all;
+`POST /api/auth/token` exchanges the shared secret (compared with
+`hmac.compare_digest`, not `==`, to avoid a timing side-channel) for a
+token. Every room-scoped REST endpoint (export/import/generate) and the
+WS `hello` handshake enforce it identically. The demo frontend
+(`ensureRoomAccess()` in `common.js`) checks `/api/auth/required` on
+load, reuses a token already in the URL or `localStorage`, and otherwise
+prompts once for the secret -- the **Share** button embeds the token in
+the invite link so a recipient never has to know or enter the secret
+themselves. A rejected/expired token (WS close code `4401`) clears the
+stored copy and re-prompts, rather than silently retrying forever.
+
+**CORS.** Wide open (`*`) only when no secret is configured (today's
+default); locked to same-origin (`CORS_ORIGINS=[]`) the moment a secret
+is set, or an explicit list via `CRDT_CAD_CORS_ORIGINS` (comma-separated)
+always wins. Unlike every other check in this section, this one is only
+evaluated once, at process startup, when `CORSMiddleware` is
+constructed -- Starlette has no mechanism to reconsider allowed origins
+per request, so changing these env vars requires a restart.
+
+**Rate limiting.** A small hand-rolled `TokenBucket` (continuous refill,
+no external dependency) rather than `slowapi`, which doesn't fit the
+WebSocket path cleanly. Three independent limits: per-connection ops/sec
+on the WS relay (`CRDT_CAD_WS_OPS_PER_SECOND`/`_BURST`), a per-room
+ops/minute ceiling shared across every connection to that room
+(`CRDT_CAD_MAX_OPS_PER_ROOM_PER_MINUTE`), and a per-client-IP limit on
+`POST /generate` (`CRDT_CAD_GENERATE_PER_MINUTE`/`_BURST`) -- the last
+one applies **even when room auth is off**, since an LLM call and CPU
+mesh-construction cost real money/time regardless of access control.
+Exceeding any WS-side limit yields `{"type": "rejected", "reason": "..."}`
+(never a silent drop); exceeding the generate limit returns HTTP 429.
+
+**Resource ceilings**, all env-tunable with sane defaults: max raw
+WebSocket frame size (`CRDT_CAD_MAX_WS_MESSAGE_BYTES`, checked before any
+JSON parsing is attempted), max ops in one message
+(`CRDT_CAD_MAX_OPS_PER_MESSAGE`), max distinct rooms per server process
+(`CRDT_CAD_MAX_ROOMS_PER_SERVER` -- bounds *new* rooms, never blocks
+access to one that already exists), and max simultaneous clients per
+room (`CRDT_CAD_MAX_CLIENTS_PER_ROOM`). Exceeding a WS-level ceiling
+closes the connection with a distinct code (`4413`/`4429`/`4503`) rather
+than a silent drop or an unbounded queue.
+
+**A bug this section's own tests caught**: a malformed op (missing or
+wrong-shaped fields) used to raise an uncaught exception deep inside the
+per-op apply loop, which propagated out of the entire WebSocket receive
+loop and silently ended the connection -- no `rejected` reply, nothing
+the client could react to, just a dead socket. Found while writing a
+rate-limit test that (accidentally, at first) sent a payload missing its
+`id` field. Fixed: a malformed op is now rejected the same clean way a
+geometry-invalid op is (see `test_malformed_op_is_rejected_cleanly...`
+in `tests/test_security.py`).
 
 ## The two demos
 
@@ -496,7 +562,7 @@ conflict-free way a vertex move does.
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-162 tests: unit tests per CRDT type and geometry module, serialization
+189 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -512,7 +578,13 @@ stacking), `pymeshlab` repair with both a simulated missing dependency
 and a simulated internal failure, the generator's CRDT-op output
 reapplied to a fresh document, and the `/api/mesh/{room}/generate`
 endpoint's success, empty-prompt, batching, failure-timeout, and
-malformed-geometry paths.
+malformed-geometry paths. Also `tests/test_security.py` (27 tests):
+token mint/verify/expiry and room-and-kind scoping, the no-secret
+default's behavior is provably unchanged, every WS/REST auth gate,
+each rate limit and resource ceiling actually tripping (oversized
+frame, too-many-ops, per-connection/per-room/per-IP throttling,
+room/client capacity), and the malformed-op-crashes-the-connection
+regression this suite caught while being written.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -520,11 +592,18 @@ concurrently; one going fully offline mid-edit, drawing more, and
 reconnecting through a real Time-Travel Merge panel; a real
 `RTCPeerConnection` negotiating between two headless Chrome tabs; the
 strict Polygon tool's rejection round-trip; every download/import/save
-button; and the Docker image built, run, and checked for
+button; the security hardening's full opt-in flow (server started with
+`CRDT_CAD_SECRET` set: a fresh tab prompts for the secret, a wrong guess
+re-prompts, the correct one connects and stores a token, the Share
+button's invite link lets a second, completely fresh browser context
+join with *zero* prompts, and a deliberately-bad `?token=` in the URL
+correctly clears itself and re-prompts instead of looping forever); and
+the Docker image built, run, and checked for
 persistence-across-container-restart. Real bugs were caught this way
 that no unit test had covered (a fire-and-forget background task that
-hung the process at exit, and "offline" not tearing down an
-already-open P2P channel) -- both fixed and specifically
+hung the process at exit, "offline" not tearing down an already-open
+P2P channel, and a URL-token re-prompt loop where a proven-bad token
+never actually left the address bar) -- all fixed and specifically
 regression-tested.
 
 A third, more interesting one turned up while browser-verifying the
@@ -689,6 +768,7 @@ src/crdt_cad/
     store.py         DocumentStore interface, SQLiteStore, InMemoryStore (tests)
   server/
     app.py            FastAPI WebSocket relay + REST (export/import/solve/AI-generate)
+    security.py        opt-in room tokens, CORS lockdown, rate limiting, resource ceilings
     metrics.py         prometheus_client metric definitions
 tests/                 pytest + Hypothesis, one file per module, conftest.py isolates storage
 demo/static/

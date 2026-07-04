@@ -98,6 +98,7 @@ input[type="color"] {
 .status-pill.online .status-dot { background: var(--accent-2); box-shadow: 0 0 6px var(--accent-2); }
 .status-pill.connecting .status-dot { background: #ffd43b; }
 .status-pill.offline .status-dot { background: var(--danger); }
+.status-pill.unauthorized .status-dot { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
 
 .body {
   display: grid;
