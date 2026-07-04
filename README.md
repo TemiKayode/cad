@@ -39,6 +39,8 @@ over gaps.
 | WebRTC P2P direct sync, WS-relayed signaling, relay fallback | **Done**, verified with a real two-tab RTCPeerConnection/DataChannel |
 | "Time-Travel Merge" branch-preview UI | **Done** |
 | Prometheus metrics (`prometheus_client`) | **Done** |
+| CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 4 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP/IGES import/export (`pythonOCC`) | **Not built** -- no usable PyPI wheel (conda-only in practice); see below |
@@ -621,6 +623,32 @@ immediately. Fixed by adding `LocalClock.observe()` and calling it from
 both demos' `loadSnapshot()`/`applyOp()`, so a replica's clock always
 catches up to the highest counter it has seen before minting its next
 local op.
+
+### Committed e2e suite + CI
+
+All of the ad-hoc Playwright verification above was, for most of this
+project's life, exactly that -- ad-hoc, run by hand, never committed.
+`tests/e2e/` (4 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`pytest tests/` run so a fresh checkout without Chromium installed still
+passes) makes four of those scenarios permanent, regression-tested code
+instead of tribal knowledge: two tabs drawing concurrently and
+converging; the full offline -> edit both sides -> reconnect ->
+Time-Travel Merge -> converge sequence; the strict Polygon tool's
+self-intersection rejection (a genuine bowtie shape, verified against
+the *real* click-to-place-vertex interaction, not a drag -- an earlier
+draft of this test used the wrong gesture entirely and silently created
+no path at all); and the `LocalClock.observe()` regression above,
+reproduced end-to-end (generate a house via AI, have a fresh client
+edit a face's material, confirm the edit actually persists server-side).
+Each spins up a real `uvicorn` subprocess on a free port with its own
+temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
+client JS against the actual relay -- not an in-process
+`fastapi.testclient` double.
+
+`.github/workflows/ci.yml` runs on every push/PR: `pytest` + `ruff
+check` (fast job), the e2e suite (`playwright install chromium` then
+`pytest -m e2e`), and a plain `docker build` -- three independent jobs,
+the e2e one depending on the fast job passing first.
 
 ## Deployment
 
