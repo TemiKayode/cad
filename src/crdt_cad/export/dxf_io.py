@@ -3,6 +3,16 @@
 Each path becomes one ``LWPOLYLINE`` entity on export. Import reads
 ``LWPOLYLINE``, ``LINE``, and legacy ``POLYLINE`` entities back into
 plain point lists.
+
+``LWPOLYLINE`` has no Bezier concept, so any curve segments (Phase 8;
+see ``crdt_cad.crdt.document``'s module docstring) are flattened into a
+dense sampled polyline via ``flatten_path_to_polyline`` before export --
+an approximation, not a re-derivation of true curve geometry, but a
+faithful-looking one at 12 samples per segment. DXF import does not
+reconstruct curves from the flattened result (there's no marker in the
+DXF distinguishing "this was originally a curve" from "this was always
+a polyline") -- reimporting a DXF this project exported gets back a
+denser polyline, not the original Bezier.
 """
 
 from __future__ import annotations
@@ -10,6 +20,8 @@ from __future__ import annotations
 import io
 
 import ezdxf
+
+from crdt_cad.crdt.document import flatten_path_to_polyline
 
 Point = tuple[float, float]
 
@@ -21,7 +33,8 @@ def drawing_to_dxf_bytes(paths: list[dict]) -> bytes:
         pts = p.get("points", [])
         if len(pts) < 2:
             continue
-        msp.add_lwpolyline(pts, dxfattribs={"layer": "0"})
+        flattened = flatten_path_to_polyline(pts, p.get("point_ids"), p)
+        msp.add_lwpolyline(flattened, dxfattribs={"layer": "0"})
     buf = io.StringIO()
     doc.write(buf)
     return buf.getvalue().encode("utf-8")

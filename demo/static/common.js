@@ -537,6 +537,21 @@ function liveValues(nodes) {
   return (nodes || []).filter((n) => !n.db).map((n) => n.v);
 }
 
+/** Same as liveValues, but keeps each node's `id` alongside its value --
+ * needed wherever a per-node id-keyed prop (e.g. sketch.js's curve
+ * segments, see curvePropKey) has to be looked up while walking a live
+ * sequence, not just the plain value. */
+function liveEntries(nodes) {
+  return (nodes || []).filter((n) => !n.db);
+}
+
+/** Mirrors crdt_cad.crdt.clock.OpId.__str__ ("{counter}@{actor}") so a
+ * curve prop key built client-side (curvePropKey in sketch.js) matches
+ * the key the server/Python side stores it under exactly. */
+function opIdKey(id) {
+  return `${id[0]}@${id[1]}`;
+}
+
 // -- shared UI feedback: toasts + the Time-Travel Merge preview modal --------------
 
 function showToast(message, kind = "info") {

@@ -1,5 +1,6 @@
 from crdt_cad.crdt.clock import LamportClock
-from crdt_cad.crdt.document import DrawingDocument
+from crdt_cad.crdt.document import DocOp, DrawingDocument, curve_prop_key, flatten_path_to_polyline
+from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 
 
 def test_add_layer_and_path_basic_flow():
@@ -16,6 +17,100 @@ def test_add_layer_and_path_basic_flow():
     assert paths[0]["points"] == [(0.0, 0.0), (1.0, 1.0)]
     assert paths[0]["color"] == "#ff0000"
     assert paths[0]["layer_id"] == layer_id
+
+
+# -- curve segments (Phase 8) -------------------------------------------------
+
+
+def test_add_path_with_curves_stores_prop_keyed_by_stable_node_id():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    doc.add_path(
+        layer_id,
+        [(0.0, 0.0), (3.0, 0.0)],
+        curves={1: {"kind": "cubic", "c1": (1.0, 1.0), "c2": (2.0, 1.0)}},
+    )
+    path = doc.path_list()[0]
+    assert path["points"] == [(0.0, 0.0), (3.0, 0.0)]
+    node_id_for_point_1 = path["point_ids"][1]
+    assert path[curve_prop_key(node_id_for_point_1)] == {"kind": "cubic", "c1": (1.0, 1.0), "c2": (2.0, 1.0)}
+    # index 0 is the path's initial moveto -- there's no "previous point"
+    # for it to have an arriving curve from, so nothing is stored there.
+    assert curve_prop_key(path["point_ids"][0]) not in path
+
+
+def test_add_path_curves_survive_a_real_svg_export_and_reimport_round_trip():
+    """The actual end-to-end path a real import goes through: construction-
+    time index-keyed curves -> stable-node-id-keyed path_prop storage
+    (add_path) -> flat props svg_io reads from (path_list) -> SVG text ->
+    reparsed back to index-keyed curves (drawing_from_svg_string)."""
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    doc.add_path(
+        layer_id,
+        [(0.0, 0.0), (3.0, 0.0)],
+        curves={1: {"kind": "quad", "c": (1.5, 3.0)}},
+    )
+    svg = drawing_to_svg_string(doc.path_list())
+    assert "Q 1.50,3.00 3.00,0.00" in svg
+    reimported = drawing_from_svg_string(svg)
+    assert reimported[0]["points"] == [(0.0, 0.0), (3.0, 0.0)]
+    assert reimported[0]["curves"] == {1: {"kind": "quad", "c": (1.5, 3.0)}}
+
+
+def test_concurrent_curve_edits_to_different_segments_dont_clobber_each_other():
+    """Each segment's curve lives at its own LWWMap key (curve_prop_key),
+    exactly like color/stroke_width already do -- verifies the design
+    claim in curve_prop_key's docstring with a real two-replica merge,
+    not just an assertion in a comment: two actors concurrently curving
+    *different* segments of the same path must both survive the merge,
+    unlike a design that bundled every segment into one JSON blob under
+    a single key (where the second write would have silently discarded
+    the first)."""
+    clock_a = LamportClock(actor="a")
+    doc_a = DrawingDocument(clock_a)
+    layer_id, layer_ops = doc_a.add_layer("L")
+    path_id, path_ops = doc_a.add_path(layer_id, [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)])
+
+    clock_b = LamportClock(actor="b")
+    doc_b = DrawingDocument(clock_b)
+    for op in [*layer_ops, *path_ops]:
+        doc_b.apply(op)
+
+    point_ids = doc_a.path_list()[0]["point_ids"]
+    seg1_id, seg2_id = point_ids[1], point_ids[2]
+
+    # a curves segment 0->1; concurrently, b (unaware of a's edit) curves
+    # segment 1->2.
+    props_a = doc_a._path_props(path_id)
+    op_a = props_a.set(curve_prop_key(seg1_id), {"kind": "quad", "c": (0.5, 1.0)})
+    props_b = doc_b._path_props(path_id)
+    op_b = props_b.set(curve_prop_key(seg2_id), {"kind": "quad", "c": (1.5, 1.0)})
+
+    doc_a.apply(DocOp("path_prop", op_b.to_dict(), scope=path_id))
+    doc_b.apply(DocOp("path_prop", op_a.to_dict(), scope=path_id))
+
+    for doc in (doc_a, doc_b):
+        path = doc.path_list()[0]
+        assert path[curve_prop_key(seg1_id)] == {"kind": "quad", "c": (0.5, 1.0)}
+        assert path[curve_prop_key(seg2_id)] == {"kind": "quad", "c": (1.5, 1.0)}
+
+
+def test_flatten_path_to_polyline_samples_curve_segments():
+    points = [(0.0, 0.0), (10.0, 0.0)]
+    point_ids = ["n0", "n1"]
+    props = {curve_prop_key("n1"): {"kind": "quad", "c": (5.0, 10.0)}}
+    flattened = flatten_path_to_polyline(points, point_ids, props, samples_per_curve=4)
+    assert len(flattened) == 5  # 1 start anchor + 4 samples
+    assert flattened[0] == (0.0, 0.0)
+    assert flattened[-1] == (10.0, 0.0)
+    assert flattened[2][1] > 3.0  # the curve bulges well above a straight line
+
+
+def test_flatten_path_to_polyline_passes_through_straight_segments_unchanged():
+    points = [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]
+    flattened = flatten_path_to_polyline(points, ["n0", "n1", "n2"], {})
+    assert flattened == points
 
 
 def test_append_point_extends_existing_path():

@@ -143,6 +143,13 @@ function pathPoints(pathId) {
   return liveValues(state.pathNodes.get(pathId));
 }
 
+/** Mirrors crdt_cad.crdt.document.curve_prop_key -- the path_prop key a
+ * curve segment (Phase 8) arriving at this anchor point is stored under,
+ * server-side and here alike. See render()'s path-drawing loop. */
+function curvePropKey(nodeId) {
+  return `curve:${opIdKey(nodeId)}`;
+}
+
 /** Undoes a locally-optimistic apply for an op the server refused (the
  * geometry validity gate rejected it). Only path_geom inserts can be
  * rejected today -- see _validate_op server-side. */
@@ -611,11 +618,26 @@ function render() {
   for (const pathId of state.pathIndex) {
     const props = state.pathProps.get(pathId) || {};
     if (ui.hiddenLayers.has(props.layer_id)) continue;
-    const pts = pathPoints(pathId);
+    const entries = liveEntries(state.pathNodes.get(pathId));
+    const pts = entries.map((n) => n.v);
     if (pts.length === 0) continue;
     ctx.beginPath();
     ctx.moveTo(pts[0][0], pts[0][1]);
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    for (let i = 1; i < pts.length; i++) {
+      // A curve segment (Phase 8) is stored as a path_prop keyed by the
+      // arriving anchor's own node id -- see curve_prop_key's docstring
+      // in document.py. Absent (every point in a path created before
+      // this existed, or any point reached via a plain L) means a
+      // straight line, same as always.
+      const seg = props[curvePropKey(entries[i].id)];
+      if (seg && seg.kind === "cubic") {
+        ctx.bezierCurveTo(seg.c1[0], seg.c1[1], seg.c2[0], seg.c2[1], pts[i][0], pts[i][1]);
+      } else if (seg && seg.kind === "quad") {
+        ctx.quadraticCurveTo(seg.c[0], seg.c[1], pts[i][0], pts[i][1]);
+      } else {
+        ctx.lineTo(pts[i][0], pts[i][1]);
+      }
+    }
     ctx.strokeStyle = props.color || "#e7e9ee";
     ctx.lineWidth = props.stroke_width || 2.5;
     ctx.lineCap = "round";

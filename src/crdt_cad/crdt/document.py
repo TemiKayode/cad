@@ -53,6 +53,90 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
+# -- curve segments (Phase 8) -------------------------------------------------
+#
+# A path's points remain a plain RGA[Point] -- no new CRDT primitive, and
+# every existing persisted path is still valid data. Curve info for the
+# segment *arriving* at a given anchor point is stored as an ordinary
+# `path_prop` entry keyed by that anchor's own (stable) RGA node id, e.g.
+# `curve:5@actor123`. Two concurrent edits to *different* segments'
+# curves are therefore independent LWWMap writes (no clobbering), the
+# same guarantee every other path_prop (color, stroke_width, ...)
+# already has -- bundling all segments into one JSON blob under a single
+# key would have re-introduced exactly the "concurrent edits to
+# unrelated data clobber each other" problem LWWMap-per-key already
+# avoids for color/width/layer_id.
+#
+# A segment with no `curve:` entry (the default, and every point in a
+# path created before this existed) is a straight line -- backward
+# compatible by construction, not by special-casing old data.
+#
+# Value shape: {"kind": "quad", "c": [cx, cy]} (one control point, for
+# `quadraticCurveTo`/SVG Q/T) or {"kind": "cubic", "c1": [..], "c2": [..]}
+# (two control points, for `bezierCurveTo`/SVG C/S).
+CURVE_PROP_PREFIX = "curve:"
+
+
+def curve_prop_key(node_id) -> str:
+    """`node_id` is normally the `OpId` of the anchor point this curve
+    segment arrives at (str()'s to `"{counter}@{actor}"`), but a
+    caller that already has that string (e.g. from `path_list()`'s
+    `point_ids`) can pass it directly -- f-string formatting a string
+    is the identity, so this works either way."""
+    return f"{CURVE_PROP_PREFIX}{node_id}"
+
+
+def _cubic_point(p0: Point, c1: Point, c2: Point, p1: Point, t: float) -> Point:
+    mt = 1.0 - t
+    x = mt**3 * p0[0] + 3 * mt**2 * t * c1[0] + 3 * mt * t**2 * c2[0] + t**3 * p1[0]
+    y = mt**3 * p0[1] + 3 * mt**2 * t * c1[1] + 3 * mt * t**2 * c2[1] + t**3 * p1[1]
+    return (x, y)
+
+
+def _quad_point(p0: Point, c: Point, p1: Point, t: float) -> Point:
+    mt = 1.0 - t
+    x = mt**2 * p0[0] + 2 * mt * t * c[0] + t**2 * p1[0]
+    y = mt**2 * p0[1] + 2 * mt * t * c[1] + t**2 * p1[1]
+    return (x, y)
+
+
+def flatten_path_to_polyline(
+    points: list[Point], point_ids: list, props: dict, samples_per_curve: int = 12
+) -> list[Point]:
+    """Expands any curve segments into `samples_per_curve` evenly-spaced
+    points along the Bezier, for a consumer (DXF's `LWPOLYLINE`) that can
+    only represent straight polylines -- see the module's Phase 8
+    docstring above and the README's Import/export section for why DXF
+    export flattens curves rather than approximating them with arcs or
+    splines. A segment with no curve prop passes through as a single
+    straight point, same as today. `point_ids` may be shorter than
+    `points` or contain `None`s (a caller with no id information at all,
+    e.g. a hand-built dict in a test) -- that segment is just treated as
+    a straight line, never an error.
+    """
+    if not points:
+        return []
+    out = [points[0]]
+    for i in range(1, len(points)):
+        node_id = point_ids[i] if point_ids and i < len(point_ids) else None
+        seg = props.get(curve_prop_key(node_id)) if node_id is not None else None
+        p0 = points[i - 1]
+        p1 = points[i]
+        if seg is None:
+            out.append(p1)
+        elif seg["kind"] == "cubic":
+            c1, c2 = tuple(seg["c1"]), tuple(seg["c2"])
+            for s in range(1, samples_per_curve + 1):
+                out.append(_cubic_point(p0, c1, c2, p1, s / samples_per_curve))
+        elif seg["kind"] == "quad":
+            c = tuple(seg["c"])
+            for s in range(1, samples_per_curve + 1):
+                out.append(_quad_point(p0, c, p1, s / samples_per_curve))
+        else:
+            out.append(p1)
+    return out
+
+
 @dataclass(frozen=True)
 class DocOp:
     """Routable envelope around one op from one of the document's sub-CRDTs."""
@@ -116,7 +200,18 @@ class DrawingDocument:
     def add_path(
         self, layer_id: LayerId, points: list[Point], color: str = "#111111",
         stroke_width: float = 2.0, path_id: PathId | None = None,
+        curves: dict[int, dict] | None = None,
     ) -> tuple[PathId, list[DocOp]]:
+        """`curves`, if given, maps a 0-based index into `points` (the
+        *arrival* end of a segment -- index i describes how points[i-1]
+        connects to points[i]; index 0 is meaningless and ignored, same
+        as it would be for an SVG path's initial `M`) to a curve payload
+        -- see `curve_prop_key`'s module docstring for the exact shape.
+        Indices are only a convenience for building a whole path in one
+        call: each one is immediately rekeyed to that anchor's own stable
+        RGA node id before becoming a `path_prop` op, so the resulting
+        ops (and every concurrent edit built on top of them) are
+        index-independent, same as every other op this method emits."""
         path_id = path_id or new_id("path")
         ops = [DocOp("path_index", self.path_index.add(path_id).to_dict())]
         props = self._path_props(path_id)
@@ -125,10 +220,13 @@ class DrawingDocument:
         ops.append(DocOp("path_prop", props.set("stroke_width", stroke_width).to_dict(), scope=path_id))
         geom = self._path_geom(path_id)
         prev = None
-        for point in points:
+        for i, point in enumerate(points):
             insert_op = geom.insert_after(prev, point)
             prev = insert_op.id
             ops.append(DocOp("path_geom", insert_op.to_dict(), scope=path_id))
+            if curves and i in curves:
+                key = curve_prop_key(insert_op.id)
+                ops.append(DocOp("path_prop", props.set(key, curves[i]).to_dict(), scope=path_id))
         self._undo.append({"kind": "path_add", "path_id": path_id})
         self._redo.clear()
         return path_id, ops
@@ -281,8 +379,20 @@ class DrawingDocument:
         out = []
         for pid in self.path_index.to_set():
             props = dict(self._path_props(pid).items())
-            points = self._path_geom(pid).values()
-            out.append({"id": pid, "points": points, **props})
+            entries = self._path_geom(pid).entries()
+            out.append(
+                {
+                    "id": pid,
+                    "points": [pt for _node_id, pt in entries],
+                    # Stringified node ids, aligned index-for-index with
+                    # "points" -- lets a consumer (svg_io's exporter,
+                    # flatten_path_to_polyline) look up curve_prop_key(id)
+                    # in the spread-in props above to know how each
+                    # segment should be drawn.
+                    "point_ids": [str(node_id) for node_id, _pt in entries],
+                    **props,
+                }
+            )
         return out
 
     def path_points(self, path_id: PathId) -> list[Point]:

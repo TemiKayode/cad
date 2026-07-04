@@ -38,7 +38,7 @@ over gaps.
 | Security hardening (opt-in room tokens, CORS lockdown, rate limits, resource ceilings) | **Done** -- off/wide-open by default, see below |
 | Durable persistence (SQLite snapshots, survives restart) | **Done**; optional `PostgresStore` for multi-process sharing, see below |
 | Save / download (JSON, SVG, DXF for 2D; JSON, STL for 3D) | **Done** |
-| Import (SVG, DXF reference geometry) | **Done** (straight-segment subset -- see below) |
+| Import (SVG, DXF reference geometry) | **Done** -- SVG now includes quadratic/cubic Bezier curves (Phase 8), see below; arcs and DXF splines/arcs remain unsupported |
 | WebRTC P2P direct sync, WS-relayed signaling, relay fallback | **Done**, verified with a real two-tab RTCPeerConnection/DataChannel |
 | "Time-Travel Merge" branch-preview UI | **Done** |
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
@@ -387,11 +387,49 @@ Kubernetes manifests and exactly what was/wasn't validated there.
 ## Import / export (`src/crdt_cad/export/`)
 
 - **SVG**: export always; import supports `<line>`, `<polyline>`,
-  `<polygon>`, and `<path>` using only `M`/`L` commands (absolute or
-  relative) -- the common "reference geometry" case. Curves
-  (`C`/`S`/`Q`/`T`/`A`) aren't parsed; today's document model only has
-  polylines, not Bezier/arc primitives, to hold them.
+  `<polygon>`, and `<path>` using `M`/`L` (absolute or relative) plus, as
+  of Phase 8, quadratic and cubic Beziers -- `C`/`S`/`Q`/`T`, including
+  the `S`/`T` "smooth" variants' reflected control point, the case real
+  design-tool exports (Illustrator, Inkscape, Figma) actually rely on for
+  a visually smooth join between segments. Elliptical arcs (`A`/`a`)
+  are still not parsed: unlike every other unhandled case, an arc's
+  flag arguments are single 0/1 digits that can appear with no
+  separating whitespace or comma in real SVGs, so a tokenizer that
+  didn't know to stop there would silently misinterpret them as
+  coordinates and corrupt everything after -- worse than an honest
+  partial import. Encountering one stops parsing that `<path>` and keeps
+  whatever was accumulated before it, same as the original M/L-only
+  importer's "truncate rather than guess" choice for anything else
+  unhandled. Curves live in the document model as an ordinary
+  `path_prop` per segment, keyed by that segment's own stable anchor
+  node id (`curve_prop_key` in `crdt_cad.crdt.document`) -- not a new
+  CRDT primitive, and every path created before this existed is still
+  valid data (no curve prop = straight line). This also means two
+  concurrent edits curving *different* segments of the same path are
+  independent LWWMap writes, same guarantee color/width already have --
+  verified with a real two-replica merge, not just asserted in a
+  comment (`test_concurrent_curve_edits_to_different_segments_dont_clobber_each_other`
+  in `tests/test_document.py`). One known, pre-existing gap this didn't
+  touch: SVG import has never carried a source file's per-path
+  stroke color/width into the document (every imported path gets the
+  same default styling regardless of the source's own colors) -- caught
+  while live-verifying curve rendering (an imported curve using the
+  default near-black color was invisible against the canvas's own
+  near-black background until manually recolored), not a Phase 8
+  regression, just a pre-existing limitation this made newly visible.
 - **DXF**: export/import via `ezdxf` (`LWPOLYLINE`/`LINE`/`POLYLINE`).
+  `LWPOLYLINE` has no Bezier concept, so a curve segment is flattened
+  into a dense sampled polyline (12 points per segment,
+  `flatten_path_to_polyline`) on export -- an approximation, not a
+  re-derivation of the true curve, but a faithful-looking one. DXF
+  import does not (and cannot) reconstruct a curve from the flattened
+  result -- reimporting a DXF this project exported gets back a denser
+  polyline, not the original Bezier. This is exactly the trade-off the
+  brief allows ("DXF export may flatten curves to polylines"); the
+  validity gate stays polyline-only too, unchanged by any of this -- it
+  only ever sees the raw anchor-point sequence a `path_geom` insert
+  builds, regardless of whether a later, separate `path_prop` op turns
+  the segment arriving at that anchor into a curve.
 - **STL**: ASCII export for the 3D mesh, fan-triangulated per face (same
   technique the Three.js renderer uses client-side -- correct for the
   convex/simple polygons the Face tool and Extrude produce).
@@ -711,7 +749,7 @@ conflict-free way a vertex move does.
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-227 tests: unit tests per CRDT type and geometry module, serialization
+242 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -755,7 +793,17 @@ needs either -- point `CRDT_CAD_TEST_DATABASE_URL`/
 actually exercise save/load/list/delete round-trips, two `PostgresStore`
 instances sharing state against the same DSN, and two `Room` instances
 (standing in for two processes) actually relaying and applying each
-other's ops through a real Redis.
+other's ops through a real Redis. Also 15 new curve-support tests
+(Phase 8) across `tests/test_export_import.py` and `tests/test_document.py`:
+every SVG curve command (absolute/relative cubic, absolute quadratic,
+`S`/`T` smooth-reflection with and without a preceding curve to reflect),
+the arc-encountered-stops-parsing-cleanly behavior, a curve surviving a
+real construction -> storage -> SVG-export -> reimport round trip through
+the actual `DrawingDocument`/`add_path`/`path_list` pipeline (not just
+`svg_io.py` in isolation), two replicas concurrently curving *different*
+segments of the same path both surviving a real merge, and DXF's curve
+flattening producing a visibly-bulging denser polyline rather than a
+straight line between anchors.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -783,14 +831,24 @@ persistence-across-container-restart; and the horizontal scaling seam
 (two real `uvicorn` processes, a real Postgres, a real Redis, one raw
 WebSocket client per process) with a genuine op sent to process A
 arriving at process B and a fresh connection to process B afterward
-correctly seeing what process A had persisted. Real bugs were caught
-this way that no unit test had covered (a fire-and-forget background
-task that hung the process at exit, "offline" not tearing down an
-already-open P2P channel, a URL-token re-prompt loop where a proven-bad
-token never actually left the address bar, and the Redis relay loop
-initially forwarding an incoming op to local clients without ever
-applying it to the receiving process's own document -- see "Horizontal
-scaling seam" above) -- all fixed and specifically regression-tested.
+correctly seeing what process A had persisted; and importing a real SVG
+containing a cubic curve followed by a smooth (`S`) cubic, confirming it
+renders as one continuous curve (via `bezierCurveTo`, not a jagged
+straight-line facet) and that exporting it back out produces a real `C`
+command, not a flattened polyline. Real bugs were caught this way that
+no unit test had covered (a fire-and-forget background task that hung
+the process at exit, "offline" not tearing down an already-open P2P
+channel, a URL-token re-prompt loop where a proven-bad token never
+actually left the address bar, the Redis relay loop initially
+forwarding an incoming op to local clients without ever applying it to
+the receiving process's own document -- see "Horizontal scaling seam"
+above -- and, while verifying the curve import, a **pre-existing**
+gap this didn't introduce: SVG import has never carried a source
+file's per-path stroke color into the document, so the imported curve
+was initially invisible against the canvas's own near-black default
+color, not because the curve itself was wrong) -- all fixed (or, for
+the pre-existing color gap, documented rather than silently left for
+the next person to rediscover) and specifically regression-tested.
 
 A third, more interesting one turned up while browser-verifying the
 face color/material editor: `LocalClock` (`common.js`, shared by both

@@ -541,14 +541,21 @@ class ImportResult(BaseModel):
     path_count: int
 
 
-async def _import_paths(room_id: str, paths: list[list[tuple[float, float]]], layer_name: str) -> ImportResult:
+async def _import_paths(room_id: str, paths: list[dict], layer_name: str) -> ImportResult:
+    """`paths` items are `{"points": [...], "curves": {...}}` -- `curves`
+    (Phase 8) maps a point index to a curve payload, passed straight
+    through to `add_path` so an imported SVG's Bezier segments survive as
+    real curves, not a flattened polyline. DXF import has no curve
+    concept of its own (see dxf_io.py), so its caller below just wraps
+    each plain point list with an empty `curves`."""
     room = await drawing_room_manager.get_or_create(room_id)
     layer_id, ops = room.doc.add_layer(layer_name)
     count = 0
-    for pts in paths:
+    for p in paths:
+        pts = p["points"]
         if len(pts) < 2:
             continue
-        _, path_ops = room.doc.add_path(layer_id, [tuple(p) for p in pts])
+        _, path_ops = room.doc.add_path(layer_id, [tuple(pt) for pt in pts], curves=p.get("curves"))
         ops.extend(path_ops)
         count += 1
     if ops:
@@ -575,7 +582,7 @@ async def import_drawing_dxf(room_id: str, request: Request) -> ImportResult:
         paths = drawing_from_dxf_bytes(body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"could not parse DXF: {exc}") from exc
-    return await _import_paths(room_id, paths, "Imported DXF")
+    return await _import_paths(room_id, [{"points": pts, "curves": {}} for pts in paths], "Imported DXF")
 
 
 # ---------------------------------------------------------------------------
