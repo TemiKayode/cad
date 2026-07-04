@@ -41,6 +41,7 @@ dependencies = [
     "prometheus_client>=0.20",
     "aiortc>=1.9",
     "itsdangerous>=2.2",
+    "trimesh>=4.0",
 ]
 
 [project.optional-dependencies]

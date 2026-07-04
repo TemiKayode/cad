@@ -259,6 +259,12 @@ async function persistOutbox(kind, room, actorId, outbox) {
  *   onRejected(reason, op)      -- server refused one op (validity gate)
  *   onSignal(fromActor, data)   -- WebRTC signaling payload from a peer
  *   onSaved(at)                 -- explicit save confirmed durable
+ *   onValidityWarning(faces, problems) -- mesh rooms only (see
+ *     crdt_cad.geometry.mesh_validity): a merge just produced
+ *     cross-component-inconsistent geometry (e.g. a face boundary
+ *     referencing a vertex a concurrent edit deleted). A warning, not a
+ *     rejection -- the ops already applied and converged; this is purely
+ *     "something here needs a human to look at it."
  *   onMergePreview(mine, theirs, proceed) -- "Time-Travel Merge": called
  *     instead of auto-applying a reconnect delta when *both* sides
  *     changed something while we were apart. Call proceed() to continue
@@ -292,7 +298,10 @@ class RelayConnection {
   constructor(
     wsPath,
     actorId,
-    { onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onMergePreview, token, kind, room, initialOutbox },
+    {
+      onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onValidityWarning, onMergePreview,
+      token, kind, room, initialOutbox,
+    },
   ) {
     this.wsPath = wsPath;
     this.actorId = actorId;
@@ -309,6 +318,7 @@ class RelayConnection {
     this.onRejected = onRejected || (() => {});
     this.onSignal = onSignal || (() => {});
     this.onSaved = onSaved || (() => {});
+    this.onValidityWarning = onValidityWarning || (() => {});
     this.onMergePreview = onMergePreview || null;
     this.frontier = new FrontierTracker();
     this.ws = null;
@@ -403,6 +413,8 @@ class RelayConnection {
       this.onSignal(msg.from, msg.data);
     } else if (msg.type === "saved") {
       this.onSaved(msg.at);
+    } else if (msg.type === "validity_warning") {
+      this.onValidityWarning(msg.faces, msg.problems);
     }
   }
 

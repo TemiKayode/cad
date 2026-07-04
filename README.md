@@ -28,6 +28,7 @@ over gaps.
 | Tombstone value-compaction (bounded RGA memory growth) | **Done** -- see "Responses to the architecture critique" below |
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
+| Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
 | AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done** -- Claude Fable 5 prompt interpretation (heuristic fallback, no API key required) + deterministic procedural geometry + optional `pymeshlab` print-repair, injected as batched CRDT ops -- see below for exact scope |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
@@ -486,6 +487,7 @@ client -> server    {"type": "save"}               -> {"type": "saved", "at": <u
 server -> client     {"type": "rejected", "reason": "...", "op": {...}}    # geometry validity gate, malformed op, or rate limit refused this op
 server -> client     {"type": "frontier", "frontier": {...}}              # lightweight periodic self-heal ping
 client -> server      {"type": "resync", "known_frontier": {...} | null}  # "catch me up" -- see below
+server -> client     {"type": "validity_warning", "faces": [...], "problems": [...]}  # mesh rooms only, see below
 ```
 
 The server also broadcasts a lightweight `frontier` ping to every client
@@ -523,6 +525,30 @@ network blip is simulated by briefly removing it from the room's
 in-memory client list while another actor edits, then "reconnecting"
 it) receives the next `frontier` ping and correctly self-heals via
 `resync` -> `delta`, converging without ever needing a full snapshot.
+
+### Cross-component mesh validity ("Validation Fork")
+
+Mesh rooms get one more broadcast: after any accepted op that could
+create or reveal a cross-component inconsistency (see
+`_touches_mesh_topology` in `app.py` -- a face created/removed/boundary
+edit, or a vertex *deletion*; plain vertex moves are excluded since
+they fire on every ~80ms drag tick and can't make a vertex stop
+existing), the server re-checks the room's *entire* merged mesh with
+`crdt_cad.geometry.mesh_validity.check_mesh_validity` (`trimesh`-backed:
+degenerate faces, non-manifold edges, inconsistent winding, and face
+boundaries referencing a deleted vertex). Any problems found are
+broadcast as `{"type": "validity_warning", "faces": [...], "problems":
+[{"faces": [...], "problem": "..."}]}`. This is a **warning, never a
+gate** -- unlike the 2D `path_geom` validity gate in `_validate_op`,
+which rejects an individual op *before* it's merged, a mesh merge has
+already happened by the time this runs and can't be rejected without
+breaking convergence. The 3D demo (`mesh3d.js`) renders every face
+listed in a `validity_warning` with a red outline (kept until
+dismissed or the face stops existing) and a dismissible banner naming
+the specific problem(s); nothing is auto-fixed or blocked -- a human
+decides whether to fix or delete the affected face. See "Responses to
+the architecture critique" claim 3 above for the full rationale,
+including why watertightness is deliberately not one of the checks.
 
 ## Security hardening (`src/crdt_cad/server/security.py`)
 
@@ -623,7 +649,7 @@ conflict-free way a vertex move does.
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-203 tests: unit tests per CRDT type and geometry module, serialization
+218 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -651,7 +677,13 @@ round-tripping, the vertex create-vs-move distinction, extrude's
 composite bundling actually undoing/redoing every vertex/edge/face it
 created in one step, and the concurrent-safety property ported directly
 from `DrawingDocument`'s own test -- undoing an extrude must not roll
-back a collaborator's simultaneous, unrelated vertex move.
+back a collaborator's simultaneous, unrelated vertex move. Also
+`tests/test_frontier_resync.py` (4 tests) and `tests/test_mesh_validity.py`
++ `tests/test_mesh_validity_integration.py` (15 tests total): every
+`check_mesh_validity` problem class in isolation, a real concurrent
+two-replica merge reproducing the "Extrusion Nightmare" end to end, and
+the server-side `validity_warning` broadcast actually firing (or, for a
+pure vertex move, correctly *not* firing) over a real WebSocket.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -670,7 +702,11 @@ correctly clears itself and re-prompts instead of looping forever); the
 every vertex/face an extrude created, not just the last one -- face
 color/material, and a check that the shortcut is correctly ignored
 while a text field has focus so it doesn't fight the browser's own
-undo); and the Docker image built, run, and checked for
+undo); the "Extrusion Nightmare" validity warning end-to-end (tab A
+extrudes a face, tab B deletes one of that face's shared boundary
+vertices, both tabs render the red outline and a banner naming the
+exact face and problem, and dismissing it on one tab clears only that
+tab's outline); and the Docker image built, run, and checked for
 persistence-across-container-restart. Real bugs were caught this way
 that no unit test had covered (a fire-and-forget background task that
 hung the process at exit, "offline" not tearing down an already-open
@@ -801,25 +837,40 @@ up via `ops_since` after compaction still converges correctly.
 
 **3. "Extrusion Nightmare" -- concurrent non-commutative edits (a face
 boundary edit racing an extrude of that same face) can diverge.**
-Acknowledged plainly: this is real and **not fixed**. `MeshCRDT`
-merges each component (vertices/edges/face index/per-face RGA)
-independently and correctly on its own terms, but nothing today
-validates the *cross-component* semantic result -- a manifoldness or
-winding check that would catch "this extrude and this boundary edit
-together produced something inconsistent" the way `validity.py` already
-does for 2D self-intersection. The suggested "Validation Fork" (run the
-constraint/geometry solver as an independent pass over the merged
-result, rejecting the merge -- not the individual ops -- if it fails)
-is a reasonable direction and is **not implemented**; it would need a
-manifoldness/winding checker for 3D face loops that doesn't exist yet
-(2D's `validity.py` has no 3D equivalent), and a protocol for what a
-"rejected merge" even means for a CRDT that's supposed to always
-converge. Same honest status for the suggested DAG-based B-Rep
-replacement for the RGA-based face-boundary representation: a bigger,
-structurally different data model, not a change made lightly this late
-without a much larger test/verification pass than fits this pass. Both
-are called out explicitly in Roadmap below rather than silently
-left out.
+Correct that `MeshCRDT` merges each component (vertices/edges/face
+index/per-face RGA) independently and correctly *on its own terms* --
+and that was never going to change, since rejecting a CRDT merge
+outright breaks convergence. What's now built is the "Validation Fork"
+in the more limited, honest form that's actually compatible with a
+CRDT: `crdt_cad.geometry.mesh_validity.check_mesh_validity` runs
+*after* a merge that touched face topology (or deleted a vertex --
+see `_touches_mesh_topology` in `app.py`), using `trimesh` to check for
+(a) degenerate faces (zero-area/collinear), (b) non-manifold edges
+(shared by more than 2 faces), (c) inconsistent winding between
+adjacent faces, and (d) a face boundary referencing a vertex with no
+live position -- exactly the "Extrusion Nightmare" shape, where one
+replica extrudes a face while another concurrently deletes one of that
+face's original boundary vertices. Deliberately *not* checked:
+watertightness -- empirically, `trimesh.Trimesh.is_watertight` is
+`False` for any incomplete WIP mesh (including a single valid
+triangle), so using it as a warning trigger would be constant noise on
+normal in-progress editing, not a signal. Any problems found are
+broadcast to the room as `{"type": "validity_warning", "faces": [...],
+"problems": [...]}` (see the Sync protocol section) -- a **warning, never
+a gate**: the merge already happened and can't be undone without
+breaking convergence, so the client just highlights the affected
+face(s) with a red outline and a dismissible banner, and it's up to a
+human to fix or delete them. Verified against a real concurrent merge
+between two `MeshCRDT` replicas (`test_the_extrusion_nightmare_end_to_end_via_real_concurrent_merge`
+in `tests/test_mesh_validity.py`), against the live WS broadcast wiring
+(`tests/test_mesh_validity_integration.py`), and live in two real
+browser tabs via Playwright (extrude in tab A, delete a shared boundary
+vertex in tab B -- both tabs correctly show the outline and banner,
+naming the exact face and problem, with no console errors). The
+suggested DAG-based B-Rep replacement for the RGA-based face-boundary
+representation remains genuinely **not implemented** -- a bigger,
+structurally different data model than a warning-pass justifies
+building this round -- and is called out in Roadmap below.
 
 ## Roadmap / what's not built yet
 
@@ -844,12 +895,15 @@ left out.
    not surviving a hard refresh -- **is now fixed** (persisted to
    IndexedDB, see "Responses to the architecture critique" claim 1 above)
    without duplicating the engine.
-5. **Cross-component mesh validity ("Validation Fork")** -- a
-   manifoldness/winding check over the *merged* result of concurrent
-   mesh edits (e.g. a face-boundary edit racing an extrude of that
-   face), the 3D analogue of `validity.py`'s 2D self-intersection gate.
-   Not built; see "Responses to the architecture critique" above for
-   the concrete failure mode this leaves open.
+5. ~~**Cross-component mesh validity ("Validation Fork")**~~ -- **Done.**
+   A manifoldness/winding/degeneracy check now runs over the *merged*
+   result after any op that could create or reveal this class of
+   problem, and broadcasts a `validity_warning` (never a rejection --
+   see "Responses to the architecture critique" claim 3 above for the
+   full design and how it was verified). The one thing this does
+   *not* do, and was never going to: reject or roll back the merge
+   itself -- that's fundamentally incompatible with CRDT convergence,
+   which is exactly why the DAG-based B-Rep item below remains open.
 6. **DAG-based B-Rep face representation** -- a structurally different
    replacement for the RGA-based face-boundary loop, suggested as a way
    to make non-commutative topology edits (extrude, boundary split)

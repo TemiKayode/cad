@@ -80,6 +80,7 @@ from crdt_cad.export.dxf_io import drawing_from_dxf_bytes, drawing_to_dxf_bytes
 from crdt_cad.export.stl_export import mesh_to_stl
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 from crdt_cad.geometry.constraints import Constraint, Sketch
+from crdt_cad.geometry.mesh_validity import check_mesh_validity
 from crdt_cad.geometry.validity import GeometryError, validate_new_point
 from crdt_cad.persistence.store import DocumentStore, SQLiteStore
 from crdt_cad.server import metrics
@@ -221,16 +222,19 @@ class Room:
         Returns the number of batches sent.
         """
         batches = 0
+        touched_topology = False
         for i in range(0, len(ops), max(1, batch_size)):
             chunk = ops[i : i + batch_size]
             for op in chunk:
                 self.doc.apply(op)
+                touched_topology = touched_topology or _touches_mesh_topology(op)
             await self.broadcast({"type": "ops", "ops": [op.to_dict() for op in chunk], "from": actor})
             self.mark_dirty()
             batches += 1
             await asyncio.sleep(0)
         if ops:
             await self.persist_async()
+            await _check_and_broadcast_mesh_validity(self, touched_topology)
         return batches
 
 
@@ -746,14 +750,19 @@ async def ws_mesh_endpoint(websocket: WebSocket, room_id: str) -> None:
 
 
 def _validate_op(room: Room, op) -> Optional[str]:
-    """Pre-commit geometry validity gate for 2D path point inserts.
+    """Pre-commit geometry validity **gate** for 2D path point inserts --
+    the only place an op can be refused before it's ever applied.
 
     Returns a rejection reason string if ``op`` should be refused, else
-    None. Only ``path_geom`` inserts on drawing rooms are gated -- see
-    the "Roadmap" section of the README for why mesh-side validity
-    (manifoldness etc.) isn't gated here yet. Zero-length segments are
-    always rejected; self-intersection is only enforced for paths
-    created with the strict "Polygon" tool (freehand pen strokes
+    None. Only ``path_geom`` inserts on drawing rooms are gated. Mesh
+    rooms have no equivalent pre-commit gate -- a CRDT merge can't be
+    rejected without breaking convergence, which is exactly why mesh
+    cross-component consistency (manifoldness, winding, degenerate
+    faces) is instead checked *after* merging and surfaced as a
+    `validity_warning` (see `_check_and_broadcast_mesh_validity` and
+    `crdt_cad.geometry.mesh_validity`), not enforced here. Zero-length
+    segments are always rejected; self-intersection is only enforced for
+    paths created with the strict "Polygon" tool (freehand pen strokes
     crossing themselves is normal and shouldn't be blocked).
     """
     if room.kind != "drawing" or not isinstance(op, DocOp):
@@ -770,6 +779,51 @@ def _validate_op(room: Room, op) -> Optional[str]:
     except GeometryError as exc:
         return str(exc)
     return None
+
+
+_MESH_TOPOLOGY_TARGETS = {"face_index", "face_geom"}
+
+
+def _touches_mesh_topology(op: object) -> bool:
+    """True if `op` could create or reveal a cross-component mesh
+    inconsistency: either a direct face-topology edit (face created/removed,
+    boundary edited) or a vertex *deletion* -- the other half of the
+    "Extrusion Nightmare", where a face boundary ends up referencing a
+    vertex that no longer exists without any face_index/face_geom op ever
+    being involved. Vertex *moves* are deliberately excluded: they fire on
+    every ~80ms drag tick, so checking on every one would be wasteful, and
+    unlike a deletion a move can't make a vertex stop existing -- only
+    change its position.
+    """
+    target = getattr(op, "target", None)
+    if target in _MESH_TOPOLOGY_TARGETS:
+        return True
+    payload = getattr(op, "payload", None)
+    return target == "vertex" and isinstance(payload, dict) and bool(payload.get("d"))
+
+
+async def _check_and_broadcast_mesh_validity(room: Room, touched_topology: bool) -> None:
+    """Runs the cross-component mesh validity check (see
+    `crdt_cad.geometry.mesh_validity`) after a delta that touched face
+    topology has already been merged, and broadcasts a
+    `{"type": "validity_warning", "faces": [...], "problems": [...]}`
+    message to the whole room if it finds anything -- a warning, never a
+    rejection, since the merge this runs after has already happened and
+    cannot be undone without breaking convergence (see the "Extrusion
+    Nightmare" discussion in README's "Responses to the architecture
+    critique"). A no-op for drawing rooms, and skipped entirely when
+    nothing in this batch could have created or revealed this class of
+    problem -- see `_touches_mesh_topology` (pure vertex-position moves
+    and face_prop edits are excluded, since a move fires on every ~80ms
+    drag tick and can't remove a vertex's existence, only its position).
+    """
+    if room.kind != "mesh" or not touched_topology:
+        return
+    problems = await asyncio.to_thread(check_mesh_validity, room.doc.vertex_positions(), room.doc.face_loops())
+    if problems:
+        all_faces = sorted({face_id for p in problems for face_id in p["faces"]})
+        logger.info("room mesh/%s: validity warning on %d face(s): %s", room.room_id, len(all_faces), problems)
+        await room.broadcast({"type": "validity_warning", "faces": all_faces, "problems": problems})
 
 
 async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: security.TokenBucket) -> None:
@@ -837,6 +891,7 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
 
     start = time.perf_counter()
     accepted_wire = []
+    touched_topology = False
     for op_dict in ops_wire:
         # A malformed op (missing/wrong-shaped fields in the envelope
         # itself, or in the sub-CRDT payload `apply()` only inspects
@@ -868,6 +923,7 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
                 await ws.send_json({"type": "rejected", "reason": f"malformed op: {exc}", "op": op_dict})
             continue
         accepted_wire.append(op_dict)
+        touched_topology = touched_topology or _touches_mesh_topology(op)
     metrics.merge_latency_seconds.observe(time.perf_counter() - start)
     metrics.ops_relayed_total.inc(len(accepted_wire))
 
@@ -875,3 +931,4 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
         await room.broadcast({"type": "ops", "ops": accepted_wire, "from": actor}, exclude=actor)
         room.mark_dirty()
         await room.persist_async()
+        await _check_and_broadcast_mesh_validity(room, touched_topology)

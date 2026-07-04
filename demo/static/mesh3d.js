@@ -26,6 +26,7 @@ const state = {
   faceNodes: new Map(),     // faceId -> [{id,o,v,db}] (already in document order)
   faceProps: new Map(),     // faceId -> {material, color, ...}
   presence: new Map(),
+  invalidFaces: new Set(),  // face ids currently flagged by a validity_warning (see syncScene)
 };
 
 const ui = { tool: "vertex", selectedFace: null, opsCount: 0 };
@@ -262,6 +263,7 @@ let conn, p2p;
     onStatus: (status) => setStatus(status),
     onSaved: () => showToast("Saved", "success"),
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
+    onValidityWarning: (faces, problems) => applyValidityWarning(faces, problems),
     token,
     kind: "mesh",
     room,
@@ -558,6 +560,7 @@ let pendingLoopLine = null;
 const vertexMeshes = new Map();
 const edgeLines = new Map();
 const faceMeshes = new Map();
+const invalidFaceOutlines = new Map();
 
 const FACE_PALETTE = [0x4dabf7, 0x69db7c, 0xffd43b, 0xda77f2, 0xff922b, 0x38d9a9, 0xf783ac];
 function faceColor(faceId) {
@@ -640,7 +643,77 @@ function syncScene() {
     }
   }
 
+  for (const [id, line] of [...invalidFaceOutlines]) {
+    if (!state.invalidFaces.has(id) || !state.faceIndex.has(id)) { scene.remove(line); invalidFaceOutlines.delete(id); }
+  }
+  for (const id of state.invalidFaces) {
+    if (!state.faceIndex.has(id)) continue;
+    const loop = liveValues(state.faceNodes.get(id)).map((vid) => state.vertices.get(vid)).filter(Boolean);
+    if (loop.length < 2) continue;
+    let line = invalidFaceOutlines.get(id);
+    if (!line) {
+      // depthTest:false so the warning outline always reads clearly through
+      // the semi-transparent, exactly-coplanar face fill it traces.
+      line = new THREE.LineLoop(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xff2222, linewidth: 2, depthTest: false }));
+      scene.add(line);
+      invalidFaceOutlines.set(id, line);
+    }
+    line.geometry.setFromPoints(loop.map((p) => new THREE.Vector3(...p)));
+  }
+
   renderPanels();
+}
+
+// -- cross-component mesh validity warnings (Phase 6 "Validation Fork") -----
+// The server broadcasts `validity_warning` after a merge leaves face
+// topology cross-component-inconsistent (e.g. a face boundary referencing a
+// vertex a concurrent edit deleted -- see crdt_cad.geometry.mesh_validity).
+// This is purely informational: the merge already happened and can't be
+// rejected without breaking convergence, so all there is to do client-side
+// is highlight the affected faces and let the user decide how to fix them.
+
+let validityBannerEl = null;
+
+function applyValidityWarning(faces, problems) {
+  for (const id of faces) state.invalidFaces.add(id);
+  syncScene();
+  showValidityBanner(problems);
+}
+
+function clearValidityWarning() {
+  state.invalidFaces.clear();
+  syncScene();
+  if (validityBannerEl) { validityBannerEl.remove(); validityBannerEl = null; }
+}
+
+function showValidityBanner(problems) {
+  if (validityBannerEl) validityBannerEl.remove();
+  const el = document.createElement("div");
+  el.style.cssText =
+    "position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:1500;" +
+    "background:#3a1f22;border:1px solid #ff6b6b;border-radius:10px;padding:14px 18px;" +
+    "max-width:520px;width:90%;color:#e7e9ee;font-size:13px;font-family:inherit;" +
+    "box-shadow:0 4px 20px rgba(0,0,0,0.4);";
+  const list = problems
+    .map((p) => `<li>${p.problem} (face${p.faces.length > 1 ? "s" : ""} ${p.faces.join(", ")})</li>`)
+    .join("");
+  el.innerHTML = `
+    <div style="display:flex;align-items:flex-start;gap:10px;">
+      <div style="font-size:18px;line-height:1;">⚠️</div>
+      <div style="flex:1;">
+        <div style="font-weight:700;color:#ff6b6b;margin-bottom:4px;">Mesh validity warning</div>
+        <div style="color:#9aa1ad;margin-bottom:8px;line-height:1.4;">
+          A merge left the highlighted face(s) (outlined in red) in an inconsistent
+          state. Nothing was rejected -- fix or delete the affected faces when convenient.
+        </div>
+        <ul style="margin:0 0 10px;padding-left:18px;">${list}</ul>
+        <button id="validityDismissBtn" style="background:#ff6b6b;border:none;color:#06121a;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;">Dismiss</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(el);
+  el.querySelector("#validityDismissBtn").onclick = () => clearValidityWarning();
+  validityBannerEl = el;
 }
 
 function syncFacesTouching(vertexId) {
