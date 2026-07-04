@@ -27,6 +27,7 @@ over gaps.
 | CRDT core (vector clocks, Lamport `OpId`, LWW-Register/Map/Set, RGA) | **Done**, Hypothesis-fuzzed for convergence |
 | Tombstone value-compaction (bounded RGA memory growth) | **Done** -- see "Responses to the architecture critique" below |
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
+| Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done** -- Claude Fable 5 prompt interpretation (heuristic fallback, no API key required) + deterministic procedural geometry + optional `pymeshlab` print-repair, injected as batched CRDT ops -- see below for exact scope |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
@@ -56,7 +57,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 189 tests, ~8s
+./.venv/Scripts/python -m pytest tests/ -v   # 199 tests, ~8s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -203,6 +204,28 @@ deliberately does **not** do: enforce manifoldness, winding, planarity,
 or reject self-intersecting topology for 3D -- that validation exists
 today only for the 2D case (see the geometry kernel section below);
 extending it to meshes is on the roadmap.
+
+**Undo/redo** ports `DrawingDocument`'s exact pattern (see below) to the
+mesh: `MeshCRDT.undo()`/`redo()` never touch history directly, they
+synthesize the opposite edit with a fresh `OpId` and run it through the
+same primitives as any other change. Vertex creation and vertex *move*
+are tracked as distinct undo entries even though both go through the
+same `add_vertex()` call (undoing a move restores the previous position;
+undoing a creation deletes the vertex outright) -- the same
+previous-value bookkeeping `DrawingDocument.set_path_prop`'s undo entry
+already uses. A composite entry kind bundles multi-op actions into one
+undo step: `extrude_face()` creates a full ring of new vertices, side
+faces, and a capping face in one call, and undoing it removes every bit
+of that in one `undo()`, regardless of what a collaborator concurrently
+changed elsewhere (`tests/test_mesh_undo.py::
+test_undo_extrude_does_not_clobber_concurrent_vertex_move` exercises
+exactly that race, mirroring `test_undo_does_not_clobber_concurrent_
+remote_edit`). As with the 2D case, this Python implementation is a
+tested reference for the algorithm's safety property; the live demo's
+actual undo/redo is `mesh3d.js`'s independent client-side
+reimplementation of the same entry kinds and composite-bundling rule
+(Ctrl+Z/Ctrl+Y or Ctrl+Shift+Z, plus Undo/Redo buttons) -- exactly the
+same relationship `sketch.js` has to `DrawingDocument.undo()`/`redo()`.
 
 ### `DrawingDocument` (`document.py`)
 
@@ -551,7 +574,9 @@ connection.
 vertices in order (then the first one again, or "Finish") to build a
 face, drag a vertex to move it (or type exact X/Y/Z into the vertex
 list), select a face to **recolor it, tag its material, extrude it
-into a prism, or delete it**, the same **Save**/download(**.json/.stl**)/**Share**/
+into a prism, or delete it**, **Undo/Redo** buttons and Ctrl+Z/Ctrl+Y
+(or Ctrl+Shift+Z) for every one of those actions -- extrude included,
+as one bundled undo step -- the same **Save**/download(**.json/.stl**)/**Share**/
 offline toggle set, plus an **AI Generate** box -- describe a house in
 plain English and a real procedurally-built mesh streams into the scene
 as CRDT ops, exactly like any other collaborator's edit. Every one of
@@ -565,7 +590,7 @@ conflict-free way a vertex move does.
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-189 tests: unit tests per CRDT type and geometry module, serialization
+199 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -587,7 +612,13 @@ default's behavior is provably unchanged, every WS/REST auth gate,
 each rate limit and resource ceiling actually tripping (oversized
 frame, too-many-ops, per-connection/per-room/per-IP throttling,
 room/client capacity), and the malformed-op-crashes-the-connection
-regression this suite caught while being written.
+regression this suite caught while being written. Also
+`tests/test_mesh_undo.py` (10 tests): every undo/redo entry kind
+round-tripping, the vertex create-vs-move distinction, extrude's
+composite bundling actually undoing/redoing every vertex/edge/face it
+created in one step, and the concurrent-safety property ported directly
+from `DrawingDocument`'s own test -- undoing an extrude must not roll
+back a collaborator's simultaneous, unrelated vertex move.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -600,8 +631,13 @@ button; the security hardening's full opt-in flow (server started with
 re-prompts, the correct one connects and stores a token, the Share
 button's invite link lets a second, completely fresh browser context
 join with *zero* prompts, and a deliberately-bad `?token=` in the URL
-correctly clears itself and re-prompts instead of looping forever); and
-the Docker image built, run, and checked for
+correctly clears itself and re-prompts instead of looping forever); the
+3D demo's Undo/Redo buttons and Ctrl+Z/Ctrl+Y/Ctrl+Shift+Z shortcuts
+(vertex create, extrude -- confirming a *single* undo click removes
+every vertex/face an extrude created, not just the last one -- face
+color/material, and a check that the shortcut is correctly ignored
+while a text field has focus so it doesn't fight the browser's own
+undo); and the Docker image built, run, and checked for
 persistence-across-container-restart. Real bugs were caught this way
 that no unit test had covered (a fire-and-forget background task that
 hung the process at exit, "offline" not tearing down an already-open

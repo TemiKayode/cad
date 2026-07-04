@@ -33,6 +33,7 @@ already-valid edits merge without conflict, not to define validity.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -49,6 +50,10 @@ Edge = tuple[VertexId, VertexId]
 _EDGE_KEY_SEP = "\x1f"  # unit separator; edges are stored as string keys (not
 # tuples) because tuple dict-keys don't survive a JSON/MessagePack round trip
 # (they decode back as lists, which are unhashable and would crash on lookup).
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
 def canonical_edge(v1: VertexId, v2: VertexId) -> str:
@@ -86,6 +91,8 @@ class MeshCRDT:
         self.faces: dict[FaceId, RGA[VertexId]] = {}
         self.face_props: dict[FaceId, LWWMap] = {}  # face_id -> {color, material, ...}
         self.presence: LWWMap[str, dict] = LWWMap(clock)  # actor id -> ephemeral cursor/focus payload
+        self._undo: list[dict] = []
+        self._redo: list[dict] = []
 
     def _face_rga(self, face_id: FaceId) -> RGA[VertexId]:
         if face_id not in self.faces:
@@ -99,6 +106,18 @@ class MeshCRDT:
 
     # -- local mutation: vertices --------------------------------------------
     def add_vertex(self, vertex_id: VertexId, position: Position) -> MeshOp:
+        """Creates a new vertex, or moves an existing one -- whichever this
+        turns out to be is recorded distinctly for undo: undoing a move
+        restores the previous position, undoing a create removes the vertex
+        entirely. See ``move_vertex`` for the same call under the name that
+        makes the "existing vertex" case read more naturally at call sites."""
+        if vertex_id in self.vertices:
+            self._undo.append(
+                {"kind": "vertex_move", "vertex_id": vertex_id, "previous": self.vertices.get(vertex_id), "forward": position}
+            )
+        else:
+            self._undo.append({"kind": "vertex_create", "vertex_id": vertex_id, "position": position})
+        self._redo.clear()
         op = self.vertices.set(vertex_id, position)
         return MeshOp("vertex", op.to_dict())
 
@@ -106,21 +125,29 @@ class MeshCRDT:
         return self.add_vertex(vertex_id, position)
 
     def remove_vertex(self, vertex_id: VertexId) -> MeshOp:
+        self._undo.append({"kind": "vertex_remove", "vertex_id": vertex_id, "previous": self.vertices.get(vertex_id)})
+        self._redo.clear()
         op = self.vertices.delete(vertex_id)
         return MeshOp("vertex", op.to_dict())
 
     # -- local mutation: edges -----------------------------------------------
     def add_edge(self, v1: VertexId, v2: VertexId) -> MeshOp:
+        self._undo.append({"kind": "edge_add", "v1": v1, "v2": v2})
+        self._redo.clear()
         op = self.edges.add(canonical_edge(v1, v2))
         return MeshOp("edge", op.to_dict())
 
     def remove_edge(self, v1: VertexId, v2: VertexId) -> MeshOp:
+        self._undo.append({"kind": "edge_remove", "v1": v1, "v2": v2})
+        self._redo.clear()
         op = self.edges.remove(canonical_edge(v1, v2))
         return MeshOp("edge", op.to_dict())
 
     # -- local mutation: faces -----------------------------------------------
     def add_face(self, face_id: FaceId, vertex_loop: list[VertexId]) -> list[MeshOp]:
         """Create a face whose boundary is the given ordered vertex loop."""
+        self._undo.append({"kind": "face_add", "face_id": face_id})
+        self._redo.clear()
         ops: list[MeshOp] = [MeshOp("face_index", self.face_index.add(face_id).to_dict())]
         rga = self._face_rga(face_id)
         prev = rga.last_id()
@@ -131,12 +158,75 @@ class MeshCRDT:
         return ops
 
     def remove_face(self, face_id: FaceId) -> MeshOp:
+        self._undo.append({"kind": "face_remove", "face_id": face_id})
+        self._redo.clear()
         op = self.face_index.remove(face_id)
         return MeshOp("face_index", op.to_dict())
 
     def set_face_prop(self, face_id: FaceId, key: str, value) -> MeshOp:
-        op = self._face_props(face_id).set(key, value)
+        props = self._face_props(face_id)
+        had_previous = key in props
+        self._undo.append(
+            {
+                "kind": "face_prop_set",
+                "face_id": face_id,
+                "key": key,
+                "previous": props.get(key) if had_previous else None,
+                "had_previous": had_previous,
+                "forward_value": value,
+            }
+        )
+        self._redo.clear()
+        op = props.set(key, value)
         return MeshOp("face_prop", op.to_dict(), face_id=face_id)
+
+    def extrude_face(self, face_id: FaceId, height: float) -> list[MeshOp]:
+        """Extrudes a face along +Y by ``height``: duplicates its boundary
+        loop at the new height, connects old-to-new with one side face per
+        edge, and caps the top with a face over the new loop -- exactly
+        mirroring the client-side ``extrudeFace()`` in ``mesh3d.js``.
+
+        Bundled as a **single** undo entry covering every vertex, edge, and
+        face this creates: undoing an extrude removes all of it in one
+        step, regardless of what else may have concurrently changed
+        elsewhere in the mesh (a concurrent, unrelated vertex move is a
+        separate undo entry on a possibly different replica entirely, and
+        is never touched by this one -- see
+        ``test_undo_extrude_does_not_clobber_concurrent_vertex_move``).
+        """
+        loop = self.face_loops().get(face_id)
+        if not loop or len(loop) < 3:
+            raise ValueError(f"cannot extrude face {face_id!r}: not found or degenerate")
+
+        undo_mark = len(self._undo)
+        ops: list[MeshOp] = []
+        positions = self.vertex_positions()
+
+        new_loop = []
+        for vid in loop:
+            x, y, z = positions[vid]
+            new_vid = new_id("v")
+            ops.append(self.add_vertex(new_vid, (x, y + height, z)))
+            new_loop.append(new_vid)
+
+        def _ring(ring: list[VertexId]) -> None:
+            for i in range(len(ring)):
+                ops.append(self.add_edge(ring[i], ring[(i + 1) % len(ring)]))
+
+        for i in range(len(loop)):
+            j = (i + 1) % len(loop)
+            side_loop = [loop[i], loop[j], new_loop[j], new_loop[i]]
+            ops.extend(self.add_face(new_id("face"), side_loop))
+            _ring(side_loop)
+
+        ops.extend(self.add_face(new_id("face"), new_loop))
+        _ring(new_loop)
+
+        sub_entries = self._undo[undo_mark:]
+        del self._undo[undo_mark:]
+        self._undo.append({"kind": "composite", "entries": sub_entries})
+        self._redo.clear()
+        return ops
 
     def insert_face_vertex(
         self, face_id: FaceId, after: Optional[object], vertex_id: VertexId
@@ -149,6 +239,83 @@ class MeshCRDT:
         rga = self._face_rga(face_id)
         op = rga.delete(target)
         return MeshOp("face_geom", op.to_dict(), face_id=face_id)
+
+    # -- undo / redo: inverted ops, not snapshots --------------------------------
+    #
+    # Same rule as DrawingDocument (crdt/document.py): undo/redo never touch
+    # history directly, they synthesize the *opposite* edit and run it
+    # through a fresh OpId, so the result is just another op that merges
+    # like any other -- it undoes *this actor's* change without disturbing
+    # a concurrent change made by anyone else. _apply_inverse/_apply_forward
+    # operate directly on the raw sub-CRDTs (self.vertices, self.edges,
+    # self.face_index, ...), not through add_vertex/add_face/etc., so
+    # replaying an undo never itself records a *new* undo entry.
+    def undo(self) -> list[MeshOp]:
+        if not self._undo:
+            return []
+        entry = self._undo.pop()
+        ops = self._apply_inverse(entry)
+        self._redo.append(entry)
+        return ops
+
+    def redo(self) -> list[MeshOp]:
+        if not self._redo:
+            return []
+        entry = self._redo.pop()
+        ops = self._apply_forward(entry)
+        self._undo.append(entry)
+        return ops
+
+    def _apply_inverse(self, entry: dict) -> list[MeshOp]:
+        kind = entry["kind"]
+        if kind == "composite":
+            ops: list[MeshOp] = []
+            for sub in reversed(entry["entries"]):
+                ops.extend(self._apply_inverse(sub))
+            return ops
+        if kind == "vertex_create":
+            return [MeshOp("vertex", self.vertices.delete(entry["vertex_id"]).to_dict())]
+        if kind in ("vertex_move", "vertex_remove"):
+            return [MeshOp("vertex", self.vertices.set(entry["vertex_id"], entry["previous"]).to_dict())]
+        if kind == "edge_add":
+            return [MeshOp("edge", self.edges.remove(canonical_edge(entry["v1"], entry["v2"])).to_dict())]
+        if kind == "edge_remove":
+            return [MeshOp("edge", self.edges.add(canonical_edge(entry["v1"], entry["v2"])).to_dict())]
+        if kind == "face_add":
+            return [MeshOp("face_index", self.face_index.remove(entry["face_id"]).to_dict())]
+        if kind == "face_remove":
+            return [MeshOp("face_index", self.face_index.add(entry["face_id"]).to_dict())]
+        if kind == "face_prop_set":
+            props = self._face_props(entry["face_id"])
+            op = props.set(entry["key"], entry["previous"]) if entry["had_previous"] else props.delete(entry["key"])
+            return [MeshOp("face_prop", op.to_dict(), face_id=entry["face_id"])]
+        raise ValueError(f"unknown undo entry kind: {kind}")
+
+    def _apply_forward(self, entry: dict) -> list[MeshOp]:
+        kind = entry["kind"]
+        if kind == "composite":
+            ops: list[MeshOp] = []
+            for sub in entry["entries"]:
+                ops.extend(self._apply_forward(sub))
+            return ops
+        if kind == "vertex_create":
+            return [MeshOp("vertex", self.vertices.set(entry["vertex_id"], entry["position"]).to_dict())]
+        if kind == "vertex_move":
+            return [MeshOp("vertex", self.vertices.set(entry["vertex_id"], entry["forward"]).to_dict())]
+        if kind == "vertex_remove":
+            return [MeshOp("vertex", self.vertices.delete(entry["vertex_id"]).to_dict())]
+        if kind == "edge_add":
+            return [MeshOp("edge", self.edges.add(canonical_edge(entry["v1"], entry["v2"])).to_dict())]
+        if kind == "edge_remove":
+            return [MeshOp("edge", self.edges.remove(canonical_edge(entry["v1"], entry["v2"])).to_dict())]
+        if kind == "face_add":
+            return [MeshOp("face_index", self.face_index.add(entry["face_id"]).to_dict())]
+        if kind == "face_remove":
+            return [MeshOp("face_index", self.face_index.remove(entry["face_id"]).to_dict())]
+        if kind == "face_prop_set":
+            op = self._face_props(entry["face_id"]).set(entry["key"], entry["forward_value"])
+            return [MeshOp("face_prop", op.to_dict(), face_id=entry["face_id"])]
+        raise ValueError(f"unknown redo entry kind: {kind}")
 
     # -- local mutation: presence (ephemeral, per-actor) ----------------------
     def set_presence(self, actor: str, payload: dict) -> MeshOp:

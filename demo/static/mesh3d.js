@@ -113,8 +113,14 @@ function removeVertexOp(vertexId) {
 function addEdgeOp(a, b) {
   return { target: "edge", payload: lwwOp(clock.tick(), canonicalEdgeKey(a, b), true, false) };
 }
+function removeEdgeOp(a, b) {
+  return { target: "edge", payload: lwwOp(clock.tick(), canonicalEdgeKey(a, b), null, true) };
+}
+function addFaceIndexOnlyOp(faceId) {
+  return { target: "face_index", payload: lwwOp(clock.tick(), faceId, true, false) };
+}
 function addFaceOps(faceId, loop) {
-  const ops = [{ target: "face_index", payload: lwwOp(clock.tick(), faceId, true, false) }];
+  const ops = [addFaceIndexOnlyOp(faceId)];
   let prev = null;
   for (const vid of loop) {
     const insId = clock.tick();
@@ -128,6 +134,97 @@ function removeFaceOp(faceId) {
 }
 function setFacePropOp(faceId, key, value) {
   return { target: "face_prop", face_id: faceId, payload: lwwOp(clock.tick(), key, value, false) };
+}
+function removeFacePropOp(faceId, key) {
+  return { target: "face_prop", face_id: faceId, payload: lwwOp(clock.tick(), key, null, true) };
+}
+
+// -- undo / redo: fresh inverted ops each time, not snapshots ---------------------
+// Mirrors crdt_cad.crdt.mesh.MeshCRDT's undo/redo (same entry "kind"s, same
+// composite-bundling for multi-op actions like extrude) -- see that
+// module's docstring for the full rationale. This is an independent
+// client-side reimplementation of the same algorithm, not a call into the
+// server: exactly the same relationship sketch.js's undo/redo has to
+// DrawingDocument.undo()/redo().
+
+const undoStack = [];
+const redoStack = [];
+
+function pushUndo(entry) {
+  undoStack.push(entry);
+  redoStack.length = 0;
+}
+
+function applyInverse(entry) {
+  if (entry.kind === "composite") {
+    const ops = [];
+    for (let i = entry.entries.length - 1; i >= 0; i--) ops.push(...applyInverse(entry.entries[i]));
+    return ops;
+  }
+  let op;
+  if (entry.kind === "vertex_create") {
+    op = removeVertexOp(entry.vertexId);
+  } else if (entry.kind === "vertex_move" || entry.kind === "vertex_remove") {
+    op = addVertexOp(entry.vertexId, entry.previous);
+  } else if (entry.kind === "edge_add") {
+    op = removeEdgeOp(entry.v1, entry.v2);
+  } else if (entry.kind === "edge_remove") {
+    op = addEdgeOp(entry.v1, entry.v2);
+  } else if (entry.kind === "face_add") {
+    op = removeFaceOp(entry.faceId);
+  } else if (entry.kind === "face_remove") {
+    op = addFaceIndexOnlyOp(entry.faceId); // re-flips membership only -- the RGA boundary was never touched by remove
+  } else if (entry.kind === "face_prop_set") {
+    op = entry.hadPrevious ? setFacePropOp(entry.faceId, entry.key, entry.previous) : removeFacePropOp(entry.faceId, entry.key);
+  }
+  applyOp(op);
+  return [op];
+}
+
+function applyForward(entry) {
+  if (entry.kind === "composite") {
+    const ops = [];
+    for (const sub of entry.entries) ops.push(...applyForward(sub));
+    return ops;
+  }
+  let op;
+  if (entry.kind === "vertex_create") {
+    op = addVertexOp(entry.vertexId, entry.position);
+  } else if (entry.kind === "vertex_move") {
+    op = addVertexOp(entry.vertexId, entry.forward);
+  } else if (entry.kind === "vertex_remove") {
+    op = removeVertexOp(entry.vertexId);
+  } else if (entry.kind === "edge_add") {
+    op = addEdgeOp(entry.v1, entry.v2);
+  } else if (entry.kind === "edge_remove") {
+    op = removeEdgeOp(entry.v1, entry.v2);
+  } else if (entry.kind === "face_add") {
+    op = addFaceIndexOnlyOp(entry.faceId);
+  } else if (entry.kind === "face_remove") {
+    op = removeFaceOp(entry.faceId);
+  } else if (entry.kind === "face_prop_set") {
+    op = setFacePropOp(entry.faceId, entry.key, entry.forwardValue);
+  }
+  applyOp(op);
+  return [op];
+}
+
+function undo() {
+  const entry = undoStack.pop();
+  if (!entry) return;
+  const ops = applyInverse(entry);
+  sendOps(ops);
+  redoStack.push(entry);
+  syncScene();
+}
+
+function redo() {
+  const entry = redoStack.pop();
+  if (!entry) return;
+  const ops = applyForward(entry);
+  sendOps(ops);
+  undoStack.push(entry);
+  syncScene();
 }
 
 // -- relay connection -----------------------------------------------------------
@@ -316,14 +413,17 @@ function addVertex(pos) {
   applyOp(op);
   sendOps([op]);
   sendPresence(pos);
+  pushUndo({ kind: "vertex_create", vertexId: id, position: pos });
   syncScene();
   return id;
 }
 
 function removeVertex(id) {
+  const previous = state.vertices.get(id);
   const op = removeVertexOp(id);
   applyOp(op);
   sendOps([op]);
+  pushUndo({ kind: "vertex_remove", vertexId: id, previous });
   syncScene();
 }
 
@@ -331,14 +431,19 @@ function removeFace(id) {
   const op = removeFaceOp(id);
   applyOp(op);
   sendOps([op]);
+  pushUndo({ kind: "face_remove", faceId: id });
   if (ui.selectedFace === id) ui.selectedFace = null;
   syncScene();
 }
 
 function setFaceProp(faceId, key, value) {
+  const props = state.faceProps.get(faceId) || {};
+  const hadPrevious = key in props;
+  const previous = props[key];
   const op = setFacePropOp(faceId, key, value);
   applyOp(op);
   sendOps([op]);
+  pushUndo({ kind: "face_prop_set", faceId, key, previous, hadPrevious, forwardValue: value });
   syncScene();
 }
 
@@ -346,12 +451,15 @@ function finishFace() {
   if (pendingFaceLoop.length < 3) return;
   const faceId = "face_" + rid();
   const ops = addFaceOps(faceId, pendingFaceLoop);
+  const subEntries = [{ kind: "face_add", faceId }];
   for (let i = 0; i < pendingFaceLoop.length; i++) {
     const a = pendingFaceLoop[i], b = pendingFaceLoop[(i + 1) % pendingFaceLoop.length];
     ops.push(addEdgeOp(a, b));
+    subEntries.push({ kind: "edge_add", v1: a, v2: b });
   }
   for (const op of ops) applyOp(op);
   sendOps(ops);
+  pushUndo({ kind: "composite", entries: subEntries });
   pendingFaceLoop = [];
   updatePendingFaceLine();
   syncScene();
@@ -367,13 +475,16 @@ function extrudeFace(faceId, height) {
   const loop = liveValues(state.faceNodes.get(faceId));
   if (loop.length < 3) return;
   const ops = [];
+  const subEntries = [];
   const newLoop = [];
   for (const vid of loop) {
     const p = state.vertices.get(vid);
     if (!p) continue;
     const newId = "v_" + rid();
-    const op = addVertexOp(newId, [p[0], p[1] + height, p[2]]);
+    const pos = [p[0], p[1] + height, p[2]];
+    const op = addVertexOp(newId, pos);
     applyOp(op); ops.push(op);
+    subEntries.push({ kind: "vertex_create", vertexId: newId, position: pos });
     newLoop.push(newId);
   }
   const buildRing = (ring) => {
@@ -381,6 +492,7 @@ function extrudeFace(faceId, height) {
       const a = ring[k], b = ring[(k + 1) % ring.length];
       const op = addEdgeOp(a, b);
       applyOp(op); ops.push(op);
+      subEntries.push({ kind: "edge_add", v1: a, v2: b });
     }
   };
   for (let i = 0; i < loop.length; i++) {
@@ -388,13 +500,20 @@ function extrudeFace(faceId, height) {
     const sideLoop = [loop[i], loop[j], newLoop[j], newLoop[i]];
     const sideId = "face_" + rid();
     for (const op of addFaceOps(sideId, sideLoop)) { applyOp(op); ops.push(op); }
+    subEntries.push({ kind: "face_add", faceId: sideId });
     buildRing(sideLoop);
   }
   const topId = "face_" + rid();
   for (const op of addFaceOps(topId, newLoop)) { applyOp(op); ops.push(op); }
+  subEntries.push({ kind: "face_add", faceId: topId });
   buildRing(newLoop);
 
   sendOps(ops);
+  // One bundled undo entry -- a single Ctrl+Z/Undo click removes every
+  // vertex, edge, and face this extrude created, in one step, regardless
+  // of what a collaborator may have concurrently changed elsewhere (see
+  // MeshCRDT.extrude_face's docstring and its concurrent-safety test).
+  pushUndo({ kind: "composite", entries: subEntries });
   syncScene();
 }
 
@@ -588,6 +707,7 @@ let lastMoveSent = 0;
  * here, so a modifier key is the lightweight way to reach the third axis. */
 function startVertexDrag(vid, vertical) {
   const pos = state.vertices.get(vid);
+  const startPosition = pos.slice(); // captured once, for a single undo entry covering the whole drag
   if (vertical) {
     const camDir = new THREE.Vector3();
     camera.getWorldDirection(camDir);
@@ -595,9 +715,9 @@ function startVertexDrag(vid, vertical) {
     if (camDir.lengthSq() < 1e-6) camDir.set(0, 0, 1);
     camDir.normalize();
     const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(camDir, new THREE.Vector3(...pos));
-    dragState = { vertexId: vid, plane, vertical: true, fixedX: pos[0], fixedZ: pos[2] };
+    dragState = { vertexId: vid, plane, vertical: true, fixedX: pos[0], fixedZ: pos[2], startPosition };
   } else {
-    dragState = { vertexId: vid, plane: new THREE.Plane(new THREE.Vector3(0, 1, 0), -pos[1]), vertical: false };
+    dragState = { vertexId: vid, plane: new THREE.Plane(new THREE.Vector3(0, 1, 0), -pos[1]), vertical: false, startPosition };
   }
   controls.enabled = false;
 }
@@ -667,6 +787,10 @@ window.addEventListener("pointerup", () => {
     const pos = state.vertices.get(dragState.vertexId);
     sendOps([addVertexOp(dragState.vertexId, pos)]);
     sendPresence(pos);
+    const moved = pos.some((v, i) => v !== dragState.startPosition[i]);
+    if (moved) {
+      pushUndo({ kind: "vertex_move", vertexId: dragState.vertexId, previous: dragState.startPosition, forward: pos });
+    }
     dragState = null;
     controls.enabled = true;
   }
@@ -691,6 +815,21 @@ function setTool(tool) {
 document.getElementById("toolVertex").onclick = () => setTool("vertex");
 document.getElementById("toolFace").onclick = () => setTool("face");
 document.getElementById("toolMove").onclick = () => setTool("move");
+
+document.getElementById("undoBtn").onclick = undo;
+document.getElementById("redoBtn").onclick = redo;
+window.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey)) return;
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA") return; // let native text-field undo/redo work instead
+  if (e.key === "z" || e.key === "Z") {
+    e.preventDefault();
+    if (e.shiftKey) redo(); else undo();
+  } else if (e.key === "y" || e.key === "Y") {
+    e.preventDefault();
+    redo();
+  }
+});
 
 // -- panels -------------------------------------------------------------------------
 
@@ -782,6 +921,7 @@ function renderVertexList() {
         const op = addVertexOp(id, next);
         applyOp(op);
         sendOps([op]);
+        pushUndo({ kind: "vertex_move", vertexId: id, previous: current, forward: next });
         syncScene();
       });
     }
