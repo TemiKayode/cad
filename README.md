@@ -47,6 +47,7 @@ offline to see the **Time-Travel Merge** panel.
 | Designer features: text, fills, stroke styles, groups, PNG export (Phase 15) | **Done** -- new `groups` component, filled shapes now hit-test their interior (not just the boundary), real z-order (layer then creation order) fixed both client- and server-side, see below |
 | 3D usability: parametric primitives, snapping, axis-aligned views (Phase 16) | **Done** -- Box/Cylinder/Pyramid/Plane built from the same batched-op/composite-undo idiom as `extrudeFace`, no new CRDT machinery; view buttons reposition the existing perspective camera (not a true orthographic swap, see below) |
 | Workspace: home page, version history, read-only share links, display names (Phase 17) | **Done** -- rooms are no longer bare URLs to remember: a home page lists/renames them with a real thumbnail, restore forks a version into a new room (never rewrites live history), and viewer-role tokens are enforced server-side at both the WS and REST layer, see below |
+| Design system: color/type/space/motion tokens, dark+light theme, icon sprite (Part 3 Phase D1) | **Done** -- every emoji glyph replaced with a hand-authored SVG icon, `docs/design-system.md`; D2-D8 (layout, input feel, keyboard-first, state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -894,6 +895,30 @@ grid- and vertex-snapped placement/dragging, and **Top**/**Front**/
 Every one of these -- including a face's color and material -- is a
 `face_prop` `LWWMap` write, so recoloring a face you didn't create
 merges the same conflict-free way a vertex move does.
+
+## Design system (Part 3, Phase D1)
+
+All three pages share one hand-written CSS custom-property system --
+`demo/static/tokens.css` (color for both a dark and a light theme,
+typography, a 4px spacing grid, three radii, two shadow levels, a
+six-level z-index scale, and motion durations) plus a ~35-icon SVG
+sprite (`demo/static/icons.svg`) that replaced every emoji glyph the UI
+used to render as a tool/action icon. No build step, no Tailwind/
+PostCSS -- matching the project's stated architecture. Full token
+tables, the exact WCAG contrast numbers behind the color choices, and
+an honest list of what's explicitly *not* covered yet (that's D2-D8's
+job) are in **[`docs/design-system.md`](docs/design-system.md)**.
+
+One thing worth calling out here rather than only in that doc: the
+first attempt at the icon sprite used a genuinely external reference
+(`<use href="/static/icons.svg#icon-name">`), which is the standard,
+well-documented SVG sprite pattern -- and it silently rendered nothing
+in this environment, confirmed by an isolated test page with no
+console error at all. Fixed by having `common.js` fetch the sprite's
+raw markup once and inject it into the page, so every icon instead
+references a same-document fragment (`href="#icon-name"`) -- see the
+design-system doc's "Icon sprite" section for the full isolation test
+that found this.
 
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 

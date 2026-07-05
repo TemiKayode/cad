@@ -1,0 +1,111 @@
+/* Design tokens (Phase D1, Part 3 of the improvement plan). Every color,
+   spacing, radius, shadow, z-index, and motion value the rest of
+   `styles.css` (and any inline canvas rendering that reads these via
+   `getComputedStyle`) uses comes from here -- see `docs/design-system.md`
+   for the full rationale. No component rule should hard-code a color,
+   px spacing value, or duration; if a new one is needed, it's added here
+   first, not inline at the call site.
+
+   Dark is the default theme (`:root`); `[data-theme="light"]` overrides
+   the color block only -- typography/space/radius/motion are identical
+   in both themes. `common.js`'s `initTheme()` sets `data-theme` on
+   `<html>` from `localStorage`, falling back to
+   `prefers-color-scheme`. */
+
+:root {
+  /* -- color: dark (default) -------------------------------------------- */
+  --bg-app: #0f172a;        /* app chrome background */
+  --bg-canvas: #0b1120;     /* canvas surface, slightly deeper than chrome */
+  --bg-panel: #1e293b;      /* panels, toolbars */
+  --bg-raised: #334155;     /* hover/raised surfaces, inputs */
+  --border: #33415580;      /* hairline borders */
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  /* --text-disabled deliberately does not clear 4.5:1 against --bg-app in
+     either theme (WCAG 1.4.3's own exception: inactive UI components have
+     no minimum contrast requirement) -- only ever apply it to a `disabled`
+     control, never to text carrying information the user needs to read. */
+  --text-disabled: #64748b;
+  --accent: #4dabf7;        /* selection, active tool, primary buttons */
+  --accent-muted: #4dabf733;
+  --accent-on: #06121a;     /* text/icon color drawn on top of a solid --accent fill */
+  --success: #22c55e;       /* saved, connected, merge complete, editor role */
+  --warning: #f59e0b;       /* offline, pending merge, reconnecting */
+  --danger: #ef4444;        /* rejection, validity warnings, delete */
+
+  /* -- typography --------------------------------------------------------- */
+  --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --text-size-base: 14px;
+  --text-size-dense: 13px;
+  --text-line-height: 1.5;
+
+  /* -- space (4px grid) ----------------------------------------------------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* -- radius --------------------------------------------------------------- */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+
+  /* -- elevation -------------------------------------------------------------- */
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-floating: 0 12px 32px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
+
+  /* -- z-index scale (no other z-index value is allowed anywhere) ------------- */
+  --z-canvas: 0;
+  --z-panel: 10;
+  --z-toolbar: 20;
+  --z-popover: 30;
+  --z-toast: 40;
+  --z-modal: 50;
+
+  /* -- motion ------------------------------------------------------------------ */
+  --t-fast: 150ms;
+  --t-med: 220ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+:root[data-theme="light"] {
+  --bg-app: #f8fafc;
+  --bg-canvas: #ffffff;
+  --bg-panel: #f1f5f9;
+  --bg-raised: #e2e8f0;
+  --border: #cbd5e1;         /* visible, not washed-out -- slate-200-ish, per the brief */
+  --text-primary: #0f172a;   /* slate-900 */
+  --text-secondary: #475569;
+  --text-disabled: #94a3b8;
+  --accent: #1864ab;         /* darkened from the dark-theme accent -- #1c7ed6 only cleared 4.5:1 on white/on-accent as large text; this clears both at normal text size (5.8:1 / 6.1:1) */
+  --accent-muted: #1864ab1a;
+  --accent-on: #ffffff;
+  --success: #16803c;
+  --warning: #b45309;
+  --danger: #dc2626;
+  --shadow-panel: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --shadow-floating: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+
+/* Any control/number that updates live (zoom %, coordinates, ops
+   counters, vertex positions) should also carry `font-variant-numeric:
+   tabular-nums` so digits don't jitter in place -- applied as a utility
+   class rather than baked into every element, since not every mono-font
+   use is a live-updating readout. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -7,6 +7,8 @@
 // token) simply 401s and falls back to a placeholder, rather than the page
 // erroring outright; see the README for this documented, accepted limit.
 
+initThemeToggle();
+
 function relativeTime(unixSeconds) {
   const deltaSec = Date.now() / 1000 - unixSeconds;
   if (deltaSec < 60) return "just now";
@@ -48,11 +50,11 @@ function renderRoomCard(room) {
     const img = document.createElement("img");
     img.src = withToken(`/api/rooms/${encodeURIComponent(roomId)}/thumbnail.svg`, "drawing", roomId);
     img.onerror = () => {
-      thumb.innerHTML = '<span class="placeholder-icon">📄</span>';
+      thumb.innerHTML = iconHtml("file", "placeholder-icon");
     };
     thumb.appendChild(img);
   } else {
-    thumb.innerHTML = '<span class="placeholder-icon">🧊</span>';
+    thumb.innerHTML = iconHtml("box", "placeholder-icon");
   }
   card.appendChild(thumb);
 

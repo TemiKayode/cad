@@ -811,7 +811,7 @@ const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("canv
 renderer.setPixelRatio(window.devicePixelRatio || 1);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0e1013);
+scene.background = new THREE.Color(canvasColor("--bg-canvas"));
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
 camera.position.set(6, 6, 8);
@@ -868,11 +868,30 @@ const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
 dirLight.position.set(6, 12, 8);
 scene.add(dirLight);
 
-scene.add(new THREE.GridHelper(20, 20, 0x2e333d, 0x1c2028));
+// Colored from the active theme's --border at construction time -- unlike
+// scene.background (a plain property, trivial to re-apply on toggle, see
+// applyThreeJsTheme below), GridHelper bakes its two colors into a
+// per-vertex color buffer attribute at construction, so a live theme
+// toggle while this page is open won't retint an already-built grid.
+// Documented gap, not silently missed: acceptable for D1 (the important
+// promise -- a *fresh* load in light theme looks right -- holds), a
+// rebuild-the-helper-on-toggle fix is a candidate for D3/D8 polish.
+const gridColor = canvasColor("--border");
+scene.add(new THREE.GridHelper(20, 20, gridColor, gridColor));
 
 const groundGeo = new THREE.PlaneGeometry(200, 200).rotateX(-Math.PI / 2);
 const ground = new THREE.Mesh(groundGeo, new THREE.MeshBasicMaterial({ visible: false }));
 scene.add(ground);
+
+// Re-applies the parts of the 3D scene's theme that a CSS custom
+// property alone can't reach (scene.background isn't driven by the DOM
+// at all) -- called once immediately by initThemeToggle (redundant with
+// the construction-time value above, but keeps this the single source
+// of truth) and again on every toggle.
+function applyThreeJsTheme() {
+  scene.background = new THREE.Color(canvasColor("--bg-canvas"));
+}
+initThemeToggle(applyThreeJsTheme);
 
 const vertexGeo = new THREE.SphereGeometry(0.1, 16, 16);
 const edgeMat = new THREE.LineBasicMaterial({ color: 0x4dabf7 });
@@ -1010,26 +1029,20 @@ function clearValidityWarning() {
 function showValidityBanner(problems) {
   if (validityBannerEl) validityBannerEl.remove();
   const el = document.createElement("div");
-  el.style.cssText =
-    "position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:1500;" +
-    "background:#3a1f22;border:1px solid #ff6b6b;border-radius:10px;padding:14px 18px;" +
-    "max-width:520px;width:90%;color:#e7e9ee;font-size:13px;font-family:inherit;" +
-    "box-shadow:0 4px 20px rgba(0,0,0,0.4);";
+  el.className = "validity-banner";
   const list = problems
     .map((p) => `<li>${p.problem} (face${p.faces.length > 1 ? "s" : ""} ${p.faces.join(", ")})</li>`)
     .join("");
   el.innerHTML = `
-    <div style="display:flex;align-items:flex-start;gap:10px;">
-      <div style="font-size:18px;line-height:1;">⚠️</div>
-      <div style="flex:1;">
-        <div style="font-weight:700;color:#ff6b6b;margin-bottom:4px;">Mesh validity warning</div>
-        <div style="color:#9aa1ad;margin-bottom:8px;line-height:1.4;">
-          A merge left the highlighted face(s) (outlined in red) in an inconsistent
-          state. Nothing was rejected -- fix or delete the affected faces when convenient.
-        </div>
-        <ul style="margin:0 0 10px;padding-left:18px;">${list}</ul>
-        <button id="validityDismissBtn" style="background:#ff6b6b;border:none;color:#06121a;font-weight:700;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;">Dismiss</button>
+    <div class="validity-banner-icon">${iconHtml("warning")}</div>
+    <div class="validity-banner-body">
+      <div class="validity-banner-title">Mesh validity warning</div>
+      <div class="validity-banner-desc">
+        A merge left the highlighted face(s) (outlined in red) in an inconsistent
+        state. Nothing was rejected -- fix or delete the affected faces when convenient.
       </div>
+      <ul>${list}</ul>
+      <button id="validityDismissBtn" class="danger-btn">Dismiss</button>
     </div>
   `;
   document.body.appendChild(el);
@@ -1366,7 +1379,7 @@ function renderVertexList() {
       `<span class="name">` +
       [0, 1, 2].map((axis) => `<input class="vertex-coord" data-axis="${axis}" type="number" step="0.1" value="${pos[axis].toFixed(2)}"/>`).join(" ") +
       `</span>` +
-      `<button class="ghost-btn" data-act="del">✕</button>`;
+      `<button class="ghost-btn" data-act="del" title="Delete" aria-label="Delete">${iconHtml("x")}</button>`;
     for (const input of row.querySelectorAll(".vertex-coord")) {
       input.addEventListener("change", (e) => {
         const current = state.vertices.get(id);
@@ -1397,7 +1410,7 @@ function renderFaceList() {
     row.className = "path-row" + (id === ui.selectedFace ? " active" : "");
     row.style.cursor = "pointer";
     row.title = "Select this face to recolor, tag, extrude, or delete it";
-    row.innerHTML = `<span class="path-swatch" style="background:#${faceColor(id).toString(16).padStart(6, "0")}"></span><span class="name">${label}</span><button class="ghost-btn" data-act="del">✕</button>`;
+    row.innerHTML = `<span class="path-swatch" style="background:#${faceColor(id).toString(16).padStart(6, "0")}"></span><span class="name">${label}</span><button class="ghost-btn" data-act="del" title="Delete" aria-label="Delete">${iconHtml("x")}</button>`;
     // The whole row selects the face -- not just the text label -- since
     // clicking the color swatch itself is the most natural first thing to
     // try when looking for a color control, and that used to do nothing.

@@ -2,6 +2,8 @@
 // wire protocol. See common.js for the WebSocket relay client and the
 // design note on why merge logic stays server-side.
 
+initThemeToggle();
+
 const actorId = getOrCreateActorId();
 let actorName = getOrCreateActorName();
 const actorColor = colorForActor(actorId);
@@ -1706,7 +1708,7 @@ function renderConstraintsListPanel() {
     const row = document.createElement("div");
     row.className = "path-row";
     const label = `${CONSTRAINT_GLYPHS[spec.kind] || "?"} ${spec.kind}`;
-    row.innerHTML = `<span class="name">${escapeHtml(label)}</span><button class="ghost-btn" data-act="del">✕</button>`;
+    row.innerHTML = `<span class="name">${escapeHtml(label)}</span><button class="ghost-btn" data-act="del" title="Delete" aria-label="Delete">${iconHtml("x")}</button>`;
     row.querySelector('[data-act="del"]').onclick = () => { removeConstraint(cId); renderAll(); };
     list.appendChild(row);
   }
@@ -1857,7 +1859,7 @@ function renderDimensionPanel() {
       : "(geometry deleted)";
     const row = document.createElement("div");
     row.className = "path-row";
-    row.innerHTML = `<span class="name">${escapeHtml(label)}</span><button class="ghost-btn" data-act="del">✕</button>`;
+    row.innerHTML = `<span class="name">${escapeHtml(label)}</span><button class="ghost-btn" data-act="del" title="Delete" aria-label="Delete">${iconHtml("x")}</button>`;
     row.querySelector('[data-act="del"]').onclick = () => { removeDimension(dimId); renderAll(); };
     list.appendChild(row);
   }
@@ -2568,21 +2570,19 @@ function toggleShortcutOverlay() {
     ["?", "Toggle this overlay"],
   ];
   const overlay = document.createElement("div");
-  overlay.style.cssText =
-    "position:fixed;inset:0;background:rgba(6,8,12,0.72);z-index:2000;" +
-    "display:flex;align-items:center;justify-content:center;";
+  overlay.className = "modal-overlay";
+  overlay.style.display = "flex";
   const box = document.createElement("div");
-  box.style.cssText =
-    "background:#1c1f26;border:1px solid #2e333d;border-radius:10px;padding:20px 24px;" +
-    "max-width:420px;width:90%;color:#e7e9ee;font-size:13px;font-family:inherit;";
+  box.className = "modal";
+  box.style.cssText = "padding:20px 24px;max-width:420px;font-size:13px;";
   box.innerHTML =
     '<h3 style="margin:0 0 10px;font-size:15px;">Keyboard shortcuts</h3>' +
     '<div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;">' +
     rows
       .map(
         ([k, v]) =>
-          `<div style="color:#4dabf7;font-weight:600;white-space:nowrap;">${escapeHtml(k)}</div>` +
-          `<div style="color:#9aa1ad;">${escapeHtml(v)}</div>`
+          `<div style="color:var(--accent);font-weight:600;white-space:nowrap;font-family:var(--font-mono);">${escapeHtml(k)}</div>` +
+          `<div style="color:var(--text-secondary);">${escapeHtml(v)}</div>`
       )
       .join("") +
     "</div>";
@@ -2739,10 +2739,16 @@ function drawGrid(rect) {
   const [wx0, wy0] = screenToWorld(0, 0);
   const [wx1, wy1] = screenToWorld(rect.width, rect.height);
 
+  // Grid lines are drawn in a theme-adaptive gray (canvasColor reads
+  // --border from whichever theme is active) rather than a hardcoded
+  // dark hex -- otherwise a dark grid would be nearly invisible against
+  // a light-theme canvas background. Major/minor hierarchy comes from
+  // alpha alone, not two different base colors.
+  const gridColor = canvasColor("--border");
   ctx.save();
   if (minorAlpha > 0.02) {
-    ctx.strokeStyle = "#1c2028";
-    ctx.globalAlpha = minorAlpha;
+    ctx.strokeStyle = gridColor;
+    ctx.globalAlpha = minorAlpha * 0.7;
     ctx.lineWidth = 1;
     for (let wx = Math.floor(wx0 / step) * step; wx <= wx1; wx += step) {
       const [sx] = worldToScreen(wx, 0);
@@ -2754,7 +2760,7 @@ function drawGrid(rect) {
     }
   }
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = "#2e333d";
+  ctx.strokeStyle = gridColor;
   ctx.lineWidth = 1;
   for (let wx = Math.floor(wx0 / majorStep) * majorStep; wx <= wx1; wx += majorStep) {
     const [sx] = worldToScreen(wx, 0);
@@ -3109,9 +3115,9 @@ function renderLayerList() {
     const row = document.createElement("div");
     row.className = "layer-row" + (lid === ui.activeLayer ? " active" : "");
     row.innerHTML = `
-      <span class="layer-swatch" style="background:${ui.hiddenLayers.has(lid) ? '#444' : '#4dabf7'}"></span>
+      <span class="layer-swatch" style="background:${ui.hiddenLayers.has(lid) ? 'var(--text-disabled)' : 'var(--accent)'}"></span>
       <span class="name">${escapeHtml(props.name || lid)}</span>
-      <button class="ghost-btn" data-act="vis">${ui.hiddenLayers.has(lid) ? "🙈" : "👁"}</button>
+      <button class="ghost-btn" data-act="vis" title="${ui.hiddenLayers.has(lid) ? "Show layer" : "Hide layer"}" aria-label="${ui.hiddenLayers.has(lid) ? "Show layer" : "Hide layer"}">${ui.hiddenLayers.has(lid) ? iconHtml("eye-off") : iconHtml("eye")}</button>
     `;
     row.querySelector(".name").onclick = () => { ui.activeLayer = lid; renderLayerList(); };
     row.querySelector('[data-act="vis"]').onclick = (e) => {
@@ -3138,7 +3144,7 @@ function renderPathList() {
     row.innerHTML = `
       <span class="path-swatch" style="background:${props.color || "#eee"}"></span>
       <span class="name">${label} · ${escapeHtml((state.layers.get(props.layer_id) || {}).name || "?")}</span>
-      <button class="ghost-btn" data-act="del">✕</button>
+      <button class="ghost-btn" data-act="del" title="Delete" aria-label="Delete">${iconHtml("x")}</button>
     `;
     row.querySelector(".name").onclick = (e) => {
       if (e.shiftKey) toggleSelection(pathId);
@@ -3171,14 +3177,14 @@ function renderBulkSelectionPanel(panel) {
       : '<button style="width:100%;margin-top:6px" id="bulkGroup">Group</button>'}
     <div class="field-row" style="margin-top:6px"><label>Align</label></div>
     <div class="tool-row">
-      <button id="alignLeft" title="Align left">⟸</button>
-      <button id="alignHCenter" title="Align center">⟺</button>
-      <button id="alignRight" title="Align right">⟹</button>
+      <button id="alignLeft" title="Align left" aria-label="Align left">${iconHtml("align-left")}</button>
+      <button id="alignHCenter" title="Align center" aria-label="Align center">${iconHtml("align-h-center")}</button>
+      <button id="alignRight" title="Align right" aria-label="Align right">${iconHtml("align-right")}</button>
     </div>
     <div class="tool-row" style="margin-top:4px">
-      <button id="alignTop" title="Align top">⟰</button>
-      <button id="alignVCenter" title="Align middle">⇕</button>
-      <button id="alignBottom" title="Align bottom">⟱</button>
+      <button id="alignTop" title="Align top" aria-label="Align top">${iconHtml("align-top")}</button>
+      <button id="alignVCenter" title="Align middle" aria-label="Align middle">${iconHtml("align-v-center")}</button>
+      <button id="alignBottom" title="Align bottom" aria-label="Align bottom">${iconHtml("align-bottom")}</button>
     </div>
     <div class="field-row" style="margin-top:6px"><label>Distribute (3+)</label></div>
     <div class="tool-row">
@@ -3279,7 +3285,7 @@ function renderSelectionPanel() {
     for (const [cid, c] of commentsForPath) {
       const row = document.createElement("div");
       row.className = "comment-row";
-      row.innerHTML = `<div style="flex:1"><b>${escapeHtml(c.author)}</b>: ${escapeHtml(c.text)}</div><button class="ghost-btn" data-act="del">✕</button>`;
+      row.innerHTML = `<div style="flex:1"><b>${escapeHtml(c.author)}</b>: ${escapeHtml(c.text)}</div><button class="ghost-btn" data-act="del" title="Delete" aria-label="Delete">${iconHtml("x")}</button>`;
       row.querySelector('[data-act="del"]').onclick = () => { removeComment(cid); renderAll(); };
       commentPanel.appendChild(row);
     }

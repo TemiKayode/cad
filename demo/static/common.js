@@ -18,6 +18,112 @@
 // makes this safe even if an individual incremental "ops" broadcast is
 // ever missed or reordered in transit.
 
+// -- theme (Phase D1 design system) -------------------------------------------
+//
+// The actual dark/light *decision* on first paint happens in a tiny inline
+// <script> in each page's own <head> (see index.html/mesh3d.html/home.html)
+// -- it has to run synchronously before CSS paints, which a deferred
+// classic <script src="common.js"> loaded at the bottom of <body> cannot
+// do without a flash of the wrong theme. Everything past that first paint
+// (the toggle button, persisting a manual switch) lives here instead of
+// being duplicated three times.
+
+const THEME_STORAGE_KEY = "crdt_cad_theme";
+
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+}
+
+function setTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem(THEME_STORAGE_KEY, theme);
+  const btn = document.getElementById("themeToggleBtn");
+  if (btn) {
+    btn.innerHTML = theme === "light"
+      ? iconHtml("moon")
+      : iconHtml("sun");
+    btn.setAttribute("aria-label", theme === "light" ? "Switch to dark theme" : "Switch to light theme");
+    btn.title = btn.getAttribute("aria-label");
+  }
+}
+
+/** Wires the shared #themeToggleBtn (present in all three pages' top
+ * bars) to flip data-theme and persist the choice. Called once at
+ * startup by each page after the DOM is parsed.
+ *
+ * `onChange` (optional) is for state a plain CSS custom property can't
+ * reach -- the 3D demo's Three.js `scene.background`/lighting aren't
+ * driven by the DOM at all, so mesh3d.js passes a callback here to
+ * re-read `canvasColor(...)` and re-apply it after every toggle (called
+ * once immediately with the theme already active on load, too). */
+function initThemeToggle(onChange) {
+  setTheme(currentTheme()); // sync the button's icon to whatever the anti-FOUC inline script already set
+  if (onChange) onChange(currentTheme());
+  const btn = document.getElementById("themeToggleBtn");
+  if (btn) {
+    btn.onclick = () => {
+      const next = currentTheme() === "light" ? "dark" : "light";
+      setTheme(next);
+      if (onChange) onChange(next);
+    };
+  }
+}
+
+/** Builds `<svg class="icon">` markup referencing icons.svg's sprite --
+ * every place an emoji glyph used to stand in for a tool/action, replaced
+ * with a real, currentColor-tintable, theme-agnostic icon (Phase D1).
+ *
+ * Uses a same-document fragment reference (`href="#icon-name"`), not
+ * `href="/static/icons.svg#icon-name"` -- confirmed by isolated testing
+ * that cross-document external `<use href="other-file.svg#id">` simply
+ * doesn't render in this environment (neither `href` nor legacy
+ * `xlink:href`), while a same-document reference to a dynamically
+ * inserted symbol works immediately. `loadIconSprite()` (called once at
+ * the bottom of this file) fetches icons.svg's raw markup and injects it
+ * into the page so every `#icon-name` fragment resolves locally; SVG
+ * `<use>` is reactive to DOM mutations, so any icon markup already
+ * present in the page before the fetch resolves picks it up the instant
+ * the sprite lands, not on next render. */
+function iconHtml(name, extraClass) {
+  return `<svg class="icon${extraClass ? " " + extraClass : ""}" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
+}
+
+async function loadIconSprite() {
+  try {
+    const resp = await fetch("/static/icons.svg");
+    const svgText = await resp.text();
+    const holder = document.createElement("div");
+    holder.style.display = "none";
+    holder.innerHTML = svgText;
+    document.body.prepend(holder);
+  } catch (err) {
+    console.warn("Could not load icon sprite -- icons will render as empty boxes", err);
+  }
+}
+loadIconSprite();
+
+/** Canvas 2D context colors (grid lines, selection handles, snap glyphs)
+ * can't reference a CSS custom property directly -- `ctx.strokeStyle`
+ * needs a real color string. This resolves one via `getComputedStyle`
+ * and caches it (canvas redraws happen every frame during a drag; reading
+ * computed style that often would be wasteful), invalidating the cache
+ * only when the theme actually changes. Both sketch.js/mesh3d.js's
+ * `setTheme` caller already re-renders after a toggle, so a stale cached
+ * value never lingers on screen. */
+let _canvasColorCache = {};
+let _canvasColorCacheTheme = null;
+function canvasColor(varName) {
+  const theme = currentTheme();
+  if (theme !== _canvasColorCacheTheme) {
+    _canvasColorCache = {};
+    _canvasColorCacheTheme = theme;
+  }
+  if (!(varName in _canvasColorCache)) {
+    _canvasColorCache[varName] = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  }
+  return _canvasColorCache[varName];
+}
+
 const ACTOR_COLORS = [
   "#ff6b6b", "#4dabf7", "#69db7c", "#ffd43b", "#da77f2",
   "#ff922b", "#38d9a9", "#f783ac", "#748ffc", "#94d82d",
@@ -617,17 +723,17 @@ function showToast(message, kind = "info") {
     container = document.createElement("div");
     container.id = "toastContainer";
     container.style.cssText =
-      "position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:1000;" +
+      `position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:var(--z-toast);` +
       "display:flex;flex-direction:column;gap:6px;align-items:center;";
     document.body.appendChild(container);
   }
-  const colors = { info: "#4dabf7", success: "#38d9a9", error: "#ff6b6b" };
+  const colors = { info: "var(--accent)", success: "var(--success)", error: "var(--danger)" };
   const el = document.createElement("div");
   el.textContent = message;
   el.style.cssText =
-    `padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;color:#06121a;` +
-    `background:${colors[kind] || colors.info};box-shadow:0 4px 16px rgba(0,0,0,0.35);` +
-    "transition:opacity 0.3s;";
+    `padding:8px 16px;border-radius:var(--r-sm);font-size:13px;font-weight:600;color:var(--accent-on);` +
+    `background:${colors[kind] || colors.info};box-shadow:var(--shadow-floating);` +
+    "transition:opacity var(--t-med) var(--ease-standard);";
   container.appendChild(el);
   setTimeout(() => {
     el.style.opacity = "0";
@@ -676,37 +782,35 @@ function describeMeshOps(ops) {
  * this just shows the user what happened on each branch before applying. */
 function showMergePreviewModal(offlineOps, remoteOps, describeOps, onProceed) {
   const overlay = document.createElement("div");
-  overlay.style.cssText =
-    "position:fixed;inset:0;background:rgba(6,8,12,0.72);z-index:2000;" +
-    "display:flex;align-items:center;justify-content:center;";
+  overlay.className = "modal-overlay";
+  overlay.style.display = "flex";
   const box = document.createElement("div");
-  box.style.cssText =
-    "background:#1c1f26;border:1px solid #2e333d;border-radius:10px;padding:20px;" +
-    "max-width:520px;width:90%;color:#e7e9ee;font-size:13px;font-family:inherit;";
+  box.className = "modal";
+  box.style.cssText = "padding:20px;max-width:520px;font-size:13px;";
   const mine = describeOps(offlineOps);
   const theirs = describeOps(remoteOps);
   const list = (items) =>
-    items.length ? `<ul style="margin:0;padding-left:18px;">${items.map((s) => `<li>${s}</li>`).join("")}</ul>` : '<div style="color:#9aa1ad">(nothing visible-- ephemeral only)</div>';
+    items.length ? `<ul style="margin:0;padding-left:18px;">${items.map((s) => `<li>${s}</li>`).join("")}</ul>` : '<div style="color:var(--text-secondary)">(nothing visible-- ephemeral only)</div>';
   box.innerHTML = `
     <h3 style="margin:0 0 8px;font-size:15px;">Reconnected -- Time-Travel Merge</h3>
-    <p style="color:#9aa1ad;margin:0 0 14px;line-height:1.5;">
+    <p style="color:var(--text-secondary);margin:0 0 14px;line-height:1.5;">
       You edited while offline. Here's what changed on each branch -- the CRDT
       engine merges both automatically once you continue, with nothing lost
       and no conflicts to resolve by hand.
     </p>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;">
       <div>
-        <div style="font-weight:700;color:#4dabf7;margin-bottom:4px;">Your offline branch</div>
-        <div style="color:#9aa1ad;font-size:11px;margin-bottom:6px;">${offlineOps.length} op(s)</div>
+        <div style="font-weight:700;color:var(--accent);margin-bottom:4px;">Your offline branch</div>
+        <div style="color:var(--text-secondary);font-size:11px;margin-bottom:6px;">${offlineOps.length} op(s)</div>
         ${list(mine)}
       </div>
       <div>
-        <div style="font-weight:700;color:#38d9a9;margin-bottom:4px;">Their branch (while you were away)</div>
-        <div style="color:#9aa1ad;font-size:11px;margin-bottom:6px;">${remoteOps.length} op(s)</div>
+        <div style="font-weight:700;color:var(--success);margin-bottom:4px;">Their branch (while you were away)</div>
+        <div style="color:var(--text-secondary);font-size:11px;margin-bottom:6px;">${remoteOps.length} op(s)</div>
         ${list(theirs)}
       </div>
     </div>
-    <button id="mergeProceedBtn" style="width:100%;background:#4dabf7;border:none;color:#06121a;font-weight:700;padding:9px;border-radius:6px;cursor:pointer;font-size:13px;">Merge now</button>
+    <button id="mergeProceedBtn" class="primary-btn" style="width:100%;padding:9px;font-size:13px;">Merge now</button>
   `;
   overlay.appendChild(box);
   document.body.appendChild(overlay);

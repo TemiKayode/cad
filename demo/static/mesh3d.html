@@ -5,6 +5,19 @@
   <title>crdt-cad — 3D Mesh</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <script>
+    // Anti-FOUC -- see the identical block in index.html for why this is
+    // inline/synchronous rather than living in common.js.
+    (function () {
+      var stored = localStorage.getItem("crdt_cad_theme");
+      var theme = stored || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/tokens.css" />
   <link rel="stylesheet" href="/static/styles.css" />
   <script type="importmap">
     {
@@ -18,13 +31,17 @@
 <body>
   <div class="app">
     <div class="topbar">
-      <div class="brand">crdt-cad <a href="/">🏠 Home</a> <a href="/2d">→ 2D sketch demo</a></div>
+      <div class="brand">crdt-cad
+        <a href="/"><svg class="icon"><use href="#icon-home"></use></svg>Home</a>
+        <a href="/2d">2D sketch demo<svg class="icon"><use href="#icon-chevron-right"></use></svg></a>
+      </div>
       <div class="spacer"></div>
-      <label style="font-size:12px;color:var(--text-dim)">room</label>
+      <label style="font-size:12px;color:var(--text-secondary)">room</label>
       <input id="roomInput" type="text" style="width:120px" />
-      <button id="shareBtn" title="Copy a full-access invite link to this room">🔗 Share</button>
-      <button id="shareViewOnlyBtn" title="Copy a read-only invite link to this room">👁 View-only link</button>
-      <span id="viewOnlyBadge" class="status-pill" style="display:none;border-color:var(--accent-2);color:var(--accent-2)">view only</span>
+      <button id="shareBtn" title="Copy a full-access invite link to this room"><svg class="icon"><use href="#icon-link"></use></svg>Share</button>
+      <button id="shareViewOnlyBtn" title="Copy a read-only invite link to this room"><svg class="icon"><use href="#icon-eye"></use></svg>View-only link</button>
+      <span id="viewOnlyBadge" class="status-pill" style="display:none;border-color:var(--success);color:var(--success)">view only</span>
+      <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
       <span id="statusPill" class="status-pill connecting"><span class="status-dot"></span><span id="statusText">connecting</span></span>
       <span id="p2pPill" class="status-pill" style="display:none"><span class="status-dot"></span><span id="p2pText">P2P</span></span>
       <button id="offlineToggle">Go offline</button>
@@ -34,21 +51,21 @@
       <div class="panel left">
         <div class="section-title">Tool</div>
         <div class="tool-row">
-          <button id="toolVertex" class="active">⊕ Vertex</button>
-          <button id="toolFace">▲ Face</button>
-          <button id="toolMove">↖ Move</button>
+          <button id="toolVertex" class="active"><svg class="icon"><use href="#icon-vertex"></use></svg>Vertex</button>
+          <button id="toolFace"><svg class="icon"><use href="#icon-triangle"></use></svg>Face</button>
+          <button id="toolMove"><svg class="icon"><use href="#icon-cursor"></use></svg>Move</button>
         </div>
         <div class="tool-row" style="margin-top:6px">
-          <button id="toolBox">◫ Box</button>
-          <button id="toolCylinder">⬤ Cylinder</button>
-          <button id="toolPyramid">▲ Pyramid</button>
-          <button id="toolPlane">▭ Plane</button>
+          <button id="toolBox"><svg class="icon"><use href="#icon-box"></use></svg>Box</button>
+          <button id="toolCylinder"><svg class="icon"><use href="#icon-cylinder"></use></svg>Cylinder</button>
+          <button id="toolPyramid"><svg class="icon"><use href="#icon-pyramid"></use></svg>Pyramid</button>
+          <button id="toolPlane"><svg class="icon"><use href="#icon-plane"></use></svg>Plane</button>
         </div>
         <div class="empty-hint" id="toolHint">Click the ground grid to place a vertex.</div>
         <div id="primitivePanel"></div>
         <div class="tool-row" style="margin-top:6px">
-          <button id="undoBtn">⟲ Undo</button>
-          <button id="redoBtn">⟳ Redo</button>
+          <button id="undoBtn"><svg class="icon"><use href="#icon-undo"></use></svg>Undo</button>
+          <button id="redoBtn"><svg class="icon"><use href="#icon-redo"></use></svg>Redo</button>
         </div>
 
         <div class="section-title">View</div>
@@ -59,12 +76,12 @@
           <button id="viewPerspective" class="active" style="flex:1">Persp.</button>
         </div>
         <div class="tool-row" style="margin-top:6px">
-          <button id="snapToggleBtn3d" style="width:100%" title="Snap placed/dragged vertices to grid intersections or existing vertices">🧲 Snap</button>
+          <button id="snapToggleBtn3d" style="width:100%" title="Snap placed/dragged vertices to grid intersections or existing vertices"><svg class="icon"><use href="#icon-magnet"></use></svg>Snap</button>
         </div>
 
         <div class="section-title">File</div>
         <div class="tool-row">
-          <button id="saveBtn" class="always-enabled" style="flex:1">💾 Save</button>
+          <button id="saveBtn" class="always-enabled" style="flex:1"><svg class="icon"><use href="#icon-save"></use></svg>Save</button>
         </div>
         <div class="tool-row" style="margin-top:6px">
           <button id="downloadJsonBtn" class="always-enabled" style="flex:1">.json</button>
@@ -72,7 +89,7 @@
           <button id="downloadStepBtn" class="always-enabled" style="flex:1" title="Faceted B-Rep STEP export (build123d) -- needs the optional 'step' extra installed server-side">.step</button>
         </div>
 
-        <div class="section-title">✨ AI Generate</div>
+        <div class="section-title"><svg class="icon"><use href="#icon-sparkles"></use></svg>AI Generate</div>
         <div class="tool-row">
           <input id="genPromptInput" type="text" style="flex:1" placeholder="e.g. a 4 bedroom house with a wooden floor" />
         </div>
@@ -119,7 +136,7 @@
     </div>
 
     <div class="statusbar">
-      <span>actor: <b id="actorLabel"></b> <button id="renameActorBtn" class="ghost-btn" title="Change your display name">✎</button></span>
+      <span>actor: <b id="actorLabel"></b> <button id="renameActorBtn" class="ghost-btn" title="Change your display name" aria-label="Change your display name"><svg class="icon"><use href="#icon-pen"></use></svg></button></span>
       <span id="opsCounter">0 ops relayed</span>
       <span id="offlineCounter"></span>
       <span style="flex:1"></span>

@@ -5,14 +5,28 @@
   <title>crdt-cad — Workspace</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <script>
+    // Anti-FOUC -- see the identical block in index.html for why this is
+    // inline/synchronous rather than living in common.js.
+    (function () {
+      var stored = localStorage.getItem("crdt_cad_theme");
+      var theme = stored || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/tokens.css" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body class="home-body">
   <div class="home-topbar">
     <div class="brand">crdt-cad workspace</div>
     <div class="spacer"></div>
-    <button id="newDrawingBtn">✏ New 2D drawing</button>
-    <button id="newMeshBtn">▲ New 3D mesh</button>
+    <button id="newDrawingBtn"><svg class="icon"><use href="#icon-pen"></use></svg>New 2D drawing</button>
+    <button id="newMeshBtn"><svg class="icon"><use href="#icon-box"></use></svg>New 3D mesh</button>
+    <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
   </div>
 
   <div class="home-main">
@@ -26,7 +40,7 @@
     <div class="modal">
       <div class="modal-header">
         <span id="historyModalTitle">Version history</span>
-        <button id="historyModalClose" class="ghost-btn">✕</button>
+        <button id="historyModalClose" class="ghost-btn" title="Close" aria-label="Close"><svg class="icon"><use href="#icon-x"></use></svg></button>
       </div>
       <div id="historyModalBody" class="modal-body"></div>
     </div>
@@ -36,7 +50,7 @@
     <div class="modal modal-narrow">
       <div class="modal-header">
         <span>Rename room</span>
-        <button id="renameModalClose" class="ghost-btn">✕</button>
+        <button id="renameModalClose" class="ghost-btn" title="Close" aria-label="Close"><svg class="icon"><use href="#icon-x"></use></svg></button>
       </div>
       <div class="modal-body">
         <input id="renameInput" type="text" style="width:100%" />
