@@ -10,14 +10,20 @@ work. A "Time-Travel Merge" panel shows exactly what happened on each
 branch before the merge completes.
 
 This README documents what's built, how the CRDT engine and sync
-protocol work, and how to run the two live demos (2D sketch, 3D mesh).
-It also says plainly what's still missing and why, rather than papering
-over gaps.
+protocol work, and how to run the workspace home page and its two live
+demos (2D sketch, 3D mesh). It also says plainly what's still missing
+and why, rather than papering over gaps.
+
+Four stages of the same tool, in order of a real session: land on the
+**workspace**, open a **2D sketch** with shapes/fills/dimensions, open a
+**3D mesh** built by the AI generator, and reconnect after editing
+offline to see the **Time-Travel Merge** panel.
 
 <p align="center">
-  <img src="docs/screenshots/2d_sketch_demo.png" width="32%" alt="2D sketch demo: three freehand strokes, layers, and the path selection panel">
-  <img src="docs/screenshots/3d_mesh_ai_generated_house.png" width="32%" alt="3D mesh demo: a 4-bedroom house built by the AI text-to-3D generator, wood floor material rendered from a CRDT face_prop">
-  <img src="docs/screenshots/time_travel_merge.png" width="32%" alt="Time-Travel Merge panel showing two branches diffed before an automatic conflict-free merge">
+  <img src="docs/screenshots/workspace_home.png" width="24%" alt="Workspace home page listing a 2D and a 3D room, each with a kind badge, real thumbnail, rename, and history action">
+  <img src="docs/screenshots/2d_sketch_demo.png" width="24%" alt="2D sketch demo: a rect and line floor plan with a filled circle, the full shape/measure/constrain toolset, and the selection inspector showing fill/dash/rotation">
+  <img src="docs/screenshots/3d_mesh_ai_generated_house.png" width="24%" alt="3D mesh demo: a single-room cottage built by the AI text-to-3D generator, alongside the Box/Cylinder/Pyramid/Plane primitive tools and view/snap controls">
+  <img src="docs/screenshots/time_travel_merge.png" width="24%" alt="Time-Travel Merge panel showing two branches diffed before an automatic conflict-free merge">
 </p>
 
 ## Status at a glance
