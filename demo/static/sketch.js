@@ -21,6 +21,7 @@ const state = {
   comments: new Map(),
   presence: new Map(),
   settings: new Map(),    // "units" | "grid_spacing" | "snap_step" -> value (Phase 11)
+  dimensions: new Map(),  // dim_id -> {a_path, a_node, b_path, b_node, offset} (Phase 13)
 };
 
 // -- document units (Phase 11) ------------------------------------------------
@@ -41,6 +42,15 @@ function toDisplayUnits(px) {
 }
 function fromDisplayUnits(value) {
   return value * pxPerUnit();
+}
+/** Area scales as length squared, so its unit conversion factor is the
+ * square of the linear one -- used by the Measure tool's Area/Perimeter
+ * mode (Phase 13). */
+function toDisplayUnitsArea(px2) {
+  return px2 / (pxPerUnit() * pxPerUnit());
+}
+function unitSuffix() {
+  return currentUnits() === "px" ? "" : currentUnits();
 }
 
 const ui = {
@@ -80,6 +90,23 @@ let pendingPolygon = [];
 // normal way so everyone in the room sees it.
 let constraintSelection = [];
 let lastMousePt = null; // world coordinates -- see the view transform section below
+
+// -- measure tool (Phase 13, read-only, client-local) -----------------------
+// Distance/Angle pick up to 2 {pathId, nodeId, pos} points, same shape as
+// constraintSelection above (and reuses findAdjacentPoint for Angle, the
+// same neighbor-inference Constrain's parallel/perpendicular already use).
+// Area/Perimeter instead picks one whole path/shape directly -- no CRDT
+// ops are ever sent for any of this, it's purely a local readout.
+let measureMode = "distance"; // "distance" | "angle" | "area"
+let measureSelection = [];
+let measureResult = null; // {text} or null
+
+// -- dimension annotations (Phase 13, persistent, shared) --------------------
+// Up to 2 {pathId, nodeId, pos} entries, same picking UX as Constrain --
+// committing a dimension (see commitDimension) sends a real "dimension"
+// op so every collaborator sees it, unlike the ephemeral Measure tool
+// above.
+let dimensionSelection = [];
 
 // Phase 11 shape primitives: {kind, anchor:[wx,wy], current:[wx,wy]} while
 // a shape tool's click-drag gesture is in progress, else null -- see the
@@ -164,6 +191,7 @@ function observeSnapshotCounters(doc) {
   scanEntries(doc.comments);
   scanEntries(doc.presence);
   scanEntries(doc.settings);
+  scanEntries(doc.dimensions);
   clock.observe(maxCounter);
 }
 
@@ -200,6 +228,8 @@ function loadSnapshot(doc) {
   for (const e of doc.presence.entries) if (!e.d) state.presence.set(e.k, e.v);
   state.settings.clear();
   for (const e of doc.settings.entries) if (!e.d) state.settings.set(e.k, e.v);
+  state.dimensions.clear();
+  for (const e of doc.dimensions.entries) if (!e.d) state.dimensions.set(e.k, e.v);
 
   if (!ui.activeLayer || !state.layers.has(ui.activeLayer)) {
     ui.activeLayer = state.layerOrder[0] || null;
@@ -246,6 +276,8 @@ function applyOp(op) {
   } else if (op.target === "setting") {
     if (!p.d) state.settings.set(p.k, p.v); else state.settings.delete(p.k);
     syncUnitsSelect();
+  } else if (op.target === "dimension") {
+    if (!p.d) state.dimensions.set(p.k, p.v); else state.dimensions.delete(p.k);
   }
 }
 
@@ -525,6 +557,30 @@ function removeComment(id) {
   sendOps([op]);
 }
 
+// -- dimension annotations (Phase 13) --------------------------------------------
+// A dimension references its two anchors by (path_id, node_id) -- the
+// stable RGA node id, not a point_index -- so it keeps resolving to the
+// *correct* point even after a concurrent insert/delete elsewhere in the
+// same path. Mirrors crdt_cad.crdt.document.DrawingDocument.add_dimension
+// exactly; see that function's docstring for the full rationale.
+
+function commitDimension(a, b, offset = 30) {
+  const id = "dim_" + rid();
+  const op = {
+    target: "dimension",
+    payload: lwwOp(clock.tick(), id, { a_path: a.pathId, a_node: a.nodeId, b_path: b.pathId, b_node: b.nodeId, offset }, false),
+  };
+  applyOp(op);
+  sendOps([op]);
+  renderAll();
+}
+
+function removeDimension(id) {
+  const op = { target: "dimension", payload: lwwOp(clock.tick(), id, null, true) };
+  applyOp(op);
+  sendOps([op]);
+}
+
 // -- document settings (Phase 11: units, grid/snap) -----------------------------
 
 function setSetting(key, value) {
@@ -754,6 +810,43 @@ canvas.addEventListener("click", (e) => {
     }
     render();
     renderConstraintPanel();
+  } else if (ui.tool === "measure") {
+    if (measureMode === "area") {
+      const hit = hitTestPath(screenPt);
+      if (hit) computeAreaMeasurement(hit);
+      render();
+      renderMeasurePanel();
+      return;
+    }
+    const hit = hitTestPoint(screenPt);
+    if (!hit) return;
+    const already = measureSelection.findIndex((s) => s.pathId === hit.pathId && idEq(s.nodeId, hit.nodeId));
+    if (already !== -1) measureSelection.splice(already, 1);
+    else if (measureSelection.length >= 2) measureSelection = [hit];
+    else measureSelection.push(hit);
+    measureResult = null;
+    if (measureSelection.length === 2) {
+      if (measureMode === "distance") computeDistanceMeasurement();
+      else computeAngleMeasurement();
+    }
+    render();
+    renderMeasurePanel();
+  } else if (ui.tool === "dimension") {
+    const hit = hitTestPoint(screenPt);
+    if (!hit) return;
+    const already = dimensionSelection.findIndex((s) => s.pathId === hit.pathId && idEq(s.nodeId, hit.nodeId));
+    if (already !== -1) {
+      dimensionSelection.splice(already, 1);
+    } else if (dimensionSelection.length >= 2) {
+      dimensionSelection = [hit];
+    } else {
+      dimensionSelection.push(hit);
+    }
+    if (dimensionSelection.length === 2) {
+      commitDimension(dimensionSelection[0], dimensionSelection[1]);
+      dimensionSelection = [];
+    }
+    render();
   }
 });
 
@@ -992,7 +1085,11 @@ function findAdjacentPoint(pathId, nodeId) {
  * weight in path_props, but the visual effect is that segment reverts
  * to a straight line) -- an accepted trade-off for the common case this
  * solver targets (straight-line CAD-style sketches), not attempted to
- * be avoided here. */
+ * be avoided here. A dimension (Phase 13) anchored to the old id is
+ * NOT left to orphan the same way, though: "updates automatically when
+ * the geometry moves" is the entire point of that feature, so
+ * remapDimensionAnchor carries any matching anchor forward onto the
+ * new node id as part of this same move. */
 function movePathPoint(pathId, oldNodeId, newPos) {
   const entries = liveEntries(state.pathNodes.get(pathId));
   const idx = entries.findIndex((e) => idEq(e.id, oldNodeId));
@@ -1000,9 +1097,35 @@ function movePathPoint(pathId, oldNodeId, newPos) {
   const prevId = idx > 0 ? entries[idx - 1].id : null;
   const delOp = { target: "path_geom", scope: pathId, payload: rgaDeleteOp(oldNodeId, clock.tick()) };
   applyOp(delOp);
-  const insOp = { target: "path_geom", scope: pathId, payload: rgaInsertOp(clock.tick(), prevId, newPos) };
+  const newNodeId = clock.tick();
+  const insOp = { target: "path_geom", scope: pathId, payload: rgaInsertOp(newNodeId, prevId, newPos) };
   applyOp(insOp);
   sendOps([delOp, insOp]);
+  remapDimensionAnchor(pathId, oldNodeId, newNodeId);
+}
+
+/** Carries a dimension's anchor forward onto a point's new node id
+ * after a CRDT-safe delete+reinsert move (see movePathPoint) -- without
+ * this, every point move would silently break "updates automatically
+ * when the geometry moves," the entire reason Phase 13 dimensions
+ * reference geometry by id instead of copying coordinates. Rewrites the
+ * whole dimension payload (one LWW value per dimension id, not
+ * per-field) since nobody else should be concurrently editing the same
+ * dimension's anchors while it's being moved. */
+function remapDimensionAnchor(pathId, oldNodeId, newNodeId) {
+  const ops = [];
+  for (const [dimId, dim] of state.dimensions) {
+    const updated = { ...dim };
+    let changed = false;
+    if (dim.a_path === pathId && idEq(dim.a_node, oldNodeId)) { updated.a_node = newNodeId; changed = true; }
+    if (dim.b_path === pathId && idEq(dim.b_node, oldNodeId)) { updated.b_node = newNodeId; changed = true; }
+    if (changed) {
+      const op = { target: "dimension", payload: lwwOp(clock.tick(), dimId, updated, false) };
+      applyOp(op);
+      ops.push(op);
+    }
+  }
+  if (ops.length) sendOps(ops);
 }
 
 /** Solves the chosen constraint against the two currently-selected
@@ -1091,6 +1214,172 @@ function renderConstraintPanel() {
   document.getElementById("constrainPerpendicular").onclick = () => applyConstraint("perpendicular");
   document.getElementById("constrainFixedDistance").onclick = () =>
     applyConstraint("fixed_distance", parseFloat(document.getElementById("constraintDistance").value) || 0);
+}
+
+// -- measure tool (Phase 13) -----------------------------------------------------
+// Read-only, client-local, no CRDT ops ever sent -- purely a computed
+// readout over already-live geometry. Distance/Angle pick points the same
+// way Constrain does (including reusing findAdjacentPoint for Angle);
+// Area/Perimeter instead picks one whole path/shape directly.
+
+function shoelaceArea(pts) {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length];
+    sum += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(sum) / 2;
+}
+
+function polygonPerimeter(pts) {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length];
+    sum += Math.hypot(x2 - x1, y2 - y1);
+  }
+  return sum;
+}
+
+function computeDistanceMeasurement() {
+  const [a, b] = measureSelection;
+  const dist = Math.hypot(a.pos[0] - b.pos[0], a.pos[1] - b.pos[1]);
+  measureResult = { text: `Distance: ${toDisplayUnits(dist).toFixed(2)}${unitSuffix() ? " " + unitSuffix() : ""}` };
+}
+
+/** Angle between the two *lines* each selected point defines (inferred
+ * from its live neighbor, same as Constrain's parallel/perpendicular) --
+ * not just the angle at a single vertex. */
+function computeAngleMeasurement() {
+  const [a, b] = measureSelection;
+  const adjA = findAdjacentPoint(a.pathId, a.nodeId);
+  const adjB = findAdjacentPoint(b.pathId, b.nodeId);
+  if (!adjA || !adjB) {
+    measureResult = { text: "Both points need a neighboring point to define a line." };
+    return;
+  }
+  const v1 = [adjA.pos[0] - a.pos[0], adjA.pos[1] - a.pos[1]];
+  const v2 = [adjB.pos[0] - b.pos[0], adjB.pos[1] - b.pos[1]];
+  const dot = v1[0] * v2[0] + v1[1] * v2[1];
+  const mag = Math.hypot(...v1) * Math.hypot(...v2);
+  if (mag < 1e-9) { measureResult = { text: "One of the lines has zero length." }; return; }
+  const angle = (Math.acos(Math.max(-1, Math.min(1, dot / mag))) * 180) / Math.PI;
+  measureResult = { text: `Angle: ${angle.toFixed(2)}°` };
+}
+
+/** Area/perimeter for Rect/Circle/Ellipse comes from their own exact
+ * formulas; a freehand/polygon path uses the shoelace formula and a
+ * summed segment length, implicitly treating it as closed either way
+ * (a "closed path" measurement doesn't mean much otherwise) -- Line/Arc
+ * have no enclosed area and are explicitly called out as such rather
+ * than showing a meaningless number. */
+function computeAreaMeasurement(pathId) {
+  const props = state.pathProps.get(pathId) || {};
+  const fmt = (v) => `${toDisplayUnits(v).toFixed(2)}${unitSuffix() ? " " + unitSuffix() : ""}`;
+  const fmtArea = (v) => `${toDisplayUnitsArea(v).toFixed(2)} ${unitSuffix() || "px"}²`;
+  if (props.shape === "rect") {
+    measureResult = { text: `Area: ${fmtArea(props.w * props.h)} · Perimeter: ${fmt(2 * (props.w + props.h))}` };
+  } else if (props.shape === "circle") {
+    measureResult = { text: `Area: ${fmtArea(Math.PI * props.r * props.r)} · Perimeter: ${fmt(2 * Math.PI * props.r)}` };
+  } else if (props.shape === "ellipse") {
+    const { rx, ry } = props;
+    // Ramanujan's approximation -- exact for a circle (rx===ry), close
+    // enough for any other ellipse for a measurement readout.
+    const h = ((rx - ry) * (rx - ry)) / ((rx + ry) * (rx + ry));
+    const perim = Math.PI * (rx + ry) * (1 + (3 * h) / (10 + Math.sqrt(4 - 3 * h)));
+    measureResult = { text: `Area: ${fmtArea(Math.PI * rx * ry)} · Perimeter: ${fmt(perim)}` };
+  } else if (props.shape) {
+    measureResult = { text: `${props.shape[0].toUpperCase()}${props.shape.slice(1)} has no enclosed area to measure.` };
+  } else {
+    const pts = pathPoints(pathId);
+    if (pts.length < 3) { measureResult = { text: "Needs at least 3 points to measure an area." }; return; }
+    measureResult = { text: `Area: ${fmtArea(shoelaceArea(pts))} · Perimeter: ${fmt(polygonPerimeter(pts))}` };
+  }
+}
+
+function renderMeasurePanel() {
+  const panel = document.getElementById("measurePanel");
+  if (!panel) return;
+  if (ui.tool !== "measure") { panel.innerHTML = ""; return; }
+  const modes = [["distance", "Distance"], ["angle", "Angle"], ["area", "Area/Perim."]];
+  const modeButtons = modes
+    .map(([m, label]) => `<button data-mode="${m}" class="${measureMode === m ? "active" : ""}" style="flex:1">${label}</button>`)
+    .join("");
+  let hint;
+  if (measureMode === "area") {
+    hint = '<div class="empty-hint">Click a closed path or shape to measure.</div>';
+  } else {
+    const remaining = 2 - measureSelection.length;
+    hint = remaining > 0 ? `<div class="empty-hint">Click ${remaining} more point(s).</div>` : "";
+  }
+  const resultHtml = measureResult ? `<div class="field-row"><b>${escapeHtml(measureResult.text)}</b></div>` : "";
+  panel.innerHTML = `<div class="tool-row" style="margin-top:6px">${modeButtons}</div>${hint}${resultHtml}`;
+  for (const [m] of modes) {
+    panel.querySelector(`[data-mode="${m}"]`).onclick = () => {
+      measureMode = m;
+      measureSelection = [];
+      measureResult = null;
+      renderMeasurePanel();
+      render();
+    };
+  }
+}
+
+function renderDimensionPanel() {
+  const list = document.getElementById("dimensionList");
+  if (!list) return;
+  if (state.dimensions.size === 0) {
+    list.innerHTML = '<div class="empty-hint">Dimension tool: click two points to add a persistent, auto-updating measurement.</div>';
+    return;
+  }
+  list.innerHTML = "";
+  for (const [dimId, dim] of state.dimensions) {
+    const a = livePosOf(dim.a_path, dim.a_node);
+    const b = livePosOf(dim.b_path, dim.b_node);
+    const label = a && b
+      ? `${toDisplayUnits(Math.hypot(b[0] - a[0], b[1] - a[1])).toFixed(2)}${unitSuffix() ? " " + unitSuffix() : ""}`
+      : "(geometry deleted)";
+    const row = document.createElement("div");
+    row.className = "path-row";
+    row.innerHTML = `<span class="name">${escapeHtml(label)}</span><button class="ghost-btn" data-act="del">✕</button>`;
+    row.querySelector('[data-act="del"]').onclick = () => { removeDimension(dimId); renderAll(); };
+    list.appendChild(row);
+  }
+}
+
+/** Draws one dimension's extension lines, offset dimension line, and
+ * value label -- called from inside render()'s world-space transform
+ * (so it pans/zooms with everything else), with line width/font size
+ * divided by view.zoom for a constant on-screen size, the same
+ * convention the polygon/shape drag previews already use. Anchors are
+ * resolved *live* every frame via livePosOf -- exactly why a dimension
+ * updates automatically as its referenced geometry moves, and silently
+ * stops drawing if either anchor point no longer exists. */
+function renderDimension(dim) {
+  const a = livePosOf(dim.a_path, dim.a_node);
+  const b = livePosOf(dim.b_path, dim.b_node);
+  if (!a || !b) return;
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const length = Math.hypot(dx, dy);
+  if (length < 1e-6) return;
+  const nx = -dy / length, ny = dx / length;
+  const offset = dim.offset || 30;
+  const la = [a[0] + nx * offset, a[1] + ny * offset];
+  const lb = [b[0] + nx * offset, b[1] + ny * offset];
+  ctx.save();
+  ctx.strokeStyle = "#4dabf7";
+  ctx.lineWidth = 1 / view.zoom;
+  ctx.beginPath();
+  ctx.moveTo(a[0], a[1]); ctx.lineTo(la[0], la[1]);
+  ctx.moveTo(b[0], b[1]); ctx.lineTo(lb[0], lb[1]);
+  ctx.moveTo(la[0], la[1]); ctx.lineTo(lb[0], lb[1]);
+  ctx.stroke();
+  const mx = (la[0] + lb[0]) / 2, my = (la[1] + lb[1]) / 2;
+  const label = `${toDisplayUnits(length).toFixed(2)}${unitSuffix() ? " " + unitSuffix() : ""}`;
+  ctx.font = `${14 / view.zoom}px sans-serif`;
+  ctx.fillStyle = "#4dabf7";
+  ctx.textAlign = "center";
+  ctx.fillText(label, mx, my - 4 / view.zoom);
+  ctx.restore();
 }
 
 // -- shape primitives (Phase 11) -----------------------------------------------
@@ -1686,6 +1975,8 @@ function toggleShortcutOverlay() {
     ["Ctrl/Cmd + C / V", "Copy / paste selection"],
     ["Delete / Backspace", "Delete selection"],
     ["Esc", "Cancel the in-progress polygon"],
+    ["Measure tool", "Read-only distance/angle/area readout, never synced"],
+    ["Dimension tool", "Click two points for a persistent, auto-updating measurement"],
     ["?", "Toggle this overlay"],
   ];
   const overlay = document.createElement("div");
@@ -1732,15 +2023,20 @@ document.getElementById("toolRect").onclick = () => setTool("rect");
 document.getElementById("toolCircle").onclick = () => setTool("circle");
 document.getElementById("toolEllipse").onclick = () => setTool("ellipse");
 document.getElementById("toolArc").onclick = () => setTool("arc");
+document.getElementById("toolMeasure").onclick = () => setTool("measure");
+document.getElementById("toolDimension").onclick = () => setTool("dimension");
 const TOOL_BUTTON_IDS = {
   pen: "toolPen", select: "toolSelect", polygon: "toolPolygon", constrain: "toolConstrain",
   line: "toolLine", rect: "toolRect", circle: "toolCircle", ellipse: "toolEllipse", arc: "toolArc",
+  measure: "toolMeasure", dimension: "toolDimension",
 };
 function setTool(tool) {
   if (ui.tool === "polygon" && tool !== "polygon") cancelPolygon();
   if (ui.tool === "constrain" && tool !== "constrain") { constraintSelection = []; renderConstraintPanel(); }
   if (isShapeTool(ui.tool) && tool !== ui.tool) { shapeDraft = null; }
   if (ui.tool === "select" && tool !== "select") selectDrag = null;
+  if (ui.tool === "measure" && tool !== "measure") { measureSelection = []; measureResult = null; }
+  if (ui.tool === "dimension" && tool !== "dimension") { dimensionSelection = []; }
   activeSnapGlyph = null;
   ui.tool = tool;
   for (const [t, id] of Object.entries(TOOL_BUTTON_IDS)) {
@@ -1750,6 +2046,7 @@ function setTool(tool) {
   render();
   renderToolHint();
   renderShapeInputPanel();
+  renderMeasurePanel();
 }
 
 function renderToolHint() {
@@ -1763,6 +2060,10 @@ function renderToolHint() {
     hint.textContent = "Drag to draw a freehand stroke.";
   } else if (ui.tool === "constrain") {
     hint.textContent = "Click two points (any paths) to relate them -- coincident, parallel, perpendicular, or a fixed distance apart.";
+  } else if (ui.tool === "measure") {
+    hint.textContent = "Read-only measurement -- pick a mode below, then click points (or a shape, for Area/Perim.). Nothing is sent to collaborators.";
+  } else if (ui.tool === "dimension") {
+    hint.textContent = "Click two points to add a persistent dimension that stays accurate as the geometry moves.";
   } else if (isShapeTool(ui.tool)) {
     hint.textContent = "Drag to size and place, or type exact dimensions below.";
   } else if (ui.tool === "select") {
@@ -2008,6 +2309,8 @@ function render() {
     ctx.restore();
   }
 
+  for (const dim of state.dimensions.values()) renderDimension(dim);
+
   ctx.restore();
 
   // Screen-space overlays from here down: constant on-screen size
@@ -2031,6 +2334,36 @@ function render() {
     ctx.strokeStyle = "#ffd43b";
     ctx.lineWidth = 2;
     for (const sel of constraintSelection) {
+      const pos = livePosOf(sel.pathId, sel.nodeId);
+      if (!pos) continue;
+      const [sx, sy] = worldToScreen(pos[0], pos[1]);
+      ctx.beginPath();
+      ctx.arc(sx, sy, 7, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  if (ui.tool === "measure" && measureMode !== "area" && measureSelection.length) {
+    ctx.save();
+    ctx.strokeStyle = "#51cf66";
+    ctx.lineWidth = 2;
+    for (const sel of measureSelection) {
+      const pos = livePosOf(sel.pathId, sel.nodeId);
+      if (!pos) continue;
+      const [sx, sy] = worldToScreen(pos[0], pos[1]);
+      ctx.beginPath();
+      ctx.arc(sx, sy, 7, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  if (ui.tool === "dimension" && dimensionSelection.length) {
+    ctx.save();
+    ctx.strokeStyle = "#4dabf7";
+    ctx.lineWidth = 2;
+    for (const sel of dimensionSelection) {
       const pos = livePosOf(sel.pathId, sel.nodeId);
       if (!pos) continue;
       const [sx, sy] = worldToScreen(pos[0], pos[1]);
@@ -2257,6 +2590,8 @@ function renderAll() {
   renderSelectionPanel();
   renderConstraintPanel();
   renderShapeInputPanel();
+  renderMeasurePanel();
+  renderDimensionPanel();
   renderPresenceList();
 }
 

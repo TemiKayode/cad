@@ -528,7 +528,7 @@ async def export_drawing_svg(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     units = room.doc.settings_dict().get("units", "px")
     paths = [bake_path_transform(p) for p in room.doc.path_list()]
-    svg = drawing_to_svg_string(paths, units=units)
+    svg = drawing_to_svg_string(paths, units=units, dimensions=room.doc.dimension_list())
     return _attachment(svg, "image/svg+xml", f"{room_id}.svg")
 
 
@@ -537,7 +537,7 @@ async def export_drawing_dxf(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     units = room.doc.settings_dict().get("units", "px")
     paths = [bake_path_transform(p) for p in room.doc.path_list()]
-    data = drawing_to_dxf_bytes(paths, units=units)
+    data = drawing_to_dxf_bytes(paths, units=units, dimensions=room.doc.dimension_list())
     return _attachment(data, "application/dxf", f"{room_id}.dxf")
 
 

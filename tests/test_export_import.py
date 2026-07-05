@@ -304,6 +304,58 @@ def test_dxf_export_scales_coordinates_for_units():
     assert circle.dxf.radius == pytest.approx(1.0)
 
 
+# -- Dimension annotations (Phase 13) ---------------------------------------------
+
+
+def test_svg_export_renders_a_resolved_dimension_as_a_line_and_text_group():
+    dims = [{"a_pos": (0.0, 0.0), "b_pos": (100.0, 0.0), "offset": 30.0}]
+    svg = drawing_to_svg_string([], dimensions=dims)
+    assert 'class="dimension"' in svg
+    assert ">100.00<" in svg  # the measured distance, as the label text
+
+
+def test_svg_export_skips_a_dimension_whose_anchor_is_unresolved():
+    """A dimension whose anchor point was concurrently deleted has no
+    `a_pos`/`b_pos` (see DrawingDocument.resolve_dimension_points) --
+    export must skip it silently, not raise or emit a broken group."""
+    dims = [{"a_path": "p", "a_node": [1, "a"], "b_path": "p", "b_node": [2, "a"], "offset": 30.0}]
+    svg = drawing_to_svg_string([], dimensions=dims)
+    assert "dimension" not in svg
+
+
+def test_svg_export_dimension_label_scales_with_units():
+    dims = [{"a_pos": (0.0, 0.0), "b_pos": (96.0, 0.0), "offset": 30.0}]
+    svg = drawing_to_svg_string([], dimensions=dims, units="mm")
+    assert ">25.40mm<" in svg
+
+
+def test_dxf_export_dimension_produces_a_real_dimension_entity():
+    """Confirmed by reading the value back via ezdxf's own
+    get_measurement(), not just checking a DIMENSION tag is present
+    somewhere in the file."""
+    dims = [{"a_pos": (0.0, 0.0), "b_pos": (100.0, 0.0), "offset": 30.0}]
+    data = drawing_to_dxf_bytes([], dimensions=dims)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    dim_entities = [e for e in doc.modelspace() if e.dxftype() == "DIMENSION"]
+    assert len(dim_entities) == 1
+    assert dim_entities[0].get_measurement() == pytest.approx(100.0)
+
+
+def test_dxf_export_skips_an_unresolved_dimension():
+    dims = [{"a_path": "p", "a_node": [1, "a"], "b_path": "p", "b_node": [2, "a"], "offset": 30.0}]
+    data = drawing_to_dxf_bytes([], dimensions=dims)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    assert list(doc.modelspace()) == []
+
+
+def test_dxf_export_dimension_scales_with_units():
+    dims = [{"a_pos": (0.0, 0.0), "b_pos": (96.0, 0.0), "offset": 30.0}]
+    data = drawing_to_dxf_bytes([], dimensions=dims, units="in")
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    dim_entities = [e for e in doc.modelspace() if e.dxftype() == "DIMENSION"]
+    assert dim_entities[0].get_measurement() == pytest.approx(1.0)
+
+
 # -- STL --------------------------------------------------------------------------
 
 

@@ -188,6 +188,18 @@ class RGA(Generic[V]):
     def entries(self) -> list[tuple[OpId, V]]:
         return [(n.id, n.value) for n in self._seq if not n.tombstone]
 
+    def value_at(self, op_id: OpId) -> Optional[V]:
+        """Live value at a specific, stable node id, or None if that id
+        doesn't exist or has since been deleted -- for features that
+        reference one particular point by id rather than its current
+        position in the list (Phase 13 dimensions), so the reference
+        keeps resolving correctly across concurrent inserts/deletes
+        elsewhere in the same path. O(1) via `_by_id`, not a scan."""
+        node = self._by_id.get(op_id)
+        if node is None or node.tombstone:
+            return None
+        return node.value
+
     def __iter__(self) -> Iterator[V]:
         return iter(self.values())
 

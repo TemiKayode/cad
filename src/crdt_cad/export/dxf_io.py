@@ -26,11 +26,24 @@ Document units (Phase 11) scale every exported coordinate by
 (0=unitless, 4=millimeters, 1=inches) so a real CAD tool interprets the
 numbers correctly -- "px" stays unitless (0), matching this project's
 behavior before units existed at all.
+
+Dimension annotations (Phase 13, ``crdt_cad.crdt.document``'s
+``dimensions`` component) export as real ``DIMENSION`` entities via
+``ezdxf``'s ``add_linear_dim`` -- a genuine two-step create-then-render
+API (confirmed by actually building, rendering, and reading one back:
+the reloaded file contains a real ``DIMENSION`` entity whose
+``get_measurement()`` matches the two points' distance), not a
+hand-drawn line-and-text approximation. Only already-resolved
+dimensions (``a_pos``/``b_pos`` present -- see ``dimension_list``) are
+exported; one whose anchor point was concurrently deleted is silently
+skipped, the same "can't currently render this" contract
+``resolve_dimension_points`` documents.
 """
 
 from __future__ import annotations
 
 import io
+import math
 
 import ezdxf
 
@@ -39,6 +52,28 @@ from crdt_cad.crdt.document import flatten_path_to_polyline, px_per_unit
 Point = tuple[float, float]
 
 _DXF_INSUNITS = {"px": 0, "mm": 4, "in": 1}
+
+
+def _add_dimension_entity(msp, dim: dict, scale: float) -> bool:
+    """Adds a real `DIMENSION` entity for one resolved dimension
+    (`a_pos`/`b_pos` present). Returns False (adds nothing) if the
+    dimension isn't currently resolvable, or its two anchors coincide
+    (a zero-length "dimension" has no direction to offset along)."""
+    a, b = dim.get("a_pos"), dim.get("b_pos")
+    if a is None or b is None:
+        return False
+    ax, ay = a[0] * scale, a[1] * scale
+    bx, by = b[0] * scale, b[1] * scale
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return False
+    nx, ny = -dy / length, dx / length  # unit perpendicular
+    offset = dim.get("offset", 30.0) * scale
+    base = (ax + nx * offset, ay + ny * offset)
+    dim_entity = msp.add_linear_dim(base=base, p1=(ax, ay), p2=(bx, by), dimstyle="EZDXF")
+    dim_entity.render()
+    return True
 
 
 def _add_shape_entity(msp, shape: dict, scale: float) -> bool:
@@ -79,7 +114,7 @@ def _add_shape_entity(msp, shape: dict, scale: float) -> bool:
     return True
 
 
-def drawing_to_dxf_bytes(paths: list[dict], units: str = "px") -> bytes:
+def drawing_to_dxf_bytes(paths: list[dict], units: str = "px", dimensions: list[dict] | None = None) -> bytes:
     scale = 1.0 / px_per_unit(units)
     doc = ezdxf.new()
     doc.header["$INSUNITS"] = _DXF_INSUNITS.get(units, 0)
@@ -93,6 +128,8 @@ def drawing_to_dxf_bytes(paths: list[dict], units: str = "px") -> bytes:
         flattened = flatten_path_to_polyline(pts, p.get("point_ids"), p)
         scaled = [(x * scale, y * scale) for x, y in flattened]
         msp.add_lwpolyline(scaled, dxfattribs={"layer": "0"})
+    for dim in dimensions or []:
+        _add_dimension_entity(msp, dim, scale)
     buf = io.StringIO()
     doc.write(buf)
     return buf.getvalue().encode("utf-8")

@@ -97,10 +97,70 @@ def _shape_svg_element(shape: dict, scale: float) -> str | None:
     return None
 
 
-def drawing_to_svg_string(paths: list[dict], padding: float = 20.0, units: str = "px") -> str:
+def _dimension_bounds(dim: dict) -> tuple[float, float, float, float] | None:
+    """Bounding box of a resolved dimension's *rendered* extent -- the
+    offset dimension line can sit well outside the two measured points
+    themselves, so the viewBox padding calc needs this too, not just
+    `a_pos`/`b_pos` directly."""
+    a, b = dim.get("a_pos"), dim.get("b_pos")
+    if a is None or b is None:
+        return None
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    nx, ny = -dy / length, dx / length
+    offset = dim.get("offset", 30.0)
+    la = (a[0] + nx * offset, a[1] + ny * offset)
+    lb = (b[0] + nx * offset, b[1] + ny * offset)
+    xs = [a[0], b[0], la[0], lb[0]]
+    ys = [a[1], b[1], la[1], lb[1]]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _dimension_svg_element(dim: dict, scale: float, units: str) -> str | None:
+    """A dimension line + two extension lines + a value-label `<text>`,
+    grouped in one `<g>` -- SVG has no native dimension-annotation
+    concept the way DXF does, so this is a faithful line+text rendering
+    per the brief, not an approximation of anything. `length` (used for
+    both the offset dimension line's endpoints and the label's numeric
+    value) is computed *after* scaling, so the label directly reads in
+    the caller's chosen display unit with no separate conversion."""
+    a, b = dim.get("a_pos"), dim.get("b_pos")
+    if a is None or b is None:
+        return None
+    ax, ay = a[0] * scale, a[1] * scale
+    bx, by = b[0] * scale, b[1] * scale
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return None
+    nx, ny = -dy / length, dx / length
+    offset = dim.get("offset", 30.0) * scale
+    lax, lay = ax + nx * offset, ay + ny * offset
+    lbx, lby = bx + nx * offset, by + ny * offset
+    mx, my = (lax + lbx) / 2, (lay + lby) / 2
+    suffix = _SVG_UNIT_SUFFIX.get(units, "")
+    label = f"{length:.2f}{suffix}"
+    return (
+        '<g class="dimension" stroke="#4dabf7" stroke-width="1" fill="none">'
+        f'<line x1="{ax:.3f}" y1="{ay:.3f}" x2="{lax:.3f}" y2="{lay:.3f}" />'
+        f'<line x1="{bx:.3f}" y1="{by:.3f}" x2="{lbx:.3f}" y2="{lby:.3f}" />'
+        f'<line x1="{lax:.3f}" y1="{lay:.3f}" x2="{lbx:.3f}" y2="{lby:.3f}" />'
+        f'<text x="{mx:.3f}" y="{my:.3f}" font-size="12" stroke="none" fill="#4dabf7" '
+        f'text-anchor="middle">{label}</text>'
+        "</g>"
+    )
+
+
+def drawing_to_svg_string(
+    paths: list[dict], padding: float = 20.0, units: str = "px", dimensions: list[dict] | None = None
+) -> str:
     scale = 1.0 / px_per_unit(units)
+    dimensions = dimensions or []
     all_points = [pt for p in paths for pt in p.get("points", [])]
     bounds = [_shape_bounds(p) for p in paths if p.get("shape")]
+    bounds += [_dimension_bounds(d) for d in dimensions]
     xs, ys = [], []
     for pt in all_points:
         xs.append(pt[0])
@@ -141,6 +201,10 @@ def drawing_to_svg_string(paths: list[dict], padding: float = 20.0, units: str =
             f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{stroke_width:.3f}" '
             'stroke-linecap="round" stroke-linejoin="round" />'
         )
+    for dim in dimensions:
+        el = _dimension_svg_element(dim, scale, units)
+        if el is not None:
+            lines.append(el)
     lines.append("</svg>")
     return "\n".join(lines)
 

@@ -518,3 +518,124 @@ def test_bake_path_transform_also_transforms_curve_control_points():
     baked = bake_path_transform(path)
     assert baked["points"] == [(100.0, 0.0), (110.0, 0.0)]
     assert baked[curve_prop_key("b")]["c"] == [105.0, 5.0]
+
+
+# -- Dimension annotations (Phase 13) ---------------------------------------------
+
+
+def _two_point_path(doc, layer_id):
+    path_id, _ = doc.add_path(layer_id, [(0.0, 0.0), (100.0, 0.0)])
+    entries = doc._path_geom(path_id).entries()
+    return path_id, entries[0][0], entries[1][0]
+
+
+def test_add_dimension_resolves_to_the_live_positions_of_its_anchors():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    dim_id, op = doc.add_dimension(path_id, a_node, path_id, b_node, offset=20.0)
+    doc.apply(op)
+    resolved = doc.resolve_dimension_points(doc.dimensions.get(dim_id))
+    assert resolved == ((0.0, 0.0), (100.0, 0.0))
+
+
+def test_dimension_list_includes_resolved_positions_alongside_the_raw_payload():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    dim_id, op = doc.add_dimension(path_id, a_node, path_id, b_node)
+    doc.apply(op)
+    entry = doc.dimension_list()[0]
+    assert entry["id"] == dim_id
+    assert entry["a_pos"] == (0.0, 0.0)
+    assert entry["b_pos"] == (100.0, 0.0)
+
+
+def test_dimension_resolution_fails_gracefully_when_an_anchor_point_is_deleted():
+    """A dimension's anchor references a specific RGA node id (not a
+    point_index the way `comments` does), so it must survive a
+    concurrent insert/delete elsewhere in the same path -- and correctly
+    report "unresolvable" (not raise) once its own anchor is actually
+    gone."""
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    dim_id, op = doc.add_dimension(path_id, a_node, path_id, b_node)
+    doc.apply(op)
+
+    doc._path_geom(path_id).delete(b_node)
+    assert doc.resolve_dimension_points(doc.dimensions.get(dim_id)) is None
+    entry = doc.dimension_list()[0]
+    assert "a_pos" not in entry and "b_pos" not in entry
+
+
+def test_dimension_resolution_unaffected_by_an_unrelated_insert_elsewhere_in_the_path():
+    """The whole point of anchoring by node id instead of point_index:
+    inserting a brand-new point earlier in the path must not shift which
+    point the dimension resolves to."""
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    dim_id, op = doc.add_dimension(path_id, a_node, path_id, b_node)
+    doc.apply(op)
+
+    doc._path_geom(path_id).insert_after(None, (-50.0, -50.0))  # inserted before a_node
+    resolved = doc.resolve_dimension_points(doc.dimensions.get(dim_id))
+    assert resolved == ((0.0, 0.0), (100.0, 0.0))
+
+
+def test_dimensions_merge_field_wise_like_every_other_lww_component():
+    doc_a = DrawingDocument(LamportClock(actor="a"))
+    layer_id, layer_ops = doc_a.add_layer("L")
+    path_id, path_ops = doc_a.add_path(layer_id, [(0.0, 0.0), (100.0, 0.0)])
+    entries = doc_a._path_geom(path_id).entries()
+    a_node, b_node = entries[0][0], entries[1][0]
+
+    doc_b = DrawingDocument(LamportClock(actor="b"))
+    for op in layer_ops + path_ops:
+        doc_b.apply(op)
+
+    dim_id, op = doc_a.add_dimension(path_id, a_node, path_id, b_node)
+    doc_a.apply(op)
+    doc_b.merge(doc_a)
+    assert dim_id in dict(doc_b.dimensions.items())
+
+
+def test_dimensions_survive_serialization_roundtrip():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    dim_id, op = doc.add_dimension(path_id, a_node, path_id, b_node, offset=15.0)
+    doc.apply(op)
+
+    restored = DrawingDocument.from_bytes(LamportClock(actor="b"), doc.to_bytes())
+    assert dict(restored.dimensions.items())[dim_id]["offset"] == 15.0
+    # points round-trip as lists rather than tuples (MessagePack/JSON have
+    # no tuple type) -- see test_document_serialization_roundtrip's own
+    # normalization note above for the same documented behavior.
+    a, b = restored.resolve_dimension_points(restored.dimensions.get(dim_id))
+    assert list(a) == [0.0, 0.0] and list(b) == [100.0, 0.0]
+
+
+def test_dimensions_default_to_empty_when_absent_from_an_old_snapshot():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    d = doc.to_dict()
+    del d["dimensions"]
+    restored = DrawingDocument.from_dict(LamportClock(actor="b"), d)
+    assert dict(restored.dimensions.items()) == {}
+    # and it's still a real, usable LWWMap afterward, not a stub
+    layer_id, _ = restored.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(restored, layer_id)
+    dim_id, op = restored.add_dimension(path_id, a_node, path_id, b_node)
+    restored.apply(op)
+    assert dim_id in dict(restored.dimensions.items())
+
+
+def test_remove_dimension_deletes_it():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    dim_id, op = doc.add_dimension(path_id, a_node, path_id, b_node)
+    doc.apply(op)
+    doc.apply(doc.remove_dimension(dim_id))
+    assert dim_id not in dict(doc.dimensions.items())

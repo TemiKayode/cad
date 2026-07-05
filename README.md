@@ -36,6 +36,7 @@ over gaps.
 | 2D viewport: pan/zoom/adaptive grid/snap-to-grid (Phase 10) | **Done** -- client-local view transform, never synced; live-verified incl. presence cursors through an asymmetric transform, see below |
 | Shape primitives: Line/Rect/Circle/Ellipse/Arc, numeric input, document units (Phase 11) | **Done** -- parametric `path_props` fields, native render/hit-test/SVG/DXF export per shape, see below |
 | Selection editing: move/rotate/scale, multi-select, duplicate, copy/paste, align/distribute, object snap (Phase 12) | **Done** -- `transform` path_prop baked only at export time, canvas's own nested transform for rendering, see below |
+| Measurement (Distance/Angle/Area, read-only) + Dimension annotations (Phase 13) | **Done** -- dimensions reference geometry by (path id, RGA node id), auto-updating live and exporting as real DXF `DIMENSION` entities, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -49,7 +50,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 19 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 24 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -64,7 +65,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 289 tests, ~15s
+./.venv/Scripts/python -m pytest tests/ -v   # 303 tests, ~15s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -463,6 +464,10 @@ Kubernetes manifests and exactly what was/wasn't validated there.
   default near-black color was invisible against the canvas's own
   near-black background until manually recolored), not a Phase 8
   regression, just a pre-existing limitation this made newly visible.
+- Both SVG and DXF export also render any dimension annotations
+  (Phase 13) as, respectively, a `<g class="dimension">` line+text
+  group and a real `DIMENSION` entity -- see "Measurement and
+  dimensions" below for the full design.
 - **DXF**: export/import via `ezdxf` (`LWPOLYLINE`/`LINE`/`POLYLINE`).
   `LWPOLYLINE` has no Bezier concept, so a curve segment is flattened
   into a dense sampled polyline (12 points per segment,
@@ -831,12 +836,15 @@ align/distribute, and object snapping (Phase 12 -- see below), a strict
 **Line/Rect/Circle/Ellipse/Arc** shape tools with numeric dimension
 input (Phase 11 -- see below), a **Constrain** tool (Phase 9 --
 coincident/parallel/perpendicular/fixed-distance via the tested
-Gauss-Newton solver), a real pan/zoom/grid/snap **viewport** and a
-**document units** (px/mm/in) selector (Phase 10/11 -- see below),
-per-layer visibility, undo/redo, live multi-user cursors, comments,
-**Save**/**.json/.svg/.dxf download**/**Import SVG or DXF**/**Share**
-(copies an invite link), a keyboard shortcut overlay (`?`), and an
-offline toggle that closes both the WebSocket and any P2P connection.
+Gauss-Newton solver), a **Measure** tool (read-only Distance/Angle/
+Area-Perimeter) and a **Dimension** tool for persistent, auto-updating
+annotations (Phase 13 -- see below), a real pan/zoom/grid/snap
+**viewport** and a **document units** (px/mm/in) selector (Phase
+10/11 -- see below), per-layer visibility, undo/redo, live multi-user
+cursors, comments, **Save**/**.json/.svg/.dxf download**/**Import SVG
+or DXF**/**Share** (copies an invite link), a keyboard shortcut
+overlay (`?`), and an offline toggle that closes both the WebSocket
+and any P2P connection.
 
 **3D mesh (`/3d`)**: click the ground grid to place vertices, click 3+
 vertices in order (then the first one again, or "Finish") to build a
@@ -1097,13 +1105,75 @@ alongside the ones proving the rect/ellipse fallback actually
 preserves edge lengths (a rotation is rigid -- it must not resize
 anything) rather than just "doesn't crash."
 
+## Measurement and dimensions (Phase 13)
+
+**Measure tool** (read-only, purely client-local -- no CRDT op is ever
+sent, confirmed by an e2e test diffing the whole document before/after):
+Distance and Angle pick up to two points the same way Constrain does
+(including reusing `findAdjacentPoint` for Angle -- each point's *line*
+is inferred from its live neighbor, not just the bare point); Area/
+Perimeter instead picks one whole path or shape directly. Rect/Circle/
+Ellipse use their own exact formulas (Ellipse's perimeter via
+Ramanujan's approximation); a freehand/polygon path uses the shoelace
+formula for area and summed segment length for perimeter, implicitly
+treating it as closed either way; Line/Arc are correctly called out as
+having no enclosed area rather than showing a meaningless number.
+
+**Dimension annotations** (persistent, shared): a new
+`dimensions: LWWMap[dim_id, payload]` component on `DrawingDocument`,
+serialized/merged/synced exactly like every other component (including
+the same backward-compatible "absent from an old snapshot" default as
+`settings`). A dimension references its two anchor points by
+**`(path_id, RGA node id)`** -- deliberately *not* the `point_index`
+`comments` uses, even though the brief describes both as "the same
+referencing pattern": a node id survives a concurrent insert/delete
+anywhere else in the same path, where an index would silently drift
+onto the wrong point. `RGA.value_at(op_id)` (a new O(1) accessor) makes
+this resolution cheap; `resolve_dimension_points` returns `None` --
+never raises -- when either anchor no longer exists, and every caller
+(rendering, the panel list, export) is required to treat that as "can't
+currently show this," the same contract `curve_prop_key` lookups
+already follow elsewhere in this file.
+
+- **Rendering**: `livePosOf` (already built for Constrain) resolves
+  both anchors fresh on every frame, so a dimension's line/extension-
+  lines/label track the actual current geometry -- move the geometry,
+  the dimension moves with it, with zero polling or explicit
+  invalidation needed.
+- **A real bug this phase's own verification caught**: moving a point
+  via the Constrain tool (`movePathPoint`) is a CRDT-safe delete +
+  reinsert -- RGA values are immutable once inserted, so the point gets
+  a *brand new* node id. A dimension anchored to the *old* id would
+  silently stop resolving the moment its point was ever constrained,
+  defeating "updates automatically when the geometry moves" -- the
+  entire reason a dimension references geometry instead of copying
+  coordinates. Fixed by `remapDimensionAnchor`, called from
+  `movePathPoint` itself: it scans `state.dimensions` for any anchor
+  matching the old id and rewrites that dimension's payload onto the
+  new one, in the same move. (Curve segments, Phase 8, still *do*
+  orphan the same way on a point move -- an accepted, pre-existing,
+  and separately documented trade-off for that more cosmetic feature;
+  dimension tracking is this phase's headline behavior, so it earned
+  the extra remap step curve segments didn't.)
+- **Export**: DXF gets a real `DIMENSION` entity per resolved dimension
+  via `ezdxf`'s `add_linear_dim` -- confirmed by actually building,
+  rendering, and reading one back (the reloaded entity's own
+  `get_measurement()` matches the two points' true distance), not
+  assumed from the API docs. SVG has no native dimension-annotation
+  concept, so it renders a `<g class="dimension">` with two extension
+  lines, the offset dimension line, and a `<text>` value label -- a
+  faithful line+text rendering per the brief, not an approximation of
+  anything. An unresolved dimension (a concurrently deleted anchor) is
+  silently skipped by both exporters, never raising or emitting broken
+  geometry.
+
 ## Testing
 
 ```bash
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-289 tests: unit tests per CRDT type and geometry module, serialization
+303 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -1184,7 +1254,23 @@ transforming alongside their anchor points, and -- the two that caught
 the rotated-rect/ellipse bug described above -- confirming a rotated
 Rect/Ellipse actually flattens to its true rotated boundary (with edge
 lengths preserved, not just "doesn't crash") while an unrotated one and
-a rotated Arc both stay native shape elements as before.
+a rotated Arc both stay native shape elements as before. Also 14 new
+Phase 13 tests: 8 in `tests/test_document.py` for the new `dimensions`
+component and `RGA.value_at` -- live resolution, the same
+absent-from-an-old-snapshot backward-compat default every other
+component gets, merging field-wise like every other LWWMap, and (the
+one that mirrors the real bug this phase's own e2e verification caught)
+a dimension's anchor resolution being *unaffected* by an unrelated
+insert elsewhere in the same path, versus correctly reporting
+unresolvable once its own anchor point is actually deleted -- proving
+node-id anchoring, not a `point_index`, is what makes "auto-updates
+when geometry moves" true instead of just asserted. 6 more in
+`tests/test_export_import.py` cover both exporters: a resolved
+dimension producing a real SVG `<g class="dimension">` group and a real
+DXF `DIMENSION` entity (`get_measurement()` checked directly, not just
+that the tag exists), an unresolved one being silently skipped by both,
+and the dimension's label/measurement scaling correctly with document
+units.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -1310,11 +1396,38 @@ actual boundary stroke to grab the shape at all -- not a bug, but
 exactly the kind of assumption a live run catches that a purely
 hand-reasoned test would not.
 
+Phase 13's Measure/Dimension tools were verified live end to end: a
+freehand path's Distance measurement (200px between two endpoints) and
+a rect's Area/Perimeter (6000/320), confirmed via the panel text, not
+just "no exception"; a dimension created between two points, confirmed
+persisted via `/export/json` and synced to a second tab's own panel;
+its SVG/DXF exports checked directly (a `<g class="dimension">` group,
+and a real `DIMENSION` entity via `ezdxf`). This exact pass is what
+caught the `movePathPoint`/anchor-orphaning bug described in the
+"Measurement and dimensions" section above -- the first attempt at this
+verification used the Constrain tool's Coincident action to actually
+move one of the dimensioned points, expecting the dimension's shown
+value to update, and it silently stayed at the old, now-wrong distance
+instead. `page.evaluate()` dumping `state.dimensions`/`state.pathNodes`
+directly (rather than guessing from the rendered text alone) showed
+exactly why: the moved point's node id had changed, and the dimension
+was still referencing the old, now-tombstoned one. Fixed by
+`remapDimensionAnchor`; re-running the same verification afterward
+showed the dimension correctly updating to the new (solver-computed
+midpoint) distance. A second, smaller mistake surfaced in the same
+pass: the initial verification assumed a Coincident constraint moves
+one point *exactly onto* the other's original position, when the
+solver actually moves both points toward their shared midpoint (least
+total movement) -- corrected by computing the expected midpoint
+directly rather than guessing, the same "verify the actual solver
+behavior, don't assume" discipline Phase 9's own constraint testing
+already established.
+
 ### Committed e2e suite + CI
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (19 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (24 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1354,7 +1467,17 @@ and marquee independently building the same multi-selection,
 align-left equalizing two shapes' left edges via the server's own JSON,
 duplicate-then-Delete round-tripping the path count, and -- the
 regression test for the export bug described below -- a rotated rect's
-SVG export containing a `<path>` polygon and no `<rect>` at all.
+SVG export containing a `<path>` polygon and no `<rect>` at all; and
+(Phase 13) `test_measurement_dimensions_e2e.py` -- Measure's Distance
+and Area/Perimeter modes reading correctly (200px; 6000/320) and
+provably sending zero new document state (a full before/after
+`/export/json` diff, not just the ops counter, since presence pings
+from ordinary mouse movement are expected background traffic
+regardless of tool); a dimension persisting and syncing to a second
+tab; and -- the regression test for the anchor-orphaning bug described
+above -- a dimension correctly tracking its anchor point's new position
+(not "(geometry deleted)", not the stale old value) after the
+Constrain tool actually moves it.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

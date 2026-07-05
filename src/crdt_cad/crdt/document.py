@@ -36,7 +36,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from crdt_cad.crdt.clock import ActorId, LamportClock, VectorClock
+from crdt_cad.crdt.clock import ActorId, LamportClock, OpId, VectorClock
 from crdt_cad.crdt.lww import LWWElementSet, LWWMap, LWWOp
 from crdt_cad.crdt.rga import RGA, op_from_dict
 from crdt_cad.crdt.serialize import (
@@ -47,6 +47,7 @@ from crdt_cad.crdt.serialize import (
 PathId = str
 LayerId = str
 CommentId = str
+DimId = str
 Point = tuple[float, float]
 
 # Document units (Phase 11): stored/CRDT geometry is always in raw
@@ -328,6 +329,14 @@ class DrawingDocument:
         # (cursor readout, numeric shape input, SVG/DXF export scale),
         # never a migration of existing coordinates.
         self.settings: LWWMap[str, object] = LWWMap(clock)
+        # Dimension annotations (Phase 13): a linear dimension references
+        # its two anchor points by (path_id, node_id) -- the same stable
+        # RGA node id `curve_prop_key` anchors on, not a `point_index`
+        # the way `comments` does -- so it keeps resolving to the
+        # *correct* point (and "no longer resolvable" is detectable) even
+        # after a concurrent insert/delete elsewhere in the same path.
+        # Payload: {"a_path", "a_node", "b_path", "b_node", "offset"}.
+        self.dimensions: LWWMap[DimId, dict] = LWWMap(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -450,6 +459,49 @@ class DrawingDocument:
     def settings_dict(self) -> dict:
         return dict(self.settings.items())
 
+    # -- dimension annotations (Phase 13) --------------------------------------
+    def add_dimension(
+        self, a_path: PathId, a_node, b_path: PathId, b_node, offset: float = 30.0
+    ) -> tuple[DimId, DocOp]:
+        """`a_node`/`b_node` are `(counter, actor)` pairs (an `OpId`, or
+        any 2-tuple/list of the same shape -- e.g. straight off the wire,
+        which has no tuple type) identifying each anchor's specific RGA
+        node, not a `point_index`; see the `dimensions` field's docstring
+        in `__init__` for why. `offset` is the perpendicular distance
+        (world px) from the measured line to the rendered dimension
+        line, matching standard drafting convention."""
+        dim_id = new_id("dim")
+        op = self.dimensions.set(
+            dim_id,
+            {
+                "a_path": a_path, "a_node": list(a_node),
+                "b_path": b_path, "b_node": list(b_node),
+                "offset": offset,
+            },
+        )
+        return dim_id, DocOp("dimension", op.to_dict())
+
+    def remove_dimension(self, dim_id: DimId) -> DocOp:
+        return DocOp("dimension", self.dimensions.delete(dim_id).to_dict())
+
+    def _resolve_anchor(self, path_id: PathId, node_id) -> Optional[Point]:
+        rga = self.paths.get(path_id)
+        if rga is None:
+            return None
+        return rga.value_at(OpId(node_id[0], node_id[1]))
+
+    def resolve_dimension_points(self, payload: dict) -> Optional[tuple[Point, Point]]:
+        """Live positions of a dimension's two anchor points, or None if
+        either anchor's path or point no longer exists (e.g. a
+        concurrent delete) -- callers (export, `dimension_list`) must
+        treat that as "can't currently render this dimension right now,"
+        never an error."""
+        a = self._resolve_anchor(payload["a_path"], payload["a_node"])
+        b = self._resolve_anchor(payload["b_path"], payload["b_node"])
+        if a is None or b is None:
+            return None
+        return a, b
+
     # -- undo / redo: inverted ops, not snapshots --------------------------------
     def undo(self) -> list[DocOp]:
         if not self._undo:
@@ -523,6 +575,8 @@ class DrawingDocument:
             return self.presence.apply(LWWOp.from_dict(op.payload))
         if op.target == "setting":
             return self.settings.apply(LWWOp.from_dict(op.payload))
+        if op.target == "dimension":
+            return self.dimensions.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown doc op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -542,6 +596,7 @@ class DrawingDocument:
         changed |= self.comments.merge(other.comments)
         changed |= self.presence.merge(other.presence)
         changed |= self.settings.merge(other.settings)
+        changed |= self.dimensions.merge(other.dimensions)
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -587,6 +642,21 @@ class DrawingDocument:
     def presence_list(self) -> list[dict]:
         return [{"actor": actor, **payload} for actor, payload in self.presence.items()]
 
+    def dimension_list(self) -> list[dict]:
+        """One dict per stored dimension, `a_pos`/`b_pos` filled in with
+        the anchors' *live* resolved positions when both still exist
+        (absent otherwise, e.g. a concurrent delete of one anchor point)
+        -- callers (SVG/DXF export) don't need to re-derive resolution
+        themselves."""
+        out = []
+        for dim_id, payload in self.dimensions.items():
+            entry = {"id": dim_id, **payload}
+            resolved = self.resolve_dimension_points(payload)
+            if resolved is not None:
+                entry["a_pos"], entry["b_pos"] = resolved
+            out.append(entry)
+        return out
+
     # -- delta sync ---------------------------------------------------------------
     def frontier(self) -> VectorClock:
         vc = self.layers.frontier()
@@ -600,6 +670,7 @@ class DrawingDocument:
         vc = vc.merge(self.comments.frontier())
         vc = vc.merge(self.presence.frontier())
         vc = vc.merge(self.settings.frontier())
+        vc = vc.merge(self.dimensions.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[DocOp]:
@@ -614,6 +685,7 @@ class DrawingDocument:
         out += [DocOp("comment", op.to_dict()) for op in self.comments.ops_since(vc)]
         out += [DocOp("presence", op.to_dict()) for op in self.presence.ops_since(vc)]
         out += [DocOp("setting", op.to_dict()) for op in self.settings.ops_since(vc)]
+        out += [DocOp("dimension", op.to_dict()) for op in self.dimensions.ops_since(vc)]
         return out
 
     # -- serialization --------------------------------------------------------------
@@ -627,6 +699,7 @@ class DrawingDocument:
             "comments": self.comments.to_dict(),
             "presence": self.presence.to_dict(),
             "settings": self.settings.to_dict(),
+            "dimensions": self.dimensions.to_dict(),
         }
 
     @staticmethod
@@ -643,6 +716,8 @@ class DrawingDocument:
         # before this existed -- default to an empty LWWMap rather than
         # KeyError, so old rooms still load cleanly.
         doc.settings = LWWMap.from_dict(clock, d["settings"]) if "settings" in d else LWWMap(clock)
+        # Same backward-compat default for "dimensions" (Phase 13).
+        doc.dimensions = LWWMap.from_dict(clock, d["dimensions"]) if "dimensions" in d else LWWMap(clock)
         return doc
 
     def to_bytes(self) -> bytes:

@@ -36,8 +36,13 @@
           <button id="toolEllipse">⬭ Ellipse</button>
           <button id="toolArc">◜ Arc</button>
         </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="toolMeasure">📏 Measure</button>
+          <button id="toolDimension">↔ Dimension</button>
+        </div>
         <div class="empty-hint" id="toolHint">Drag to draw a freehand stroke.</div>
         <div id="shapeInputPanel"></div>
+        <div id="measurePanel"></div>
         <div class="tool-row" style="margin-top:6px">
           <button id="undoBtn">⟲ Undo</button>
           <button id="redoBtn">⟳ Redo</button>
@@ -94,6 +99,9 @@
 
         <div class="section-title">Constraints</div>
         <div id="constraintPanel"><div class="empty-hint">Constrain tool: click two points (in any path, same or different) to relate them.</div></div>
+
+        <div class="section-title">Dimensions</div>
+        <div id="dimensionList"><div class="empty-hint">Dimension tool: click two points to add a persistent, auto-updating measurement.</div></div>
 
         <div class="section-title">Comments</div>
         <div id="commentList"><div class="empty-hint">No path selected.</div></div>
