@@ -41,7 +41,49 @@ let pendingPolygon = [];
 // ops any other point move would use (see movePathPoint), broadcast the
 // normal way so everyone in the room sees it.
 let constraintSelection = [];
-let lastMousePt = null;
+let lastMousePt = null; // world coordinates -- see the view transform section below
+
+// -- view transform (Phase 10) ------------------------------------------------
+// Pan (panX/panY, screen pixels the world origin is offset by) + zoom are
+// purely client-local UI state -- never synced, never touching the CRDT --
+// per the brief: "the view transform is client-local state -- it is not
+// CRDT data and must not sync." All stored/sent geometry (path points,
+// presence cursors) is in *world* coordinates; only rendering and input
+// mapping go through this transform. A fresh view (panX=0, panY=0, zoom=1)
+// maps world 1:1 to screen pixels, so every pre-existing room's pixel-space
+// data renders exactly as it always did -- world space is a strict superset.
+const view = { panX: 0, panY: 0, zoom: 1 };
+let snapToGridEnabled = false;
+
+function screenToWorld(sx, sy) {
+  return [(sx - view.panX) / view.zoom, (sy - view.panY) / view.zoom];
+}
+function worldToScreen(wx, wy) {
+  return [wx * view.zoom + view.panX, wy * view.zoom + view.panY];
+}
+
+/** Picks a "nice" world-space grid step (1/2/5 x10^n) so its on-screen
+ * spacing stays in a comfortable, zoom-independent pixel range -- used for
+ * both grid rendering and snap-to-grid, so snapping always matches
+ * whatever grid is currently visible. */
+function pickGridStep(zoom) {
+  const targetScreenPx = 60;
+  const rawStep = targetScreenPx / zoom;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const residual = rawStep / magnitude;
+  let nice;
+  if (residual < 1.5) nice = 1;
+  else if (residual < 3.5) nice = 2;
+  else if (residual < 7.5) nice = 5;
+  else nice = 10;
+  return nice * magnitude;
+}
+
+function snapWorldPoint([wx, wy]) {
+  if (!snapToGridEnabled) return [wx, wy];
+  const step = pickGridStep(view.zoom);
+  return [Math.round(wx / step) * step, Math.round(wy / step) * step];
+}
 
 // -- wire <-> local state -----------------------------------------------------
 
@@ -485,32 +527,67 @@ function resizeCanvas() {
 }
 window.addEventListener("resize", resizeCanvas);
 
+/** Raw canvas-relative screen pixels (unaffected by pan/zoom) -- used for
+ * hit-test thresholds and pan-drag deltas, where a constant on-screen
+ * distance is what actually feels right at any zoom level. */
 function canvasPoint(e) {
   const rect = canvas.getBoundingClientRect();
   return [Math.round(e.clientX - rect.left), Math.round(e.clientY - rect.top)];
 }
 
+/** The world-space point under the cursor -- what actually gets stored/
+ * sent as geometry, snapped to the current grid if snap-to-grid is on. */
+function worldPoint(e) {
+  const [sx, sy] = canvasPoint(e);
+  return snapWorldPoint(screenToWorld(sx, sy));
+}
+
 let drawing = null;
+let spacePressed = false;
+let panState = null; // {startSx, startSy, panX0, panY0}
+
+function isPanGesture(e) {
+  return e.button === 1 || (e.button === 0 && spacePressed);
+}
 
 canvas.addEventListener("pointerdown", (e) => {
+  if (isPanGesture(e)) {
+    e.preventDefault();
+    const [sx, sy] = canvasPoint(e);
+    panState = { startSx: sx, startSy: sy, panX0: view.panX, panY0: view.panY };
+    canvas.style.cursor = "grabbing";
+    return;
+  }
   if (ui.tool !== "pen") return;
   if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
-  const pt = canvasPoint(e);
+  const pt = worldPoint(e);
   const { id, lastPointId } = addPath(ui.activeLayer, [pt], actorColor, 2.5);
-  drawing = { pathId: id, lastPointId, lastPt: pt };
+  drawing = { pathId: id, lastPointId, lastScreenPt: canvasPoint(e) };
   ui.selectedPath = id;
   renderAll();
 });
 
 canvas.addEventListener("pointermove", (e) => {
-  const pt = canvasPoint(e);
+  if (panState) {
+    const [sx, sy] = canvasPoint(e);
+    view.panX = panState.panX0 + (sx - panState.startSx);
+    view.panY = panState.panY0 + (sy - panState.startSy);
+    render();
+    return;
+  }
+  const screenPt = canvasPoint(e);
+  const pt = worldPoint(e);
   sendPresence(pt[0], pt[1]);
   lastMousePt = pt;
+  updateCursorReadout(pt);
   if (drawing) {
-    const dist = Math.hypot(pt[0] - drawing.lastPt[0], pt[1] - drawing.lastPt[1]);
+    // The "how far before adding a new point" feel should stay constant
+    // on screen regardless of zoom, so this threshold compares screen
+    // positions -- but the stored point itself is world-space.
+    const dist = Math.hypot(screenPt[0] - drawing.lastScreenPt[0], screenPt[1] - drawing.lastScreenPt[1]);
     if (dist > 2.5) {
       drawing.lastPointId = appendPoint(drawing.pathId, drawing.lastPointId, pt);
-      drawing.lastPt = pt;
+      drawing.lastScreenPt = screenPt;
       render();
     }
   } else if (ui.tool === "polygon" && pendingPolygon.length) {
@@ -518,15 +595,28 @@ canvas.addEventListener("pointermove", (e) => {
   }
 });
 
-window.addEventListener("pointerup", () => { drawing = null; });
+let justPanned = false;
+window.addEventListener("pointerup", () => {
+  if (panState) {
+    panState = null;
+    justPanned = true;
+    canvas.style.cursor = ui.tool === "select" ? "default" : "crosshair";
+    return;
+  }
+  drawing = null;
+});
 
 canvas.addEventListener("click", (e) => {
-  const pt = canvasPoint(e);
+  // A drag-to-pan (middle-button, or Space+left-button) still fires a
+  // `click` on release -- suppress exactly that one, not real clicks.
+  if (justPanned) { justPanned = false; return; }
+  const screenPt = canvasPoint(e);
+  const pt = worldPoint(e);
   if (ui.tool === "select") {
-    ui.selectedPath = hitTestPath(pt);
+    ui.selectedPath = hitTestPath(screenPt);
     renderAll();
   } else if (ui.tool === "polygon") {
-    if (pendingPolygon.length >= 3 && Math.hypot(pt[0] - pendingPolygon[0][0], pt[1] - pendingPolygon[0][1]) < 10) {
+    if (pendingPolygon.length >= 3 && Math.hypot(...subtract(worldToScreen(...pendingPolygon[0]), screenPt)) < 10) {
       finishPolygon();
     } else {
       pendingPolygon.push(pt);
@@ -534,7 +624,7 @@ canvas.addEventListener("click", (e) => {
       renderToolHint();
     }
   } else if (ui.tool === "constrain") {
-    const hit = hitTestPoint(pt);
+    const hit = hitTestPoint(screenPt);
     if (!hit) return;
     const already = constraintSelection.findIndex((s) => s.pathId === hit.pathId && idEq(s.nodeId, hit.nodeId));
     if (already !== -1) {
@@ -549,8 +639,41 @@ canvas.addEventListener("click", (e) => {
   }
 });
 
+function subtract(a, b) {
+  return [a[0] - b[0], a[1] - b[1]];
+}
+
+canvas.addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
+    const [sx, sy] = canvasPoint(e);
+    const [wxBefore, wyBefore] = screenToWorld(sx, sy);
+    const factor = Math.exp(-e.deltaY * 0.001);
+    view.zoom = Math.max(0.05, Math.min(20, view.zoom * factor));
+    // Re-anchor pan so the world point under the cursor doesn't jump --
+    // "zoom centered on cursor" per the brief.
+    view.panX = sx - wxBefore * view.zoom;
+    view.panY = sy - wyBefore * view.zoom;
+    render();
+    updateZoomIndicator();
+  },
+  { passive: false }
+);
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && ui.tool === "polygon") cancelPolygon();
+  if (e.code === "Space" && !["INPUT", "TEXTAREA"].includes(e.target.tagName)) {
+    spacePressed = true;
+    canvas.style.cursor = "grab";
+    e.preventDefault(); // don't let the page scroll on spacebar
+  }
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space") {
+    spacePressed = false;
+    canvas.style.cursor = ui.tool === "select" ? "default" : "crosshair";
+  }
 });
 
 function finishPolygon() {
@@ -569,13 +692,17 @@ function cancelPolygon() {
   renderToolHint();
 }
 
-function hitTestPath(pt) {
+/** `screenPt` is in raw canvas pixels (canvasPoint(e)) -- stored path
+ * points are world-space, so each candidate is projected to screen via
+ * worldToScreen before comparing, keeping the hit-test radius a constant
+ * on-screen size regardless of zoom. */
+function hitTestPath(screenPt) {
   let best = null, bestDist = 8;
   for (const pathId of state.pathIndex) {
     if (ui.hiddenLayers.has((state.pathProps.get(pathId) || {}).layer_id)) continue;
-    const pts = pathPoints(pathId);
+    const pts = pathPoints(pathId).map(([wx, wy]) => worldToScreen(wx, wy));
     for (let i = 0; i < pts.length - 1; i++) {
-      const d = distToSegment(pt, pts[i], pts[i + 1]);
+      const d = distToSegment(screenPt, pts[i], pts[i + 1]);
       if (d < bestDist) { bestDist = d; best = pathId; }
     }
   }
@@ -583,14 +710,16 @@ function hitTestPath(pt) {
 }
 
 /** Finds the closest *individual point* (not segment) across every
- * visible path, within a small pixel radius -- the constrain tool
- * relates specific points, not whole paths. */
-function hitTestPoint(pt) {
+ * visible path, within a small on-screen pixel radius -- the constrain
+ * tool relates specific points, not whole paths. `screenPt` is raw
+ * canvas pixels; `pos` on the returned hit is world-space. */
+function hitTestPoint(screenPt) {
   let best = null, bestDist = 10;
   for (const pathId of state.pathIndex) {
     if (ui.hiddenLayers.has((state.pathProps.get(pathId) || {}).layer_id)) continue;
     for (const entry of liveEntries(state.pathNodes.get(pathId))) {
-      const d = Math.hypot(pt[0] - entry.v[0], pt[1] - entry.v[1]);
+      const [sx, sy] = worldToScreen(entry.v[0], entry.v[1]);
+      const d = Math.hypot(screenPt[0] - sx, screenPt[1] - sy);
       if (d < bestDist) { bestDist = d; best = { pathId, nodeId: entry.id, pos: entry.v }; }
     }
   }
@@ -768,6 +897,56 @@ function renderToolHint() {
   }
 }
 
+// -- view controls: zoom indicator, cursor readout, fit-to-content, snap ----------
+
+function updateZoomIndicator() {
+  document.getElementById("zoomIndicator").textContent = `${Math.round(view.zoom * 100)}%`;
+}
+
+function updateCursorReadout([wx, wy]) {
+  document.getElementById("cursorCoords").textContent = `${wx.toFixed(1)}, ${wy.toFixed(1)}`;
+}
+
+/** Fits all visible (non-hidden-layer) geometry into view with some
+ * padding -- an empty document resets to the identity view (zoom 1,
+ * centered on the world origin) rather than leaving a stale pan/zoom
+ * from before everything was deleted. */
+function fitToContent() {
+  const allPts = [];
+  for (const pathId of state.pathIndex) {
+    if (ui.hiddenLayers.has((state.pathProps.get(pathId) || {}).layer_id)) continue;
+    allPts.push(...pathPoints(pathId));
+  }
+  const rect = canvasWrap.getBoundingClientRect();
+  if (allPts.length === 0) {
+    view.zoom = 1;
+    view.panX = 0;
+    view.panY = 0;
+    render();
+    updateZoomIndicator();
+    return;
+  }
+  const xs = allPts.map((p) => p[0]), ys = allPts.map((p) => p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 40;
+  const contentW = Math.max(maxX - minX, 1e-6), contentH = Math.max(maxY - minY, 1e-6);
+  const zoomX = (rect.width - pad * 2) / contentW;
+  const zoomY = (rect.height - pad * 2) / contentH;
+  view.zoom = Math.max(0.05, Math.min(20, Math.min(zoomX, zoomY)));
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  view.panX = rect.width / 2 - cx * view.zoom;
+  view.panY = rect.height / 2 - cy * view.zoom;
+  render();
+  updateZoomIndicator();
+}
+document.getElementById("fitToContentBtn").onclick = fitToContent;
+
+document.getElementById("snapToggleBtn").onclick = (e) => {
+  snapToGridEnabled = !snapToGridEnabled;
+  e.target.classList.toggle("active", snapToGridEnabled);
+};
+
 document.getElementById("addLayerBtn").onclick = () => {
   const id = addLayer(`Layer ${state.layerOrder.length + 1}`);
   ui.activeLayer = id;
@@ -776,15 +955,60 @@ document.getElementById("addLayerBtn").onclick = () => {
 
 // -- rendering ------------------------------------------------------------------
 
+/** Draws an adaptive grid: a minor line every `pickGridStep(zoom)` world
+ * units (faded out as its on-screen spacing compresses below a readable
+ * threshold -- "fade minor lines out as they compress" per the brief),
+ * and a major line every 5x that. Screen-space (drawn before the world
+ * transform is applied), computed from the world-space viewport bounds. */
+function drawGrid(rect) {
+  const step = pickGridStep(view.zoom);
+  const majorStep = step * 5;
+  const onScreenMinorSpacing = step * view.zoom;
+  const minorAlpha = Math.max(0, Math.min(1, (onScreenMinorSpacing - 8) / (40 - 8)));
+
+  const [wx0, wy0] = screenToWorld(0, 0);
+  const [wx1, wy1] = screenToWorld(rect.width, rect.height);
+
+  ctx.save();
+  if (minorAlpha > 0.02) {
+    ctx.strokeStyle = "#1c2028";
+    ctx.globalAlpha = minorAlpha;
+    ctx.lineWidth = 1;
+    for (let wx = Math.floor(wx0 / step) * step; wx <= wx1; wx += step) {
+      const [sx] = worldToScreen(wx, 0);
+      ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, rect.height); ctx.stroke();
+    }
+    for (let wy = Math.floor(wy0 / step) * step; wy <= wy1; wy += step) {
+      const [, sy] = worldToScreen(0, wy);
+      ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(rect.width, sy); ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = "#2e333d";
+  ctx.lineWidth = 1;
+  for (let wx = Math.floor(wx0 / majorStep) * majorStep; wx <= wx1; wx += majorStep) {
+    const [sx] = worldToScreen(wx, 0);
+    ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, rect.height); ctx.stroke();
+  }
+  for (let wy = Math.floor(wy0 / majorStep) * majorStep; wy <= wy1; wy += majorStep) {
+    const [, sy] = worldToScreen(0, wy);
+    ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(rect.width, sy); ctx.stroke();
+  }
+  ctx.restore();
+}
+
 function render() {
   const rect = canvasWrap.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
+  drawGrid(rect);
+
+  // Everything from here down is drawn directly in world coordinates --
+  // the canvas transform (not per-point math) handles the screen mapping,
+  // so a path's geometry, and its stroke_width, correctly scale with zoom
+  // the same way real-world ink would.
   ctx.save();
-  ctx.strokeStyle = "#1c2028";
-  ctx.lineWidth = 1;
-  for (let x = 0; x < rect.width; x += 32) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, rect.height); ctx.stroke(); }
-  for (let y = 0; y < rect.height; y += 32) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(rect.width, y); ctx.stroke(); }
-  ctx.restore();
+  ctx.translate(view.panX, view.panY);
+  ctx.scale(view.zoom, view.zoom);
 
   for (const pathId of state.pathIndex) {
     const props = state.pathProps.get(pathId) || {};
@@ -833,17 +1057,28 @@ function render() {
   if (ui.tool === "polygon" && pendingPolygon.length) {
     ctx.save();
     ctx.strokeStyle = "#ffd43b";
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 2 / view.zoom; // constant on-screen thickness for this transient preview
+    ctx.setLineDash([6 / view.zoom, 4 / view.zoom]);
     ctx.beginPath();
     ctx.moveTo(pendingPolygon[0][0], pendingPolygon[0][1]);
     for (let i = 1; i < pendingPolygon.length; i++) ctx.lineTo(pendingPolygon[i][0], pendingPolygon[i][1]);
     if (lastMousePt) ctx.lineTo(lastMousePt[0], lastMousePt[1]);
     ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  ctx.restore();
+
+  // Screen-space overlays from here down: constant on-screen size
+  // regardless of zoom, which is what actually feels right for
+  // selection/vertex handles (drawn after ctx.restore(), so no
+  // world transform is active).
+  if (ui.tool === "polygon" && pendingPolygon.length) {
+    ctx.save();
     for (const [i, pt] of pendingPolygon.entries()) {
+      const [sx, sy] = worldToScreen(pt[0], pt[1]);
       ctx.beginPath();
-      ctx.arc(pt[0], pt[1], i === 0 ? 6 : 4, 0, Math.PI * 2);
+      ctx.arc(sx, sy, i === 0 ? 6 : 4, 0, Math.PI * 2);
       ctx.fillStyle = i === 0 ? "#ffd43b" : "#ffe89b";
       ctx.fill();
     }
@@ -857,8 +1092,9 @@ function render() {
     for (const sel of constraintSelection) {
       const pos = livePosOf(sel.pathId, sel.nodeId);
       if (!pos) continue;
+      const [sx, sy] = worldToScreen(pos[0], pos[1]);
       ctx.beginPath();
-      ctx.arc(pos[0], pos[1], 7, 0, Math.PI * 2);
+      ctx.arc(sx, sy, 7, 0, Math.PI * 2);
       ctx.stroke();
     }
     ctx.restore();
@@ -874,8 +1110,12 @@ function renderPresence() {
     if (actor === actorId || !p) continue;
     const el = document.createElement("div");
     el.className = "cursor-label";
-    el.style.left = p.x + "px";
-    el.style.top = p.y + "px";
+    // Presence positions are stored/sent in world coordinates (Phase 10)
+    // -- this DOM overlay isn't inside the canvas's transform, so it
+    // needs its own worldToScreen conversion to land in the right place.
+    const [sx, sy] = worldToScreen(p.x, p.y);
+    el.style.left = sx + "px";
+    el.style.top = sy + "px";
     el.style.background = p.color || "#4dabf7";
     el.textContent = p.name || actor;
     layer.appendChild(el);

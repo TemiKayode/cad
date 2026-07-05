@@ -35,6 +35,16 @@
           <button id="redoBtn">⟳ Redo</button>
         </div>
 
+        <div class="section-title">View</div>
+        <div class="tool-row">
+          <button id="fitToContentBtn" style="flex:1" title="Fit all visible geometry in view">⛶ Fit</button>
+          <button id="snapToggleBtn" style="flex:1" title="Snap new points to the grid">🧲 Snap</button>
+        </div>
+        <div class="empty-hint" style="margin-top:4px">
+          Zoom <span id="zoomIndicator">100%</span> · scroll to zoom (centered on cursor),
+          middle-drag or Space+drag to pan.
+        </div>
+
         <div class="section-title">File</div>
         <div class="tool-row">
           <button id="saveBtn" style="flex:1">💾 Save</button>
@@ -81,6 +91,7 @@
       <span>actor: <b id="actorLabel"></b></span>
       <span id="opsCounter">0 ops relayed</span>
       <span id="offlineCounter"></span>
+      <span id="cursorCoords"></span>
       <span style="flex:1"></span>
       <span>crdt_cad — pure-Python CRDT engine, server-authoritative merge</span>
     </div>

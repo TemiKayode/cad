@@ -33,6 +33,7 @@ over gaps.
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9) -- coincident/parallel/perpendicular/fixed-distance, live-verified with real point convergence, see below |
+| 2D viewport: pan/zoom/adaptive grid/snap-to-grid (Phase 10) | **Done** -- client-local view transform, never synced; live-verified incl. presence cursors through an asymmetric transform, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -46,7 +47,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 7 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 10 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -822,8 +823,11 @@ from a CDN via an import map (the only external runtime dependency
 either frontend has).
 
 **2D sketch (`/`)**: pen tool, select tool, a strict **Polygon** tool
-that demonstrates the geometry validity gate, per-layer visibility,
-undo/redo, live multi-user cursors, comments, **Save**/**.json/.svg/.dxf
+that demonstrates the geometry validity gate, a **Constrain** tool
+(Phase 9 -- coincident/parallel/perpendicular/fixed-distance via the
+tested Gauss-Newton solver), a real pan/zoom/grid/snap **viewport**
+(Phase 10 -- see below), per-layer visibility, undo/redo, live
+multi-user cursors, comments, **Save**/**.json/.svg/.dxf
 download**/**Import SVG or DXF**/**Share** (copies an invite link), and
 an offline toggle that closes both the WebSocket and any P2P
 connection.
@@ -841,6 +845,69 @@ as CRDT ops, exactly like any other collaborator's edit. Every one of
 these -- including a face's color and material -- is a `face_prop`
 `LWWMap` write, so recoloring a face you didn't create merges the same
 conflict-free way a vertex move does.
+
+## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
+
+Before this, the canvas mapped document coordinates 1:1 to screen
+pixels -- the drawable universe was exactly one browser window. A
+client-local `view = { panX, panY, zoom }` transform fixes that, and per
+the brief's own framing, it is deliberately **not** CRDT data: it never
+syncs, never touches `applyOp`, never appears in a snapshot. All stored
+and sent geometry (path points, presence cursor positions) is genuinely
+**world coordinates** now; only rendering (`ctx.translate`/`ctx.scale`
+around the world-space drawing pass) and input mapping
+(`screenToWorld`/`worldToScreen`) go through the transform. A fresh
+view is the identity transform (`panX=0, panY=0, zoom=1`), so every
+room's pre-existing pixel-space data (drawn before this phase existed)
+renders exactly as it always did -- world space is a strict superset of
+the old pixel space, not a breaking migration.
+
+- **Zoom**: mouse wheel, centered on the cursor -- re-anchors `panX`/`panY`
+  each tick so the world point under the cursor never jumps, clamped to
+  [5%, 2000%]. A **Fit** button frames all visible (non-hidden-layer)
+  geometry with padding; an empty document resets to the identity view
+  rather than leaving a stale pan/zoom behind.
+- **Pan**: middle-mouse-drag or Space+left-drag (the Space handler is
+  careful not to fire while a text input/textarea has focus, and
+  `preventDefault()`s only then, so it doesn't fight normal typing or
+  scroll the page). The `click` a drag-release still fires is explicitly
+  suppressed via a `justPanned` flag, so panning never gets
+  misinterpreted as "place a polygon vertex" or "select a path."
+- **Adaptive grid**: `pickGridStep` picks a "nice" world-space step
+  (1/2/5 x10^n) so its on-screen spacing stays in a fixed, readable pixel
+  range regardless of zoom -- a minor grid at that step, a major grid at
+  5x it, with the minor lines' opacity fading to zero as their on-screen
+  spacing compresses below ~8px (exactly the brief's "fade minor lines
+  out as they compress," not just a single static grid).
+- **Snap-to-grid** (toggle button): reuses the same `pickGridStep` so
+  snapping always matches whatever grid is currently visible; applied at
+  point-placement time (pen strokes, polygon vertices), not as a
+  separate CRDT concept.
+- **Live cursor coordinate readout** in the status bar, in world units.
+- **Hit-testing stays screen-space-relative**: `hitTestPath`/`hitTestPoint`
+  project each candidate point to screen via `worldToScreen` and compare
+  against a constant *screen*-pixel threshold, so click targets don't
+  become impossibly small when zoomed out or absurdly oversized when
+  zoomed in -- the correct behavior for a CAD-style viewport, and why
+  the constraint-selection highlight circles and polygon vertex markers
+  are deliberately drawn *outside* the canvas transform (screen space,
+  constant radius) while the actual path geometry is drawn *inside* it
+  (world space, so `stroke_width` correctly scales with zoom like real
+  ink would).
+- **Remote presence cursors render correctly through the transform**:
+  presence positions are stored/sent in world coordinates now, and
+  `renderPresence()`'s DOM overlay (not itself inside the canvas
+  transform) applies its own `worldToScreen` conversion per cursor.
+  Live-verified with a two-tab, *asymmetric*-transform test: tab A
+  zooms/pans away from the identity view, tab B's mouse moves to a known
+  screen point at B's own identity view (so its world coordinates equal
+  its screen coordinates there), and tab A's rendered cursor-label for B
+  is checked against **A's own** `worldToScreen` projection of that
+  point -- not simply B's raw screen position, which is the whole reason
+  presence needed to move to world coordinates in the first place. Also
+  committed as `tests/e2e/test_viewport_e2e.py`, alongside a
+  snap-to-grid check confirming stored points actually land on grid
+  multiples (not just that the toggle button changes its own CSS class).
 
 ## Testing
 
@@ -993,7 +1060,7 @@ local op.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (7 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (10 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1013,7 +1080,13 @@ no recovery toast (persistence is additive, not a new default); and
 (Phase 9) `test_constraint_ui_e2e.py` -- draw two lines, select an
 endpoint from each with the Constrain tool, apply Coincident, and
 confirm via the server's own `/export/json` (on *both* tabs) that the
-two points actually converged, not just that the UI looked right.
+two points actually converged, not just that the UI looked right; and
+(Phase 10) `test_viewport_e2e.py` -- the default view stays
+backward-compatible and the zoom indicator updates on wheel-zoom, a
+remote presence cursor projects correctly through a *different,
+asymmetric* view transform on the receiving tab (checked against that
+tab's own live `worldToScreen`, not a hand-computed expectation), and
+snap-to-grid produces genuinely grid-aligned stored points.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process
