@@ -32,6 +32,49 @@ const state = {
 const ui = { tool: "vertex", selectedFace: null, opsCount: 0 };
 let pendingFaceLoop = [];
 
+// -- parametric primitives (Phase 16) -- typed dimensions, then click to place ----
+const PRIMITIVE_FIELD_DEFS = {
+  box: [["width", "Width"], ["height", "Height"], ["depth", "Depth"]],
+  cylinder: [["radius", "Radius"], ["height", "Height"], ["segments", "Segments"]],
+  pyramid: [["radius", "Base radius"], ["height", "Height"], ["segments", "Segments"]],
+  plane: [["width", "Width"], ["depth", "Depth"]],
+};
+const PRIMITIVE_DEFAULTS = {
+  box: { width: 2, height: 2, depth: 2 },
+  cylinder: { radius: 1, height: 2, segments: 16 },
+  pyramid: { radius: 1, height: 2, segments: 4 },
+  plane: { width: 2, depth: 2 },
+};
+function isPrimitiveTool(tool) {
+  return tool === "box" || tool === "cylinder" || tool === "pyramid" || tool === "plane";
+}
+// Currently-typed dimensions for the active primitive tool, or null when
+// no primitive tool is selected -- reseeded from PRIMITIVE_DEFAULTS every
+// time a primitive tool is (re-)selected (see setTool).
+let primitiveFields = null;
+
+// -- 3D snapping (Phase 16) -- toggle mirrors the 2D demo's Snap button ----------
+let snapEnabled3D = false;
+const GRID_SNAP_STEP = 1; // matches the GridHelper(20, 20) below -- 1-unit cells
+const VERTEX_SNAP_THRESHOLD = 0.3; // world units; existing-vertex snap wins over grid snap when both are in range
+
+/** Snaps a candidate world position to the nearest existing vertex
+ * (within a small threshold) or, failing that, the nearest grid
+ * intersection -- shared by new-vertex placement and vertex dragging,
+ * a no-op unless the Snap toggle is on. `excludeVertexId` keeps a
+ * vertex from snapping to its own (pre-drag) position. */
+function snapPosition3D(pos, excludeVertexId) {
+  if (!snapEnabled3D) return pos;
+  let best = null, bestDist = VERTEX_SNAP_THRESHOLD;
+  for (const [vid, vpos] of state.vertices) {
+    if (vid === excludeVertexId) continue;
+    const d = Math.hypot(pos[0] - vpos[0], pos[1] - vpos[1], pos[2] - vpos[2]);
+    if (d < bestDist) { bestDist = d; best = vpos; }
+  }
+  if (best) return best.slice();
+  return pos.map((v) => Math.round(v / GRID_SNAP_STEP) * GRID_SNAP_STEP);
+}
+
 // -- wire <-> local state -----------------------------------------------------
 
 /** Bumps `clock` past every OpId found in a freshly-loaded snapshot, so this
@@ -555,6 +598,154 @@ function extrudeFace(faceId, height) {
   syncScene();
 }
 
+// -- parametric primitives (Phase 16) ---------------------------------------------
+// Box/Cylinder/Pyramid/Plane generate a whole vertex+edge+face set as one
+// batch of client-minted ops, following exactly the same pattern
+// extrudeFace/finishFace already use above (and the same pattern
+// crdt_cad.ai.generator.generate_mesh_ops uses server-side to build a
+// whole AI-generated mesh): mint each op via the existing op
+// constructors, apply it locally, collect it into one flat array, then
+// ONE sendOps(ops) call and ONE pushUndo({kind:"composite", ...}) --
+// never one op (or one undo entry) per vertex/face. A primitive well
+// under a few hundred ops stays far under the WS message's op/byte
+// ceilings (security.max_ops_per_message/max_ws_message_bytes), so no
+// server-side chunking (Room.commit_ops_batched, which is a REST-only,
+// AI-generation-specific helper) is needed here.
+
+function pushVertexOp(ops, subEntries, id, pos) {
+  const op = addVertexOp(id, pos);
+  ops.push(op);
+  subEntries.push({ kind: "vertex_create", vertexId: id, position: pos });
+}
+function pushFaceOps(ops, subEntries, faceId, loop) {
+  for (const op of addFaceOps(faceId, loop)) ops.push(op);
+  subEntries.push({ kind: "face_add", faceId });
+}
+function pushEdgeOp(ops, subEntries, a, b) {
+  ops.push(addEdgeOp(a, b));
+  subEntries.push({ kind: "edge_add", v1: a, v2: b });
+}
+function pushRingEdges(ops, subEntries, ring) {
+  for (let i = 0; i < ring.length; i++) pushEdgeOp(ops, subEntries, ring[i], ring[(i + 1) % ring.length]);
+}
+
+/** Applies every op in a builder's result locally, sends them as one
+ * batch, and records one composite undo entry -- shared by all four
+ * primitive builders below, mirroring extrudeFace's own tail exactly. */
+function commitPrimitive({ ops, subEntries }) {
+  for (const op of ops) applyOp(op);
+  sendOps(ops);
+  pushUndo({ kind: "composite", entries: subEntries });
+  syncScene();
+}
+
+/** `segments` evenly-spaced points around a horizontal circle of the
+ * given `radius`, centered at (center[0], y, center[2]) -- shared by
+ * Cylinder and Pyramid, which both start from a base ring. */
+function ringPositions(center, radius, segments, y) {
+  const [cx, , cz] = center;
+  const pts = [];
+  for (let i = 0; i < segments; i++) {
+    const theta = (2 * Math.PI * i) / segments;
+    pts.push([cx + radius * Math.cos(theta), y, cz + radius * Math.sin(theta)]);
+  }
+  return pts;
+}
+
+/** `center` is the box's base center (its lowest, middle point) --
+ * matches where the ground-click placement below anchors every
+ * primitive, so a Box "sits on" the point the user clicked the same way
+ * a Cylinder/Pyramid/Plane do. */
+function buildBoxOps(center, w, h, d) {
+  const ops = [], subEntries = [];
+  const [cx, cy, cz] = center;
+  const hw = w / 2, hd = d / 2;
+  const corners = {
+    b0: [cx - hw, cy, cz - hd], b1: [cx + hw, cy, cz - hd], b2: [cx + hw, cy, cz + hd], b3: [cx - hw, cy, cz + hd],
+    t0: [cx - hw, cy + h, cz - hd], t1: [cx + hw, cy + h, cz - hd], t2: [cx + hw, cy + h, cz + hd], t3: [cx - hw, cy + h, cz + hd],
+  };
+  const ids = {};
+  for (const [key, pos] of Object.entries(corners)) {
+    ids[key] = "v_" + rid();
+    pushVertexOp(ops, subEntries, ids[key], pos);
+  }
+  const rings = [
+    [ids.b0, ids.b3, ids.b2, ids.b1], // bottom
+    [ids.t0, ids.t1, ids.t2, ids.t3], // top
+    [ids.b0, ids.b1, ids.t1, ids.t0], // sides
+    [ids.b1, ids.b2, ids.t2, ids.t1],
+    [ids.b2, ids.b3, ids.t3, ids.t2],
+    [ids.b3, ids.b0, ids.t0, ids.t3],
+  ];
+  for (const ring of rings) {
+    pushFaceOps(ops, subEntries, "face_" + rid(), ring);
+    pushRingEdges(ops, subEntries, ring);
+  }
+  return { ops, subEntries };
+}
+
+function buildCylinderOps(center, radius, height, segments) {
+  const ops = [], subEntries = [];
+  const cy = center[1];
+  const bottomIds = ringPositions(center, radius, segments, cy).map((p) => {
+    const id = "v_" + rid();
+    pushVertexOp(ops, subEntries, id, p);
+    return id;
+  });
+  const topIds = ringPositions(center, radius, segments, cy + height).map((p) => {
+    const id = "v_" + rid();
+    pushVertexOp(ops, subEntries, id, p);
+    return id;
+  });
+  for (let i = 0; i < segments; i++) {
+    const j = (i + 1) % segments;
+    const ring = [bottomIds[i], bottomIds[j], topIds[j], topIds[i]];
+    pushFaceOps(ops, subEntries, "face_" + rid(), ring);
+    pushRingEdges(ops, subEntries, ring);
+  }
+  pushFaceOps(ops, subEntries, "face_" + rid(), [...bottomIds].reverse());
+  pushRingEdges(ops, subEntries, bottomIds);
+  pushFaceOps(ops, subEntries, "face_" + rid(), topIds);
+  pushRingEdges(ops, subEntries, topIds);
+  return { ops, subEntries };
+}
+
+function buildPyramidOps(center, radius, height, segments) {
+  const ops = [], subEntries = [];
+  const [cx, cy, cz] = center;
+  const baseIds = ringPositions(center, radius, segments, cy).map((p) => {
+    const id = "v_" + rid();
+    pushVertexOp(ops, subEntries, id, p);
+    return id;
+  });
+  const apexId = "v_" + rid();
+  pushVertexOp(ops, subEntries, apexId, [cx, cy + height, cz]);
+  for (let i = 0; i < segments; i++) {
+    const j = (i + 1) % segments;
+    const ring = [baseIds[i], baseIds[j], apexId];
+    pushFaceOps(ops, subEntries, "face_" + rid(), ring);
+    pushRingEdges(ops, subEntries, ring);
+  }
+  pushFaceOps(ops, subEntries, "face_" + rid(), [...baseIds].reverse());
+  pushRingEdges(ops, subEntries, baseIds);
+  return { ops, subEntries };
+}
+
+function buildPlaneOps(center, w, d) {
+  const ops = [], subEntries = [];
+  const [cx, cy, cz] = center;
+  const hw = w / 2, hd = d / 2;
+  const corners = [[cx - hw, cy, cz - hd], [cx + hw, cy, cz - hd], [cx + hw, cy, cz + hd], [cx - hw, cy, cz + hd]];
+  const ids = corners.map((p) => {
+    const id = "v_" + rid();
+    pushVertexOp(ops, subEntries, id, p);
+    return id;
+  });
+  pushFaceOps(ops, subEntries, "face_" + rid(), ids);
+  pushRingEdges(ops, subEntries, ids);
+  return { ops, subEntries };
+}
+
 function sendPresence(pos) {
   const op = { target: "presence", payload: lwwOp(clock.tick(), actorId, { pos, name: actorName, color: actorColor }, false) };
   applyOp(op);
@@ -577,6 +768,48 @@ camera.lookAt(0, 0, 0);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
 controls.enableDamping = true;
+
+// -- orthographic-ish view buttons (Phase 16) ------------------------------------
+// Repositions the *existing* perspective camera to standard axis-aligned
+// views rather than swapping in a real THREE.OrthographicCamera: `camera`
+// is referenced directly by name throughout this file (raycasting,
+// resize, the presence overlay, the render loop), so a true second
+// camera would mean threading a "current camera" indirection through
+// every one of those call sites. An axis-aligned perspective view reads
+// as "Top/Front/Right" for a CAD sketch at this scale and is a much
+// smaller, safer change -- an honest, deliberate scope reduction from a
+// literal parallel-projection camera, not a silent one.
+const DEFAULT_CAMERA_POSITION = [6, 6, 8];
+const VIEW_DISTANCE = 12;
+function setCameraView(view) {
+  controls.target.set(0, 0, 0);
+  if (view === "top") {
+    // Looking straight down -Y with the default up=(0,1,0) leaves the
+    // camera's up vector parallel to its view direction (undefined
+    // orientation) -- point "up" along -Z instead for a top-down view.
+    camera.up.set(0, 0, -1);
+    camera.position.set(0, VIEW_DISTANCE, 0);
+  } else {
+    camera.up.set(0, 1, 0);
+    if (view === "front") camera.position.set(0, 0, VIEW_DISTANCE);
+    else if (view === "right") camera.position.set(VIEW_DISTANCE, 0, 0);
+    else camera.position.set(...DEFAULT_CAMERA_POSITION); // "perspective" -- the original default view
+  }
+  camera.lookAt(controls.target);
+  controls.update();
+  for (const [id, v] of [["viewTop", "top"], ["viewFront", "front"], ["viewRight", "right"], ["viewPerspective", "perspective"]]) {
+    document.getElementById(id).classList.toggle("active", v === view);
+  }
+}
+document.getElementById("viewTop").onclick = () => setCameraView("top");
+document.getElementById("viewFront").onclick = () => setCameraView("front");
+document.getElementById("viewRight").onclick = () => setCameraView("right");
+document.getElementById("viewPerspective").onclick = () => setCameraView("perspective");
+
+document.getElementById("snapToggleBtn3d").onclick = (e) => {
+  snapEnabled3D = !snapEnabled3D;
+  e.target.classList.toggle("active", snapEnabled3D);
+};
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.65));
 const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
@@ -860,11 +1093,23 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
 
   if (ui.tool === "vertex") {
     const pt = raycastGround();
-    if (pt) addVertex([round(pt.x), 0, round(pt.z)]);
+    if (pt) addVertex(snapPosition3D([round(pt.x), 0, round(pt.z)], null));
   } else if (ui.tool === "move") {
     const fmesh = raycastFaces();
     ui.selectedFace = fmesh ? fmesh.userData.faceId : null;
     renderPanels();
+  } else if (isPrimitiveTool(ui.tool)) {
+    const pt = raycastGround();
+    if (!pt) return;
+    // Every primitive is placed with its base center at the clicked
+    // (snapped) ground point, y=0, so it sits on the grid the same way
+    // a plain vertex does -- consistent anchor across all four kinds.
+    const center = snapPosition3D([round(pt.x), 0, round(pt.z)], null);
+    const f = primitiveFields || PRIMITIVE_DEFAULTS[ui.tool];
+    if (ui.tool === "box") commitPrimitive(buildBoxOps(center, f.width, f.height, f.depth));
+    else if (ui.tool === "cylinder") commitPrimitive(buildCylinderOps(center, f.radius, f.height, Math.max(3, Math.round(f.segments))));
+    else if (ui.tool === "pyramid") commitPrimitive(buildPyramidOps(center, f.radius, f.height, Math.max(3, Math.round(f.segments))));
+    else if (ui.tool === "plane") commitPrimitive(buildPlaneOps(center, f.width, f.depth));
   }
 });
 
@@ -876,9 +1121,10 @@ renderer.domElement.addEventListener("pointermove", (e) => {
   const ok = raycaster.ray.intersectPlane(dragState.plane, hit);
   if (!ok) return;
   const current = state.vertices.get(dragState.vertexId);
-  const pos = dragState.vertical
+  const rawPos = dragState.vertical
     ? [dragState.fixedX, round(hit.y), dragState.fixedZ]
     : [round(hit.x), current[1], round(hit.z)];
+  const pos = snapPosition3D(rawPos, dragState.vertexId);
   state.vertices.set(dragState.vertexId, pos);
   const mesh = vertexMeshes.get(dragState.vertexId);
   if (mesh) mesh.position.set(pos[0], pos[1], pos[2]);
@@ -902,28 +1148,75 @@ window.addEventListener("pointerup", () => {
     }
     dragState = null;
     controls.enabled = true;
+    // A real bug caught while verifying Phase 16's snapping: pointermove
+    // only calls syncFacesTouching() (a lightweight 3D-scene-only patch,
+    // for live feedback during the drag) -- nothing here ever refreshed
+    // the side panels afterward, so the Vertices list's coordinate
+    // inputs kept showing the *pre*-drag position even though the 3D
+    // view was already correct. renderPanels() is cheap (it's already
+    // called after every other mutation via syncScene()) and only needs
+    // to run once, here, when the drag actually ends.
+    renderPanels();
   }
 });
 
 // -- tool buttons -----------------------------------------------------------------
 
+const TOOL_BUTTON_IDS_3D = {
+  vertex: "toolVertex", face: "toolFace", move: "toolMove",
+  box: "toolBox", cylinder: "toolCylinder", pyramid: "toolPyramid", plane: "toolPlane",
+};
 function setTool(tool) {
   ui.tool = tool;
-  for (const [id, t] of [["toolVertex", "vertex"], ["toolFace", "face"], ["toolMove", "move"]]) {
+  for (const [t, id] of Object.entries(TOOL_BUTTON_IDS_3D)) {
     document.getElementById(id).classList.toggle("active", tool === t);
   }
   const hints = {
     vertex: "Click the ground grid to place a vertex, or drag an existing one to move it (hold Shift to move it up/down instead).",
     face: "Click 3+ vertices in order, then click the first one again (or use Finish) to create a face.",
     move: "Drag a vertex to move it (hold Shift to move it up/down; or type exact X/Y/Z below). Click empty space on a face to select it for extrusion, recoloring, or a material tag.",
+    box: "Type dimensions below, then click the ground to place the box.",
+    cylinder: "Type dimensions below, then click the ground to place the cylinder.",
+    pyramid: "Type dimensions below, then click the ground to place the pyramid.",
+    plane: "Type dimensions below, then click the ground to place the plane.",
   };
   document.getElementById("toolHint").textContent = hints[tool];
   if (tool !== "face" && pendingFaceLoop.length) cancelFace();
+  if (isPrimitiveTool(tool)) primitiveFields = { ...PRIMITIVE_DEFAULTS[tool] };
+  renderPrimitivePanel();
   renderPanels();
 }
 document.getElementById("toolVertex").onclick = () => setTool("vertex");
 document.getElementById("toolFace").onclick = () => setTool("face");
 document.getElementById("toolMove").onclick = () => setTool("move");
+document.getElementById("toolBox").onclick = () => setTool("box");
+document.getElementById("toolCylinder").onclick = () => setTool("cylinder");
+document.getElementById("toolPyramid").onclick = () => setTool("pyramid");
+document.getElementById("toolPlane").onclick = () => setTool("plane");
+
+/** Numeric dimension fields for the active primitive tool -- "type
+ * dimensions, then click to place" per the brief, mirroring the 2D
+ * demo's shape numeric panel rather than a drag-to-size gesture (3D
+ * primitives don't have an obvious 2-point drag the way a 2D rect
+ * does). Empty when no primitive tool is active. */
+function renderPrimitivePanel() {
+  const panel = document.getElementById("primitivePanel");
+  if (!panel) return;
+  if (!isPrimitiveTool(ui.tool)) { panel.innerHTML = ""; return; }
+  const defs = PRIMITIVE_FIELD_DEFS[ui.tool];
+  panel.innerHTML = defs
+    .map(([key, label]) => {
+      const isInt = key === "segments";
+      return `<div class="field-row"><label>${label}</label><input class="primField" data-key="${key}" type="number" step="${isInt ? 1 : 0.1}" min="${isInt ? 3 : 0.01}" value="${primitiveFields[key]}" style="width:70px"/></div>`;
+    })
+    .join("");
+  for (const inp of panel.querySelectorAll(".primField")) {
+    inp.addEventListener("change", (e) => {
+      const key = e.target.dataset.key;
+      primitiveFields[key] = parseFloat(e.target.value) || PRIMITIVE_DEFAULTS[ui.tool][key];
+    });
+  }
+}
 
 document.getElementById("undoBtn").onclick = undo;
 document.getElementById("redoBtn").onclick = redo;
@@ -1105,7 +1398,13 @@ function renderPresenceOverlay() {
 
 setInterval(() => {
   document.getElementById("opsCounter").textContent = `${ui.opsCount} ops relayed`;
-  document.getElementById("offlineCounter").textContent = conn.outbox.length ? `${conn.outbox.length} queued offline` : "";
+  // `conn` is assigned inside an async bootstrap (it awaits
+  // ensureRoomAccess() first) -- this 400ms interval can fire before
+  // that resolves, so `conn` may briefly still be undefined here. A
+  // real, pre-existing (not Phase-16-specific) uncaught exception
+  // caught live: "Cannot read properties of undefined (reading
+  // 'outbox')" on an early tick.
+  document.getElementById("offlineCounter").textContent = conn && conn.outbox.length ? `${conn.outbox.length} queued offline` : "";
 }, 400);
 
 // -- resize & render loop -----------------------------------------------------------

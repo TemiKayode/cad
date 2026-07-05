@@ -36,10 +36,28 @@
           <button id="toolFace">▲ Face</button>
           <button id="toolMove">↖ Move</button>
         </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="toolBox">◫ Box</button>
+          <button id="toolCylinder">⬤ Cylinder</button>
+          <button id="toolPyramid">▲ Pyramid</button>
+          <button id="toolPlane">▭ Plane</button>
+        </div>
         <div class="empty-hint" id="toolHint">Click the ground grid to place a vertex.</div>
+        <div id="primitivePanel"></div>
         <div class="tool-row" style="margin-top:6px">
           <button id="undoBtn">⟲ Undo</button>
           <button id="redoBtn">⟳ Redo</button>
+        </div>
+
+        <div class="section-title">View</div>
+        <div class="tool-row">
+          <button id="viewTop" style="flex:1">Top</button>
+          <button id="viewFront" style="flex:1">Front</button>
+          <button id="viewRight" style="flex:1">Right</button>
+          <button id="viewPerspective" class="active" style="flex:1">Persp.</button>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="snapToggleBtn3d" style="width:100%" title="Snap placed/dragged vertices to grid intersections or existing vertices">🧲 Snap</button>
         </div>
 
         <div class="section-title">File</div>

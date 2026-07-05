@@ -39,6 +39,7 @@ over gaps.
 | Measurement (Distance/Angle/Area, read-only) + Dimension annotations (Phase 13) | **Done** -- dimensions reference geometry by (path id, RGA node id), auto-updating live and exporting as real DXF `DIMENSION` entities, see below |
 | Persistent sketch constraints, tangent, re-solve-on-drag (Phase 14) | **Done** -- new `constraints` document component, `movePathPoint` now undoable and remaps both dimensions and constraints onto a moved point's new node id, see below |
 | Designer features: text, fills, stroke styles, groups, PNG export (Phase 15) | **Done** -- new `groups` component, filled shapes now hit-test their interior (not just the boundary), real z-order (layer then creation order) fixed both client- and server-side, see below |
+| 3D usability: parametric primitives, snapping, axis-aligned views (Phase 16) | **Done** -- Box/Cylinder/Pyramid/Plane built from the same batched-op/composite-undo idiom as `extrudeFace`, no new CRDT machinery; view buttons reposition the existing perspective camera (not a true orthographic swap, see below) |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -52,7 +53,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 33 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 38 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -862,10 +863,15 @@ into a prism, or delete it**, **Undo/Redo** buttons and Ctrl+Z/Ctrl+Y
 as one bundled undo step -- the same **Save**/download(**.json/.stl**)/**Share**/
 offline toggle set, plus an **AI Generate** box -- describe a house in
 plain English and a real procedurally-built mesh streams into the scene
-as CRDT ops, exactly like any other collaborator's edit. Every one of
-these -- including a face's color and material -- is a `face_prop`
-`LWWMap` write, so recoloring a face you didn't create merges the same
-conflict-free way a vertex move does.
+as CRDT ops, exactly like any other collaborator's edit. **Box**/
+**Cylinder**/**Pyramid**/**Plane** parametric primitive tools (Phase
+16 -- see below) drop a fully-formed shape with one click, a **Snap**
+toggle for grid- and vertex-snapped placement/dragging, and
+**Top**/**Front**/**Right**/**Persp.** view buttons for quickly
+squaring up the camera. Every one of these -- including a face's color
+and material -- is a `face_prop` `LWWMap` write, so recoloring a face
+you didn't create merges the same conflict-free way a vertex move
+does.
 
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
@@ -1303,6 +1309,78 @@ constraint now persists, and constrained geometry stays constrained.
   creation order (a stable sort, so it only reorders *across* layers,
   never within one).
 
+## 3D usability: parametric primitives, snapping, views (Phase 16)
+
+Entirely a `mesh3d.js` client-side phase -- no Python touched, no new
+CRDT component, no new document schema. Every primitive is minted as
+ordinary `vertex`/`edge`/`face` ops, reusing exactly the pattern
+`extrudeFace` already established for building several mesh pieces at
+once: mint via the existing op constructors, apply each locally,
+**one** `sendOps(ops)` call, **one** composite `pushUndo` entry. The
+server never sees "a box" as a concept, only a batch of ordinary ops it
+already knows how to apply and merge -- the same reason
+`crdt_cad.ai.generator.generate_mesh_ops` doesn't need its own special
+undo/redo handling either.
+
+- **Box/Cylinder/Pyramid/Plane**: each tool has a small numeric field
+  panel (`renderPrimitivePanel`, seeded from per-shape defaults --
+  width/height/depth for Box, radius/height/segments for Cylinder and
+  Pyramid, width/depth for Plane); clicking the ground grid raycasts a
+  center point and builds the whole shape there in one click. Segment
+  count is adjustable for Cylinder/Pyramid (verified live with an
+  8-segment cylinder producing exactly 16 vertices and 10 faces --
+  8 side quads plus 2 caps -- and a default 4-segment pyramid producing
+  5 vertices/5 faces). Undo/redo reuses the existing `composite`,
+  `vertex_create`, `edge_add`, and `face_add` undo-entry kinds --
+  no new "kind" string was needed, since a primitive is just several
+  ops of the same shapes undo already knew how to invert.
+- **Snapping** (`snapPosition3D`, a `Snap` toggle button): existing-
+  vertex snapping (0.3 world-unit threshold) takes priority over a
+  1-unit grid snap, applied uniformly to new-vertex placement, vertex
+  dragging, and primitive placement. An arbitrary, non-grid-aligned
+  click with Snap on lands on an exact integer X/Z; dragging a vertex
+  close to another snaps it onto that vertex's *exact* position rather
+  than stopping just short of it.
+- **Axis-aligned views**: Top/Front/Right/Perspective buttons
+  reposition the camera to a standard framing. **Deliberate scope
+  reduction, stated plainly**: this repositions the existing single
+  `THREE.PerspectiveCamera` (`camera.up`/`camera.position`/
+  `camera.lookAt`) rather than swapping in a true
+  `THREE.OrthographicCamera`. `camera` is referenced directly by name
+  throughout raycasting, the render loop, resize handling, and the
+  presence-cursor overlay; a real second camera would need a "current
+  camera" indirection threaded through all of those call sites, which
+  wasn't judged worth the risk for what these buttons are actually for
+  (quickly squaring up a view to place or inspect geometry, not a
+  literal orthographic projection). Precise numeric extrude distance
+  was already present from an earlier phase -- confirmed via research
+  before starting this one, so no new work was needed there.
+- **A real bug this phase's verification caught**: dragging a vertex
+  updated the 3D scene immediately (`pointermove`'s lightweight
+  `syncFacesTouching` calls) but `pointerup` never refreshed the
+  Vertices side panel afterward, so its coordinate `<input>`s kept
+  showing the *pre-drag* position even though `state.vertices` and the
+  rendered mesh were already correct -- a real user dragging a vertex
+  would see a stale number in the list right after letting go. Fixed by
+  calling `renderPanels()` at the end of `pointerup`'s drag-completion
+  branch.
+- **A second, pre-existing bug found (and fixed) along the way**: a
+  `pageerror: Cannot read properties of undefined (reading 'outbox')`
+  turned up mid-verification, traced to the status bar's `setInterval`
+  reading `conn.outbox.length` while `conn` -- assigned inside an async
+  bootstrap that awaits `ensureRoomAccess()` -- was still `undefined` on
+  an early tick. Confirmed via `git stash`/`git stash pop` that this
+  exact code predates this phase entirely (a genuine, unrelated race,
+  not something introduced here); fixed anyway with a minimal
+  `conn && conn.outbox.length` guard, consistent with this project's
+  practice of fixing real bugs found incidentally during verification
+  rather than filing them away.
+- **No new Python unit tests**: nothing in `src/crdt_cad/` changed, so
+  the full 328-test non-e2e suite runs unmodified and green. This phase
+  is covered entirely by `tests/e2e/test_3d_usability_e2e.py` (see
+  below), since every behavior here -- primitive topology, snapping,
+  camera framing -- only exists in the client.
+
 ## Testing
 
 ```bash
@@ -1627,11 +1705,39 @@ failing first -- worth recording as a case where careful code reading
 (not just live-testing) found the bug, the reverse of most other
 entries in this log.
 
+Phase 16's primitives and snapping were verified live end to end: Box
+created and its Undo removing all 8 vertices/6 faces in one click,
+Redo restoring them; an 8-segment Cylinder producing exactly 16
+vertices/10 faces; default Pyramid and Plane producing 5/5 and 4/1;
+grid snap landing an arbitrary click on an integer coordinate; and a
+vertex-to-vertex drag snapping exactly onto the target. Getting the
+snapping checks right took three passes, each one a genuine lesson: the
+first draft left Snap toggled on from the grid-snap check when it went
+on to place two fresh vertices for the drag check, so those two landed
+slightly away from their actual click coordinates -- meaning re-clicking
+that same screen spot to grab one for the drag silently missed its
+sphere and created a third vertex instead of dragging the second; fixed
+by explicitly toggling Snap off before placing them. The second draft,
+after that fix, dragged toward a nearby offset instead of the exact
+target -- at this scene's camera distance a few screen pixels covers
+more world-distance than the 0.3-unit snap threshold, so the drag
+routinely landed just outside it; fixed by targeting the *exact*
+original screen coordinates instead of an approximation, since both
+points came from the same ray-plane intersection to begin with. The
+third, and the one that mattered most: even with the drag correctly
+landing inside the snap threshold, the Vertices panel kept showing the
+pre-drag position -- which is what led to finding the genuine
+`pointerup`/`renderPanels()` product bug described in the section
+above, not a test artifact. All three were resolved by adding temporary
+diagnostic logging and isolating one layer of the problem at a time
+rather than guessing, then removing that instrumentation once each root
+cause was confirmed.
+
 ### Committed e2e suite + CI
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (33 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (38 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1696,7 +1802,16 @@ selects nothing before filling a shape does select it afterward, same
 point, same test); a dash style persisting; grouping making one
 member's click select the whole group and Ungroup reverting it; and
 both PNG export buttons producing a real `.png` download, with the
-fit-to-content variant's view confirmed restored afterward.
+fit-to-content variant's view confirmed restored afterward; and (Phase
+16) `test_3d_usability_e2e.py` -- Box creating in one click with Undo/
+Redo removing and restoring all 8 vertices/6 faces atomically;
+Cylinder/Pyramid/Plane each producing the expected vertex/face counts;
+grid snap landing an arbitrary click on an integer coordinate; a
+vertex-to-vertex drag snapping exactly onto the target *and* the
+Vertices panel reflecting the new position afterward (the regression
+test for the stale-panel-after-drag bug above, which is exactly why
+this test reads positions from the panel's own `.vertex-coord` inputs
+rather than the 3D scene); and the four view buttons not throwing.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process
