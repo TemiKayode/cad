@@ -21,6 +21,7 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body class="home-body">
+  <a class="skip-link" href="#roomGrid">Skip to rooms</a>
   <div class="home-topbar">
     <div class="brand">crdt-cad workspace</div>
     <div class="spacer"></div>
@@ -30,7 +31,7 @@
   </div>
 
   <div class="home-main">
-    <div id="roomGrid" class="room-grid"></div>
+    <div id="roomGrid" class="room-grid" tabindex="-1"></div>
     <div id="emptyState" class="empty-hint" style="display:none;padding:24px 4px;">
       No rooms yet -- click "New 2D drawing" or "New 3D mesh" above to create one.
     </div>

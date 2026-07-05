@@ -49,7 +49,8 @@ offline to see the **Time-Travel Merge** panel.
 | Workspace: home page, version history, read-only share links, display names (Phase 17) | **Done** -- rooms are no longer bare URLs to remember: a home page lists/renames them with a real thumbnail, restore forks a version into a new room (never rewrites live history), and viewer-role tokens are enforced server-side at both the WS and REST layer, see below |
 | Design system: color/type/space/motion tokens, dark+light theme, icon sprite (Part 3 Phase D1) | **Done** -- every emoji glyph replaced with a hand-authored SVG icon, `docs/design-system.md`, see below |
 | Layout: icon tool rail, collapsible panels, document name, avatar stack (Part 3 Phase D2) | **Done** -- canvas gets most of the width back; responsive down to 375px, see below |
-| Input feel: per-tool cursors, hover halo, token-correct snap/marquee colors (Part 3 Phase D3) | **Done** -- no drag-to-resize handles (a pre-existing, deliberate numeric-input-only scope decision, not reopened here); D4-D8 (keyboard-first, state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
+| Input feel: per-tool cursors, hover halo, token-correct snap/marquee colors (Part 3 Phase D3) | **Done** -- no drag-to-resize handles (a pre-existing, deliberate numeric-input-only scope decision, not reopened here), see below |
+| Keyboard-first: command palette, single-key shortcuts, keyboard reachability audit (Part 3 Phase D4) | **Done** -- Ctrl/Cmd+K palette, per-tool single-key shortcuts, arrow-key nudge, Ctrl/Cmd+Z/Y now in the 2D demo too, grouped/searchable "?" overlay, skip-to-canvas link, focus-trapped modals; D5-D8 (state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -63,7 +64,7 @@ offline to see the **Time-Travel Merge** panel.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 55 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 64 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -1069,6 +1070,107 @@ stay usable.
   also resets the cursor to `default` (it previously only cleared the
   hover halo), so the canvas's internal cursor state can't drift stale
   while the pointer is elsewhere.
+
+## Keyboard-first: palette, shortcuts, reachability audit (Part 3, Phase D4)
+
+- **Command palette (Ctrl/Cmd+K)**: a fuzzy-searchable list of every
+  action in both demos -- tool switching, undo/redo, duplicate/copy/
+  paste/delete, fit/zoom-to-100%, panel toggles, save/export (json/svg/
+  dxf/png/stl/step), import, AI Generate (3D), share/view-only links,
+  rename room, change display name, go offline/reconnect, toggle theme,
+  open the shortcut overlay, and cross-page navigation. Each row shows
+  an icon, the action name, and a mono-font shortcut chip where one
+  exists. Arrow keys move the highlighted row, Enter runs it, Esc
+  closes. This is the discoverability answer for every action that
+  never had a toolbar button (export formats, rename, going offline)
+  and not just a faster path to the ones that do. The list is rebuilt
+  fresh every time the palette opens (`buildCommands()` in
+  sketch.js/mesh3d.js), so it always reflects live state -- the offline
+  toggle's current label, and, more importantly, viewer-mode: editing
+  commands are dropped entirely for a read-only viewer rather than
+  shown-but-broken, and a generic `clickCmd()` helper additionally
+  skips any command backed by a button the existing `.viewer-mode` CSS
+  has currently disabled (`pointer-events: none`), so the list can't
+  silently drift out of sync with that CSS as new buttons are added.
+- **Single-key tool shortcuts**: 2D -- V select, P pen, L line, R
+  rectangle, C circle, O ellipse, A arc, T text, G polygon, K
+  constrain, M measure, D dimension. 3D -- V vertex, F face, M move, B
+  box, C cylinder, P pyramid, L plane. Letters were picked to avoid
+  colliding with the existing Ctrl/Cmd-modified shortcuts (Ctrl+D
+  duplicate vs. plain D dimension, Ctrl+C copy vs. plain C circle,
+  etc.) -- a bare key only switches tools when no modifier is held.
+  Also added: `Ctrl/Cmd+Z`/`Ctrl/Cmd+Shift+Z` (undo/redo) in the 2D
+  demo -- the 3D demo already had this, the 2D demo never did, only its
+  Undo/Redo *buttons* worked -- `Ctrl/Cmd+0` (fit to content) and
+  `Ctrl/Cmd+1` (zoom to 100%, a new `zoomTo()` helper anchored on the
+  viewport's own center rather than the cursor, since there's no cursor
+  position to anchor a keyboard-triggered zoom on), and arrow-key
+  nudge for the 2D Select tool's current selection (1px per press,
+  10px with Shift), reusing Phase 12's existing `nudgePathTransform` --
+  each nudge is its own undo step for free, since `setPathProp` already
+  pushes to the undo stack internally. Tool tooltips (`data-tooltip`,
+  shown on hover) now also display their shortcut key/chord, e.g. "Rect
+  (R)" or "Undo (Ctrl+Z)" -- `aria-label` is left as the plain action
+  name so Phase D1's emoji-glyph regression test keeps checking exactly
+  what it always checked.
+- **Viewer-mode keyboard gating -- a real, if low-severity, gap this
+  phase's own audit found and closed**: the mouse-level "editing
+  disabled" restriction for a read-only viewer (Phase 17's
+  `.viewer-mode` CSS) was never checked by the keyboard shortcut
+  handlers -- a viewer could press Ctrl+D or Delete and the client
+  would optimistically apply the edit locally (creating a phantom
+  local-only change that would only reveal itself as wrong once the
+  server's rejection of a viewer connection's `ops` message -- already
+  enforced server-side, see `server/app.py` -- diverged the client from
+  the authoritative state on the next sync). Not a security hole (the
+  server was always the actual authority), but a confusing client-side
+  experience, and exactly the kind of thing a "full keyboard
+  reachability audit" is for. Both demos' keydown handlers now check
+  `viewerMode` before running any mutating shortcut (single-key tool
+  switches, Ctrl+D/V, Delete, arrow-nudge, Ctrl+Z/Y), matching what the
+  mouse-level CSS already blocked -- Copy and the "?"/Ctrl+K/Ctrl+0/
+  Ctrl+1 shortcuts stay available to a viewer since they're genuinely
+  read-only. One related, narrower fix: 2D's "Fit" button and 3D's Top/
+  Front/Right/Perspective view buttons were previously disabled for
+  viewers too (they live inside `.panel.left`, which the viewer-mode
+  CSS blanket-disables) even though a camera-only operation is harmless
+  for a viewer to trigger -- marked `always-enabled`, matching how the
+  Save/export buttons already were.
+- **Grouped, searchable "?" shortcut overlay, styled like the palette**:
+  previously a plain, ungrouped list, and 2D-only (the 3D demo had no
+  overlay at all before this phase). Both demos now share one
+  implementation (`showShortcutOverlay(groups)` in common.js) grouped
+  into Tools/Editing/Selection/View/General (2D) or Tools/Editing/View/
+  General (3D), with a search box filtering across every row's key
+  *and* description live as you type -- "what does Ctrl+D do again" and
+  "how do I duplicate something" are the same question from two
+  directions. A real bug found writing this: the "?" keydown handler
+  never called `preventDefault()`, so the same keystroke's default
+  text-insertion action ran *after* the handler had already created and
+  focused the overlay's search input -- typing a literal "?" into it
+  and instantly self-filtering the list down to the one row that
+  happens to contain a "?" character. Fixed by adding
+  `preventDefault()`, same as every other shortcut branch already had.
+- **Full keyboard reachability audit**: a skip-to-canvas link (`.skip-
+  link`, off-screen until focused, first element in the DOM on both
+  demo pages) lets Tab jump straight past the top bar and tool rail;
+  the equivalent "Skip to rooms" link exists on the workspace home
+  page. Tab order was confirmed to already match DOM order everywhere
+  (no `order:` CSS property is used anywhere in styles.css, so visual
+  and DOM order can't have silently diverged). Every custom overlay in
+  the app -- the command palette, the shortcut overlay, the Time-Travel
+  Merge preview, and the workspace home page's rename/version-history
+  modals (which predate this phase and previously had no focus
+  management at all) -- now traps Tab inside itself via a single shared
+  `trapFocusIn()` (common.js) and restores focus to whatever triggered
+  it on close; the home page's two modals also gained Esc-to-close and
+  backdrop-click-to-close for the first time, matching every other
+  overlay in the app.
+- **A real bug the D3-established testing discipline caught again**:
+  same story as before, verified systematically rather than assumed --
+  see the "?" `preventDefault()` bug above, found by an e2e test
+  asserting the shortcut-overlay's row count rather than just that the
+  overlay opened.
 
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
@@ -2113,7 +2215,7 @@ which it did, on the first real attempt in both passes.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (55 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (64 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -2229,7 +2331,25 @@ staying within the canvas's own bounding box; a hovered shape's
 `hoveredPathId` is distinct from and does not disturb an existing
 selection; holding Space shows the "grab" pan cursor regardless of
 tool; and the 3D demo's cursor likewise follows Vertex (crosshair) vs.
-Move (default arrow).
+Move (default arrow); and (Phase D4) `test_keyboard_e2e.py` -- the
+command palette filters and runs a command (a fuzzy "rectangle" query
+switches to the Rect tool); Ctrl/Cmd+K opens the palette even while
+focused in the room-id input, and Esc closes it and restores focus to
+that same input; a single-key shortcut ("r") switches tools when
+nothing is focused but types a literal "r" instead when the room-id
+input has focus; Ctrl+Z/Ctrl+Shift+Z now undo/redo in the 2D demo;
+arrow-key nudge moves a selected path's transform by 1px (10px with
+Shift); the "?" overlay is searchable (a "duplicate" query narrows it
+to exactly one row) and closes on Esc; the skip-link is the very first
+Tab stop and activating it focuses the canvas; the 3D demo gets the
+same single-key shortcuts, palette, and overlay; and a read-only
+viewer's keyboard shortcuts are inert -- pressing "r" leaves the active
+tool untouched and Ctrl+D does not duplicate a selection forced via
+direct state manipulation (since a viewer's pointerdown gesture is
+already blocked outright, there's no click-driven way to select
+something to test against, so the test isolates exactly what this
+phase changed: whether the keyboard handler itself checks
+`viewerMode`).
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

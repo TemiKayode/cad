@@ -5,6 +5,7 @@
 initThemeToggle();
 initTooltips();
 initPanelCollapse();
+initCommandPalette(buildCommands);
 
 const actorId = getOrCreateActorId();
 let actorName = getOrCreateActorName();
@@ -140,7 +141,6 @@ let selectDrag = null;
 // {pt:[wx,wy], kind:"endpoint"|"midpoint"|"center"} while the cursor is
 // snapped to nearby geometry (object snapping, Phase 12), else null.
 let activeSnapGlyph = null;
-let shortcutOverlayEl = null;
 // Phase D3: the path a plain (non-dragging) pointermove is currently
 // hovering under the Select tool, or null -- drives both the subtle
 // hover halo (render()) and the cursor (canvas.style.cursor).
@@ -1213,6 +1213,18 @@ canvas.addEventListener(
   { passive: false }
 );
 
+// Phase D4 single-key tool shortcuts. Gated on !viewerMode: a read-only
+// viewer already can't click these same tool buttons (the mouse-level
+// .viewer-mode CSS in styles.css disables them), so letting a keyboard
+// shortcut reach the same setTool() would be a keyboard-only way around
+// that restriction -- harmless server-side (every mutating op still
+// gets rejected for a viewer connection, see server/app.py), but
+// confusing client-side, since the tool would visibly switch active.
+const KEY_TO_TOOL = {
+  v: "select", p: "pen", l: "line", r: "rect", c: "circle", o: "ellipse",
+  a: "arc", t: "text", g: "polygon", k: "constrain", m: "measure", d: "dimension",
+};
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && ui.tool === "polygon") cancelPolygon();
   if (e.code === "Space" && !["INPUT", "TEXTAREA"].includes(e.target.tagName)) {
@@ -1220,20 +1232,51 @@ window.addEventListener("keydown", (e) => {
     canvas.style.cursor = "grab";
     e.preventDefault(); // don't let the page scroll on spacebar
   }
-  if (["INPUT", "TEXTAREA"].includes(e.target.tagName)) return;
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) return;
   const mod = e.ctrlKey || e.metaKey;
-  if (mod && e.key.toLowerCase() === "d") {
+  if (mod && e.key.toLowerCase() === "z") {
     e.preventDefault();
-    duplicateSelection();
+    if (!viewerMode) { if (e.shiftKey) redo(); else undo(); }
+  } else if (mod && e.key.toLowerCase() === "y") {
+    e.preventDefault();
+    if (!viewerMode) redo();
+  } else if (mod && e.key.toLowerCase() === "d") {
+    e.preventDefault();
+    if (!viewerMode) duplicateSelection();
   } else if (mod && e.key.toLowerCase() === "c") {
     if (ui.selectedPaths.size) { e.preventDefault(); copySelectionToClipboard(); }
   } else if (mod && e.key.toLowerCase() === "v") {
     e.preventDefault();
-    pasteSelectionFromClipboard();
+    if (!viewerMode) pasteSelectionFromClipboard();
+  } else if (mod && e.key === "0") {
+    e.preventDefault();
+    fitToContent();
+  } else if (mod && e.key === "1") {
+    e.preventDefault();
+    zoomTo(1);
   } else if (e.key === "Delete" || e.key === "Backspace") {
-    if (ui.selectedPaths.size) { e.preventDefault(); deleteSelection(); }
+    if (!viewerMode && ui.selectedPaths.size) { e.preventDefault(); deleteSelection(); }
+  } else if (!mod && ui.tool === "select" && ui.selectedPaths.size && e.key.startsWith("Arrow")) {
+    if (!viewerMode) {
+      e.preventDefault();
+      const step = e.shiftKey ? 10 : 1;
+      const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+      const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+      for (const pathId of ui.selectedPaths) nudgePathTransform(pathId, dx, dy);
+      renderAll();
+    }
   } else if (e.key === "?") {
-    toggleShortcutOverlay();
+    // preventDefault matters here, not just for consistency with every
+    // other branch: without it, the "?" character gets typed into the
+    // overlay's own just-focused search input as this same keystroke's
+    // default action runs (a focus change mid-keydown redirects the
+    // browser's own text-insertion to the new target), instantly
+    // self-filtering the list down to the one row containing "?".
+    e.preventDefault();
+    showShortcutOverlay(SHORTCUT_GROUPS_2D);
+  } else if (!mod && !e.altKey && !viewerMode && KEY_TO_TOOL[e.key.toLowerCase()]) {
+    e.preventDefault();
+    setTool(KEY_TO_TOOL[e.key.toLowerCase()]);
   }
 });
 window.addEventListener("keyup", (e) => {
@@ -2601,51 +2644,52 @@ async function pasteSelectionFromClipboard() {
   }
 }
 
-// -- keyboard shortcut overlay (Phase 12) ----------------------------------------
+// -- keyboard shortcut overlay (Phase 12; grouped/searchable/palette-styled -----
+// in Phase D4, moved to the shared showShortcutOverlay/closeShortcutOverlay in
+// common.js so the 3D demo gets an identically-styled overlay of its own)
 
-function toggleShortcutOverlay() {
-  if (shortcutOverlayEl) {
-    shortcutOverlayEl.remove();
-    shortcutOverlayEl = null;
-    return;
-  }
-  const rows = [
-    ["Space + drag / middle-drag", "Pan"],
-    ["Scroll wheel", "Zoom (centered on cursor)"],
-    ["Click", "Select a path"],
-    ["Shift + click", "Add/remove a path from the selection"],
-    ["Drag on empty canvas", "Marquee-select"],
-    ["Drag a selected path", "Move the selection"],
-    ["Ctrl/Cmd + D", "Duplicate selection"],
-    ["Ctrl/Cmd + C / V", "Copy / paste selection"],
-    ["Delete / Backspace", "Delete selection"],
-    ["Esc", "Cancel the in-progress polygon"],
-    ["Measure tool", "Read-only distance/angle/area readout, never synced"],
-    ["Dimension tool", "Click two points for a persistent, auto-updating measurement"],
-    ["?", "Toggle this overlay"],
-  ];
-  const overlay = document.createElement("div");
-  overlay.className = "modal-overlay";
-  overlay.style.display = "flex";
-  const box = document.createElement("div");
-  box.className = "modal";
-  box.style.cssText = "padding:20px 24px;max-width:420px;font-size:13px;";
-  box.innerHTML =
-    '<h3 style="margin:0 0 10px;font-size:15px;">Keyboard shortcuts</h3>' +
-    '<div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;">' +
-    rows
-      .map(
-        ([k, v]) =>
-          `<div style="color:var(--accent);font-weight:600;white-space:nowrap;font-family:var(--font-mono);">${escapeHtml(k)}</div>` +
-          `<div style="color:var(--text-secondary);">${escapeHtml(v)}</div>`
-      )
-      .join("") +
-    "</div>";
-  overlay.appendChild(box);
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) toggleShortcutOverlay(); });
-  document.body.appendChild(overlay);
-  shortcutOverlayEl = overlay;
-}
+const SHORTCUT_GROUPS_2D = [
+  {
+    title: "Tools",
+    rows: [
+      ["V", "Select"], ["P", "Pen (freehand)"], ["L", "Line"], ["R", "Rectangle"],
+      ["C", "Circle"], ["O", "Ellipse"], ["A", "Arc"], ["T", "Text"],
+      ["G", "Polygon (strict)"], ["K", "Constrain"], ["M", "Measure"], ["D", "Dimension"],
+    ],
+  },
+  {
+    title: "Editing",
+    rows: [
+      ["Ctrl/Cmd+Z", "Undo"], ["Ctrl/Cmd+Shift+Z", "Redo"], ["Ctrl/Cmd+D", "Duplicate selection"],
+      ["Ctrl/Cmd+C / V", "Copy / paste selection"], ["Delete / Backspace", "Delete selection"],
+      ["Arrow keys", "Nudge selection 1px"], ["Shift+Arrow keys", "Nudge selection 10px"],
+      ["Esc", "Cancel the in-progress polygon"],
+    ],
+  },
+  {
+    title: "Selection",
+    rows: [
+      ["Click", "Select a path"], ["Shift+click", "Add/remove a path from the selection"],
+      ["Drag on empty canvas", "Marquee-select"], ["Drag a selected path", "Move the selection"],
+    ],
+  },
+  {
+    title: "View",
+    rows: [
+      ["Space+drag / middle-drag", "Pan"], ["Scroll wheel", "Zoom (centered on cursor)"],
+      ["Ctrl/Cmd+0", "Fit all content in view"], ["Ctrl/Cmd+1", "Zoom to 100%"],
+      ["\\", "Toggle both side panels"],
+    ],
+  },
+  {
+    title: "General",
+    rows: [
+      ["Ctrl/Cmd+K", "Open the command palette"], ["?", "Toggle this overlay"],
+      ["Measure tool", "Read-only distance/angle/area readout, never synced"],
+      ["Dimension tool", "Click two points for a persistent, auto-updating measurement"],
+    ],
+  },
+];
 
 function distToSegment(p, a, b) {
   const [px, py] = p, [ax, ay] = a, [bx, by] = b;
@@ -2691,6 +2735,75 @@ function setTool(tool) {
   renderToolHint();
   renderShapeInputPanel();
   renderMeasurePanel();
+}
+
+/** Built fresh every time the command palette (Ctrl/Cmd+K) opens, so it
+ * always reflects live state -- e.g. the offline toggle's label, and
+ * which commands even make sense to list at all: editing commands are
+ * dropped entirely for a read-only viewer rather than shown-but-broken
+ * (Phase D4), and clickCmd() additionally skips any button the
+ * existing .viewer-mode CSS has currently disabled (pointer-events:
+ * none), so this list can't drift out of sync with that CSS. */
+function buildCommands() {
+  function cmd(label, group, shortcut, icon, run) {
+    return { label, group, shortcut, icon, run };
+  }
+  function clickCmd(id, label, group, shortcut, icon) {
+    const el = document.getElementById(id);
+    if (!el) return null;
+    if (getComputedStyle(el).pointerEvents === "none") return null;
+    return cmd(label, group, shortcut, icon, () => el.click());
+  }
+  function toolCmd(tool, label, key, icon) {
+    return viewerMode ? null : cmd(label, "Tools", key.toUpperCase(), icon, () => setTool(tool));
+  }
+
+  return [
+    toolCmd("select", "Select", "v", "cursor"),
+    toolCmd("pen", "Pen (freehand)", "p", "pen"),
+    toolCmd("line", "Line", "l", "line"),
+    toolCmd("rect", "Rectangle", "r", "rect"),
+    toolCmd("circle", "Circle", "c", "circle"),
+    toolCmd("ellipse", "Ellipse", "o", "ellipse"),
+    toolCmd("arc", "Arc", "a", "arc"),
+    toolCmd("text", "Text", "t", "text"),
+    toolCmd("polygon", "Polygon (strict)", "g", "polygon"),
+    toolCmd("constrain", "Constrain", "k", "constrain"),
+    toolCmd("measure", "Measure", "m", "ruler"),
+    toolCmd("dimension", "Dimension", "d", "dimension"),
+
+    !viewerMode && cmd("Undo", "Edit", "Ctrl+Z", "undo", undo),
+    !viewerMode && cmd("Redo", "Edit", "Ctrl+Shift+Z", "redo", redo),
+    !viewerMode && cmd("Duplicate selection", "Edit", "Ctrl+D", "plus", duplicateSelection),
+    ui.selectedPaths.size > 0 && cmd("Copy selection", "Edit", "Ctrl+C", "file", copySelectionToClipboard),
+    !viewerMode && cmd("Paste", "Edit", "Ctrl+V", "file", pasteSelectionFromClipboard),
+    !viewerMode && ui.selectedPaths.size > 0 && cmd("Delete selection", "Edit", "Delete", "x", deleteSelection),
+
+    cmd("Fit all content in view", "View", "Ctrl+0", "maximize", fitToContent),
+    cmd("Zoom to 100%", "View", "Ctrl+1", "maximize", () => zoomTo(1)),
+    clickCmd("snapToggleBtn", "Toggle snap to grid", "View", "", "magnet"),
+    clickCmd("toggleSecondaryPanelBtn", "Toggle tools & files panel", "View", "\\", "chevron-left"),
+    clickCmd("toggleRightPanelBtn", "Toggle inspector panel", "View", "\\", "chevron-right"),
+
+    clickCmd("saveBtn", "Save", "File", "", "save"),
+    clickCmd("downloadJsonBtn", "Export .json", "File", "", "file"),
+    clickCmd("downloadSvgBtn", "Export .svg", "File", "", "file"),
+    clickCmd("downloadDxfBtn", "Export .dxf", "File", "", "file"),
+    clickCmd("downloadPngBtn", "Export .png (current view)", "File", "", "file"),
+    clickCmd("downloadPngFitBtn", "Export .png (fit to content)", "File", "", "file"),
+    clickCmd("importBtn", "Import SVG/DXF", "File", "", "upload"),
+
+    clickCmd("shareBtn", "Copy full-access invite link", "Room", "", "link"),
+    clickCmd("shareViewOnlyBtn", "Copy view-only invite link", "Room", "", "eye"),
+    clickCmd("docNameBtn", "Rename this room", "Room", "", "pen"),
+    clickCmd("renameActorBtn", "Change your display name", "Room", "", "pen"),
+    clickCmd("offlineToggle", document.getElementById("offlineToggle")?.textContent || "Go offline", "Room", "", "plug-off"),
+
+    clickCmd("themeToggleBtn", "Toggle light/dark theme", "General", "", "sun"),
+    cmd("Keyboard shortcuts", "General", "?", "search", () => showShortcutOverlay(SHORTCUT_GROUPS_2D)),
+    cmd("Open 3D mesh demo", "General", "", "chevron-right", () => { location.href = "/3d"; }),
+    cmd("Back to workspace home", "General", "", "home", () => { location.href = "/"; }),
+  ].filter(Boolean);
 }
 
 function renderToolHint() {
@@ -2766,6 +2879,20 @@ function fitToContent() {
   updateZoomIndicator();
 }
 document.getElementById("fitToContentBtn").onclick = fitToContent;
+
+/** Zooms to `targetZoom` anchored on the viewport's own center (there's
+ * no cursor position to anchor on for a keyboard-triggered zoom, unlike
+ * the wheel handler above) -- Ctrl/Cmd+1 "zoom to 100%" (Phase D4). */
+function zoomTo(targetZoom) {
+  const rect = canvasWrap.getBoundingClientRect();
+  const cx = rect.width / 2, cy = rect.height / 2;
+  const [wx, wy] = screenToWorld(cx, cy);
+  view.zoom = Math.max(0.05, Math.min(20, targetZoom));
+  view.panX = cx - wx * view.zoom;
+  view.panY = cy - wy * view.zoom;
+  render();
+  updateZoomIndicator();
+}
 
 document.getElementById("snapToggleBtn").onclick = (e) => {
   snapToGridEnabled = !snapToGridEnabled;

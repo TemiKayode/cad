@@ -461,6 +461,51 @@ a.pill-link { color: var(--text-secondary); text-decoration: none; }
 }
 .modal-body { padding: 12px 14px; overflow-y: auto; }
 
+/* -- command palette + "?" shortcut overlay (Phase D4 keyboard-first) ---- */
+
+.palette-overlay { align-items: flex-start; padding-top: 12vh; }
+.palette { width: 560px; }
+.palette-input-row {
+  display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.palette-input-row .icon { color: var(--text-secondary); }
+.palette-input-row input[type="text"] {
+  flex: 1; border: none; background: none; border-radius: 0; padding: 0; font-size: 14px;
+}
+.palette-list { overflow-y: auto; max-height: 55vh; padding: 6px; }
+.palette-group {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-secondary); padding: 10px 10px 4px;
+}
+.palette-row {
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+  border-radius: var(--r-sm); cursor: pointer; font-size: 13px;
+}
+.palette-row .icon { color: var(--text-secondary); flex-shrink: 0; }
+.palette-row.active { background: var(--accent-muted); }
+.palette-row.active .icon { color: var(--accent); }
+.palette-row-static { cursor: default; }
+.palette-label { flex: 1; }
+.palette-shortcut {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+  background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 2px 6px; white-space: nowrap;
+}
+.palette-empty { padding: 18px; text-align: center; color: var(--text-secondary); font-size: 13px; }
+
+/* -- skip-to-canvas link (Phase D4 keyboard reachability) ----------------- */
+/* Off-screen until focused, so a mouse user never sees it but the very
+   first Tab press on any page reveals a way to jump past the top bar
+   and tool rail straight to the canvas/room grid. */
+.skip-link {
+  position: fixed; top: -100px; left: 8px; z-index: var(--z-modal);
+  background: var(--accent); color: var(--accent-on); font-weight: 700;
+  padding: 10px 16px; border-radius: var(--r-sm); text-decoration: none;
+  transition: top var(--t-fast) var(--ease-standard);
+}
+.skip-link:focus { top: 8px; }
+
 .version-row {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 4px; border-bottom: 1px solid var(--border); font-size: 12.5px;

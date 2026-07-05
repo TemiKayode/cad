@@ -23,6 +23,7 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+  <a class="skip-link" href="#canvas">Skip to canvas</a>
   <div class="app">
     <div class="topbar">
       <div class="brand">crdt-cad
@@ -37,8 +38,8 @@
       <button id="shareBtn" title="Copy a full-access invite link to this room"><svg class="icon"><use href="#icon-link"></use></svg>Share</button>
       <button id="shareViewOnlyBtn" title="Copy a read-only invite link to this room"><svg class="icon"><use href="#icon-eye"></use></svg>View-only link</button>
       <span id="viewOnlyBadge" class="status-pill" style="display:none;border-color:var(--success);color:var(--success)">view only</span>
-      <button id="toggleSecondaryPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle tools & files panel" aria-label="Toggle tools & files panel"><svg class="icon"><use href="#icon-chevron-left"></use></svg></button>
-      <button id="toggleRightPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle inspector panel" aria-label="Toggle inspector panel"><svg class="icon"><use href="#icon-chevron-right"></use></svg></button>
+      <button id="toggleSecondaryPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle tools & files panel (\)" aria-label="Toggle tools & files panel"><svg class="icon"><use href="#icon-chevron-left"></use></svg></button>
+      <button id="toggleRightPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle inspector panel (\)" aria-label="Toggle inspector panel"><svg class="icon"><use href="#icon-chevron-right"></use></svg></button>
       <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
       <span id="statusPill" class="status-pill connecting"><span class="status-dot"></span><span id="statusText">connecting</span></span>
       <span id="p2pPill" class="status-pill" style="display:none"><span class="status-dot"></span><span id="p2pText">P2P</span></span>
@@ -47,23 +48,23 @@
 
     <div class="body">
       <div class="tool-rail">
-        <button id="toolPen" class="active" data-tooltip="Pen" aria-label="Pen"><svg class="icon"><use href="#icon-pen"></use></svg></button>
-        <button id="toolSelect" data-tooltip="Select" aria-label="Select"><svg class="icon"><use href="#icon-cursor"></use></svg></button>
-        <button id="toolPolygon" data-tooltip="Polygon (strict)" aria-label="Polygon (strict)"><svg class="icon"><use href="#icon-polygon"></use></svg></button>
-        <button id="toolConstrain" data-tooltip="Constrain" aria-label="Constrain"><svg class="icon"><use href="#icon-constrain"></use></svg></button>
+        <button id="toolPen" class="active" data-tooltip="Pen (P)" aria-label="Pen"><svg class="icon"><use href="#icon-pen"></use></svg></button>
+        <button id="toolSelect" data-tooltip="Select (V)" aria-label="Select"><svg class="icon"><use href="#icon-cursor"></use></svg></button>
+        <button id="toolPolygon" data-tooltip="Polygon (strict) (G)" aria-label="Polygon (strict)"><svg class="icon"><use href="#icon-polygon"></use></svg></button>
+        <button id="toolConstrain" data-tooltip="Constrain (K)" aria-label="Constrain"><svg class="icon"><use href="#icon-constrain"></use></svg></button>
         <div class="rail-divider"></div>
-        <button id="toolLine" data-tooltip="Line" aria-label="Line"><svg class="icon"><use href="#icon-line"></use></svg></button>
-        <button id="toolRect" data-tooltip="Rect" aria-label="Rect"><svg class="icon"><use href="#icon-rect"></use></svg></button>
-        <button id="toolCircle" data-tooltip="Circle" aria-label="Circle"><svg class="icon"><use href="#icon-circle"></use></svg></button>
-        <button id="toolEllipse" data-tooltip="Ellipse" aria-label="Ellipse"><svg class="icon"><use href="#icon-ellipse"></use></svg></button>
-        <button id="toolArc" data-tooltip="Arc" aria-label="Arc"><svg class="icon"><use href="#icon-arc"></use></svg></button>
-        <button id="toolText" data-tooltip="Text" aria-label="Text"><svg class="icon"><use href="#icon-text"></use></svg></button>
+        <button id="toolLine" data-tooltip="Line (L)" aria-label="Line"><svg class="icon"><use href="#icon-line"></use></svg></button>
+        <button id="toolRect" data-tooltip="Rect (R)" aria-label="Rect"><svg class="icon"><use href="#icon-rect"></use></svg></button>
+        <button id="toolCircle" data-tooltip="Circle (C)" aria-label="Circle"><svg class="icon"><use href="#icon-circle"></use></svg></button>
+        <button id="toolEllipse" data-tooltip="Ellipse (O)" aria-label="Ellipse"><svg class="icon"><use href="#icon-ellipse"></use></svg></button>
+        <button id="toolArc" data-tooltip="Arc (A)" aria-label="Arc"><svg class="icon"><use href="#icon-arc"></use></svg></button>
+        <button id="toolText" data-tooltip="Text (T)" aria-label="Text"><svg class="icon"><use href="#icon-text"></use></svg></button>
         <div class="rail-divider"></div>
-        <button id="toolMeasure" data-tooltip="Measure" aria-label="Measure"><svg class="icon"><use href="#icon-ruler"></use></svg></button>
-        <button id="toolDimension" data-tooltip="Dimension" aria-label="Dimension"><svg class="icon"><use href="#icon-dimension"></use></svg></button>
+        <button id="toolMeasure" data-tooltip="Measure (M)" aria-label="Measure"><svg class="icon"><use href="#icon-ruler"></use></svg></button>
+        <button id="toolDimension" data-tooltip="Dimension (D)" aria-label="Dimension"><svg class="icon"><use href="#icon-dimension"></use></svg></button>
         <div class="rail-divider"></div>
-        <button id="undoBtn" data-tooltip="Undo" aria-label="Undo"><svg class="icon"><use href="#icon-undo"></use></svg></button>
-        <button id="redoBtn" data-tooltip="Redo" aria-label="Redo"><svg class="icon"><use href="#icon-redo"></use></svg></button>
+        <button id="undoBtn" data-tooltip="Undo (Ctrl+Z)" aria-label="Undo"><svg class="icon"><use href="#icon-undo"></use></svg></button>
+        <button id="redoBtn" data-tooltip="Redo (Ctrl+Shift+Z)" aria-label="Redo"><svg class="icon"><use href="#icon-redo"></use></svg></button>
       </div>
       <div class="panel left">
         <div class="empty-hint" id="toolHint">Drag to draw a freehand stroke.</div>
@@ -72,7 +73,7 @@
 
         <div class="section-title">View</div>
         <div class="tool-row">
-          <button id="fitToContentBtn" style="flex:1" title="Fit all visible geometry in view"><svg class="icon"><use href="#icon-maximize"></use></svg>Fit</button>
+          <button id="fitToContentBtn" class="always-enabled" style="flex:1" title="Fit all visible geometry in view (Ctrl/Cmd+0)"><svg class="icon"><use href="#icon-maximize"></use></svg>Fit</button>
           <button id="snapToggleBtn" style="flex:1" title="Snap new points to the grid"><svg class="icon"><use href="#icon-magnet"></use></svg>Snap</button>
         </div>
         <div class="empty-hint" style="margin-top:4px">
@@ -115,7 +116,7 @@
       </div>
 
       <div class="canvas-wrap">
-        <canvas id="canvas"></canvas>
+        <canvas id="canvas" tabindex="-1"></canvas>
         <div id="cursorLayer"></div>
       </div>
 

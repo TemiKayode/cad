@@ -29,6 +29,7 @@
   </script>
 </head>
 <body>
+  <a class="skip-link" href="#canvas3d">Skip to canvas</a>
   <div class="app">
     <div class="topbar">
       <div class="brand">crdt-cad
@@ -43,8 +44,8 @@
       <button id="shareBtn" title="Copy a full-access invite link to this room"><svg class="icon"><use href="#icon-link"></use></svg>Share</button>
       <button id="shareViewOnlyBtn" title="Copy a read-only invite link to this room"><svg class="icon"><use href="#icon-eye"></use></svg>View-only link</button>
       <span id="viewOnlyBadge" class="status-pill" style="display:none;border-color:var(--success);color:var(--success)">view only</span>
-      <button id="toggleSecondaryPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle tools & files panel" aria-label="Toggle tools & files panel"><svg class="icon"><use href="#icon-chevron-left"></use></svg></button>
-      <button id="toggleRightPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle inspector panel" aria-label="Toggle inspector panel"><svg class="icon"><use href="#icon-chevron-right"></use></svg></button>
+      <button id="toggleSecondaryPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle tools & files panel (\)" aria-label="Toggle tools & files panel"><svg class="icon"><use href="#icon-chevron-left"></use></svg></button>
+      <button id="toggleRightPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle inspector panel (\)" aria-label="Toggle inspector panel"><svg class="icon"><use href="#icon-chevron-right"></use></svg></button>
       <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
       <span id="statusPill" class="status-pill connecting"><span class="status-dot"></span><span id="statusText">connecting</span></span>
       <span id="p2pPill" class="status-pill" style="display:none"><span class="status-dot"></span><span id="p2pText">P2P</span></span>
@@ -53,17 +54,17 @@
 
     <div class="body">
       <div class="tool-rail">
-        <button id="toolVertex" class="active" data-tooltip="Vertex" aria-label="Vertex"><svg class="icon"><use href="#icon-vertex"></use></svg></button>
-        <button id="toolFace" data-tooltip="Face" aria-label="Face"><svg class="icon"><use href="#icon-triangle"></use></svg></button>
-        <button id="toolMove" data-tooltip="Move" aria-label="Move"><svg class="icon"><use href="#icon-cursor"></use></svg></button>
+        <button id="toolVertex" class="active" data-tooltip="Vertex (V)" aria-label="Vertex"><svg class="icon"><use href="#icon-vertex"></use></svg></button>
+        <button id="toolFace" data-tooltip="Face (F)" aria-label="Face"><svg class="icon"><use href="#icon-triangle"></use></svg></button>
+        <button id="toolMove" data-tooltip="Move (M)" aria-label="Move"><svg class="icon"><use href="#icon-cursor"></use></svg></button>
         <div class="rail-divider"></div>
-        <button id="toolBox" data-tooltip="Box" aria-label="Box"><svg class="icon"><use href="#icon-box"></use></svg></button>
-        <button id="toolCylinder" data-tooltip="Cylinder" aria-label="Cylinder"><svg class="icon"><use href="#icon-cylinder"></use></svg></button>
-        <button id="toolPyramid" data-tooltip="Pyramid" aria-label="Pyramid"><svg class="icon"><use href="#icon-pyramid"></use></svg></button>
-        <button id="toolPlane" data-tooltip="Plane" aria-label="Plane"><svg class="icon"><use href="#icon-plane"></use></svg></button>
+        <button id="toolBox" data-tooltip="Box (B)" aria-label="Box"><svg class="icon"><use href="#icon-box"></use></svg></button>
+        <button id="toolCylinder" data-tooltip="Cylinder (C)" aria-label="Cylinder"><svg class="icon"><use href="#icon-cylinder"></use></svg></button>
+        <button id="toolPyramid" data-tooltip="Pyramid (P)" aria-label="Pyramid"><svg class="icon"><use href="#icon-pyramid"></use></svg></button>
+        <button id="toolPlane" data-tooltip="Plane (L)" aria-label="Plane"><svg class="icon"><use href="#icon-plane"></use></svg></button>
         <div class="rail-divider"></div>
-        <button id="undoBtn" data-tooltip="Undo" aria-label="Undo"><svg class="icon"><use href="#icon-undo"></use></svg></button>
-        <button id="redoBtn" data-tooltip="Redo" aria-label="Redo"><svg class="icon"><use href="#icon-redo"></use></svg></button>
+        <button id="undoBtn" data-tooltip="Undo (Ctrl+Z)" aria-label="Undo"><svg class="icon"><use href="#icon-undo"></use></svg></button>
+        <button id="redoBtn" data-tooltip="Redo (Ctrl+Shift+Z)" aria-label="Redo"><svg class="icon"><use href="#icon-redo"></use></svg></button>
       </div>
       <div class="panel left">
         <div class="empty-hint" id="toolHint">Click the ground grid to place a vertex.</div>
@@ -71,10 +72,10 @@
 
         <div class="section-title">View</div>
         <div class="tool-row">
-          <button id="viewTop" style="flex:1">Top</button>
-          <button id="viewFront" style="flex:1">Front</button>
-          <button id="viewRight" style="flex:1">Right</button>
-          <button id="viewPerspective" class="active" style="flex:1">Persp.</button>
+          <button id="viewTop" class="always-enabled" style="flex:1">Top</button>
+          <button id="viewFront" class="always-enabled" style="flex:1">Front</button>
+          <button id="viewRight" class="always-enabled" style="flex:1">Right</button>
+          <button id="viewPerspective" class="active always-enabled" style="flex:1">Persp.</button>
         </div>
         <div class="tool-row" style="margin-top:6px">
           <button id="snapToggleBtn3d" style="width:100%" title="Snap placed/dragged vertices to grid intersections or existing vertices"><svg class="icon"><use href="#icon-magnet"></use></svg>Snap</button>
@@ -116,7 +117,7 @@
       </div>
 
       <div class="canvas-wrap">
-        <canvas id="canvas3d"></canvas>
+        <canvas id="canvas3d" tabindex="-1"></canvas>
         <div id="cursorLayer"></div>
       </div>
 

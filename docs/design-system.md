@@ -182,8 +182,10 @@ CSS custom property can't reach -- `mesh3d.js` passes it to re-apply
   "Layout: the canvas is the hero" section, not repeated here.
 - Per-tool cursors, snap-glyph/selection-handle theming, and button
   hover/active/focus polish beyond the baseline states already in
-  `styles.css` are D3.
-- No command palette yet (D4).
+  `styles.css` are D3 -- done, see the README's "Input feel" section.
+- Command palette, single-key shortcuts, and the keyboard reachability
+  audit are done -- Phase D4, documented in the README's own
+  "Keyboard-first" section, not repeated here.
 - The connection/save status cluster, toast copy, and empty states are
   functionally unchanged from before D1 -- just re-skinned onto tokens.
   Redesigning them is D5.

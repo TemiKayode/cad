@@ -76,7 +76,9 @@ def test_tooltip_appears_on_hover_with_correct_label(live_server, browser):
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         page.wait_for_function("document.getElementById('__tooltip').classList.contains('visible')", timeout=2000)
         text = page.eval_on_selector("#__tooltip", "el => el.textContent")
-        assert text == "Circle"
+        # Phase D4: tool tooltips now also show their single-key shortcut,
+        # so the UI itself teaches the keyboard layer.
+        assert text == "Circle (C)"
     finally:
         page.close()
 

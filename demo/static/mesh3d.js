@@ -7,6 +7,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 initTooltips();
 initPanelCollapse();
+initCommandPalette(buildCommands);
 
 const actorId = getOrCreateActorId();
 let actorName = getOrCreateActorName();
@@ -1299,6 +1300,69 @@ document.getElementById("toolCylinder").onclick = () => setTool("cylinder");
 document.getElementById("toolPyramid").onclick = () => setTool("pyramid");
 document.getElementById("toolPlane").onclick = () => setTool("plane");
 
+/** Mirrors sketch.js's buildCommands() -- see its comment for the
+ * viewer-mode filtering rationale (dropped entirely for tools/editing,
+ * clickCmd() additionally skips anything the .viewer-mode CSS has
+ * currently disabled). Rebuilt fresh every time the palette opens. */
+function buildCommands() {
+  function cmd(label, group, shortcut, icon, run) {
+    return { label, group, shortcut, icon, run };
+  }
+  function clickCmd(id, label, group, shortcut, icon) {
+    const el = document.getElementById(id);
+    if (!el) return null;
+    if (getComputedStyle(el).pointerEvents === "none") return null;
+    return cmd(label, group, shortcut, icon, () => el.click());
+  }
+  function toolCmd(tool, label, key, icon) {
+    return viewerMode ? null : cmd(label, "Tools", key.toUpperCase(), icon, () => setTool(tool));
+  }
+
+  return [
+    toolCmd("vertex", "Vertex", "v", "vertex"),
+    toolCmd("face", "Face", "f", "triangle"),
+    toolCmd("move", "Move", "m", "cursor"),
+    toolCmd("box", "Box", "b", "box"),
+    toolCmd("cylinder", "Cylinder", "c", "cylinder"),
+    toolCmd("pyramid", "Pyramid", "p", "pyramid"),
+    toolCmd("plane", "Plane", "l", "plane"),
+
+    !viewerMode && cmd("Undo", "Edit", "Ctrl+Z", "undo", undo),
+    !viewerMode && cmd("Redo", "Edit", "Ctrl+Shift+Z", "redo", redo),
+
+    clickCmd("viewTop", "View: Top", "View", "", "maximize"),
+    clickCmd("viewFront", "View: Front", "View", "", "maximize"),
+    clickCmd("viewRight", "View: Right", "View", "", "maximize"),
+    clickCmd("viewPerspective", "View: Perspective", "View", "", "maximize"),
+    clickCmd("snapToggleBtn3d", "Toggle snap to grid/vertices", "View", "", "magnet"),
+    clickCmd("toggleSecondaryPanelBtn", "Toggle tools & files panel", "View", "\\", "chevron-left"),
+    clickCmd("toggleRightPanelBtn", "Toggle inspector panel", "View", "\\", "chevron-right"),
+
+    clickCmd("saveBtn", "Save", "File", "", "save"),
+    clickCmd("downloadJsonBtn", "Export .json", "File", "", "file"),
+    clickCmd("downloadStlBtn", "Export .stl", "File", "", "file"),
+    clickCmd("downloadStepBtn", "Export .step", "File", "", "file"),
+
+    (() => {
+      const el = document.getElementById("genPromptInput");
+      if (!el || getComputedStyle(el).pointerEvents === "none") return null;
+      return cmd("Focus AI Generate prompt", "AI Generate", "", "sparkles", () => el.focus());
+    })(),
+    clickCmd("genBtn", "Generate", "AI Generate", "", "sparkles"),
+
+    clickCmd("shareBtn", "Copy full-access invite link", "Room", "", "link"),
+    clickCmd("shareViewOnlyBtn", "Copy view-only invite link", "Room", "", "eye"),
+    clickCmd("docNameBtn", "Rename this room", "Room", "", "pen"),
+    clickCmd("renameActorBtn", "Change your display name", "Room", "", "pen"),
+    clickCmd("offlineToggle", document.getElementById("offlineToggle")?.textContent || "Go offline", "Room", "", "plug-off"),
+
+    clickCmd("themeToggleBtn", "Toggle light/dark theme", "General", "", "sun"),
+    cmd("Keyboard shortcuts", "General", "?", "search", () => showShortcutOverlay(SHORTCUT_GROUPS_3D)),
+    cmd("Open 2D sketch demo", "General", "", "chevron-right", () => { location.href = "/2d"; }),
+    cmd("Back to workspace home", "General", "", "home", () => { location.href = "/"; }),
+  ].filter(Boolean);
+}
+
 /** Numeric dimension fields for the active primitive tool -- "type
  * dimensions, then click to place" per the brief, mirroring the 2D
  * demo's shape numeric panel rather than a drag-to-size gesture (3D
@@ -1325,16 +1389,56 @@ function renderPrimitivePanel() {
 
 document.getElementById("undoBtn").onclick = undo;
 document.getElementById("redoBtn").onclick = redo;
+
+// Phase D4 single-key tool shortcuts -- same rationale as sketch.js's
+// KEY_TO_TOOL: gated on !viewerMode because a read-only viewer already
+// can't reach these same tool buttons via mouse (.viewer-mode CSS).
+const KEY_TO_TOOL_3D = { v: "vertex", f: "face", m: "move", b: "box", c: "cylinder", p: "pyramid", l: "plane" };
+
+const SHORTCUT_GROUPS_3D = [
+  {
+    title: "Tools",
+    rows: [
+      ["V", "Vertex"], ["F", "Face"], ["M", "Move"], ["B", "Box"],
+      ["C", "Cylinder"], ["P", "Pyramid"], ["L", "Plane"],
+    ],
+  },
+  {
+    title: "Editing",
+    rows: [["Ctrl/Cmd+Z", "Undo"], ["Ctrl/Cmd+Shift+Z", "Redo"]],
+  },
+  {
+    title: "View",
+    rows: [
+      ["Drag", "Orbit"], ["Scroll wheel", "Zoom"], ["Right-drag", "Pan"],
+      ["\\", "Toggle both side panels"],
+    ],
+  },
+  {
+    title: "General",
+    rows: [["Ctrl/Cmd+K", "Open the command palette"], ["?", "Toggle this overlay"]],
+  },
+];
+
 window.addEventListener("keydown", (e) => {
-  if (!(e.ctrlKey || e.metaKey)) return;
   const tag = (e.target && e.target.tagName) || "";
-  if (tag === "INPUT" || tag === "TEXTAREA") return; // let native text-field undo/redo work instead
-  if (e.key === "z" || e.key === "Z") {
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && (e.key === "z" || e.key === "Z")) {
     e.preventDefault();
-    if (e.shiftKey) redo(); else undo();
-  } else if (e.key === "y" || e.key === "Y") {
+    if (!viewerMode) { if (e.shiftKey) redo(); else undo(); }
+  } else if (mod && (e.key === "y" || e.key === "Y")) {
     e.preventDefault();
-    redo();
+    if (!viewerMode) redo();
+  } else if (e.key === "?") {
+    // see the identical comment in sketch.js -- without preventDefault,
+    // this same keystroke's default action types "?" into the overlay's
+    // own just-focused search input, self-filtering the list.
+    e.preventDefault();
+    showShortcutOverlay(SHORTCUT_GROUPS_3D);
+  } else if (!mod && !e.altKey && !viewerMode && KEY_TO_TOOL_3D[e.key.toLowerCase()]) {
+    e.preventDefault();
+    setTool(KEY_TO_TOOL_3D[e.key.toLowerCase()]);
   }
 });
 

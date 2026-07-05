@@ -275,6 +275,248 @@ function initPanelCollapse() {
   });
 }
 
+// -- keyboard-first: focus trap, command palette, shortcut overlay (Phase D4) ---
+//
+// trapFocusIn() is shared by every custom overlay in the app (the
+// command palette below, the Time-Travel Merge preview, the "?"
+// shortcuts overlay, and the workspace home page's rename/history
+// modals): Tab never escapes an open overlay, and closing it hands
+// focus back to whatever triggered it -- a keyboard user should never
+// lose their place. Native <dialog> would give this for free, but these
+// overlays predate this phase as plain positioned <div>s (see D1/D2/D7),
+// so the trap is implemented directly rather than migrating every call
+// site's markup.
+
+function trapFocusIn(container) {
+  const previouslyFocused = document.activeElement;
+  const FOCUSABLE = 'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  function focusable() {
+    return [...container.querySelectorAll(FOCUSABLE)].filter((el) => el.offsetParent !== null);
+  }
+  function onKeydown(e) {
+    if (e.key !== "Tab") return;
+    const items = focusable();
+    if (!items.length) return;
+    const idx = items.indexOf(document.activeElement);
+    if (e.shiftKey ? idx <= 0 : idx === items.length - 1) {
+      e.preventDefault();
+      items[e.shiftKey ? items.length - 1 : 0].focus();
+    }
+  }
+  container.addEventListener("keydown", onKeydown);
+  const first = focusable()[0];
+  if (first) first.focus();
+  return function releaseFocusTrap() {
+    container.removeEventListener("keydown", onKeydown);
+    if (previouslyFocused && typeof previouslyFocused.focus === "function") previouslyFocused.focus();
+  };
+}
+
+function _escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/** A subsequence fuzzy match: every character of `query` must appear in
+ * `text`, in order, case-insensitively (no separate fuzzy-search
+ * dependency). Returns the total gap between matched characters (lower
+ * is a tighter match, so callers can sort by it) or -1 for no match. */
+function fuzzyScore(query, text) {
+  if (!query) return 0;
+  const q = query.toLowerCase();
+  const t = String(text ?? "").toLowerCase();
+  let ti = 0, score = 0, lastMatch = -1;
+  for (let qi = 0; qi < q.length; qi++) {
+    const idx = t.indexOf(q[qi], ti);
+    if (idx === -1) return -1;
+    if (lastMatch !== -1) score += idx - lastMatch - 1;
+    lastMatch = idx;
+    ti = idx + 1;
+  }
+  return score;
+}
+
+let _paletteEl = null;
+let _paletteReleaseFocus = null;
+
+function closeCommandPalette() {
+  if (!_paletteEl) return;
+  _paletteEl.remove();
+  _paletteEl = null;
+  if (_paletteReleaseFocus) { _paletteReleaseFocus(); _paletteReleaseFocus = null; }
+}
+
+/** `getCommands()` is re-invoked every time the palette opens, so a list
+ * built from live state (active tool, current selection, viewer-mode
+ * read-only-ness) is always accurate. Each command is
+ * `{ label, group, shortcut?, icon?, run() }`. This is the
+ * discoverability answer for every action that has no toolbar button
+ * -- export formats, rename, theme, going offline -- not just a
+ * faster path to the ones that do. */
+function openCommandPalette(getCommands) {
+  if (_paletteEl) return;
+  const commands = getCommands();
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay palette-overlay";
+  overlay.style.display = "flex";
+  const box = document.createElement("div");
+  box.className = "modal palette";
+  box.innerHTML =
+    '<div class="palette-input-row">' +
+    '<svg class="icon"><use href="#icon-search"></use></svg>' +
+    '<input id="paletteInput" type="text" placeholder="Type a command..." autocomplete="off" />' +
+    "</div>" +
+    '<div class="palette-list" id="paletteList"></div>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  _paletteEl = overlay;
+
+  const input = box.querySelector("#paletteInput");
+  const list = box.querySelector("#paletteList");
+  let filtered = commands;
+  let activeIndex = 0;
+
+  function renderRows() {
+    if (!filtered.length) {
+      list.innerHTML = '<div class="palette-empty">No matching commands</div>';
+      return;
+    }
+    let lastGroup = null;
+    list.innerHTML = filtered
+      .map((cmd, i) => {
+        let header = "";
+        if (cmd.group !== lastGroup) { header = `<div class="palette-group">${_escapeHtml(cmd.group)}</div>`; lastGroup = cmd.group; }
+        return (
+          header +
+          `<div class="palette-row${i === activeIndex ? " active" : ""}" data-index="${i}">` +
+          `<svg class="icon"><use href="#icon-${cmd.icon || "file"}"></use></svg>` +
+          `<span class="palette-label">${_escapeHtml(cmd.label)}</span>` +
+          (cmd.shortcut ? `<span class="palette-shortcut">${_escapeHtml(cmd.shortcut)}</span>` : "") +
+          "</div>"
+        );
+      })
+      .join("");
+    list.querySelector(".palette-row.active")?.scrollIntoView({ block: "nearest" });
+  }
+
+  function runActive() {
+    const cmd = filtered[activeIndex];
+    if (!cmd) return;
+    closeCommandPalette();
+    cmd.run();
+  }
+
+  input.addEventListener("input", () => {
+    const q = input.value.trim();
+    filtered = !q
+      ? commands
+      : commands
+          .map((cmd) => ({ cmd, score: Math.max(fuzzyScore(q, cmd.label), fuzzyScore(q, cmd.group)) }))
+          .filter(({ score }) => score !== -1)
+          .sort((a, b) => a.score - b.score)
+          .map(({ cmd }) => cmd);
+    activeIndex = 0;
+    renderRows();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); activeIndex = Math.min(activeIndex + 1, filtered.length - 1); renderRows(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); activeIndex = Math.max(activeIndex - 1, 0); renderRows(); }
+    else if (e.key === "Enter") { e.preventDefault(); runActive(); }
+    else if (e.key === "Escape") { e.preventDefault(); closeCommandPalette(); }
+  });
+  list.addEventListener("click", (e) => {
+    const row = e.target.closest(".palette-row");
+    if (!row) return;
+    activeIndex = Number(row.dataset.index);
+    runActive();
+  });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeCommandPalette(); });
+
+  renderRows();
+  _paletteReleaseFocus = trapFocusIn(box);
+  input.focus();
+}
+
+/** Wires Ctrl/Cmd+K globally to open the palette. Deliberately NOT
+ * gated on "don't fire while typing in an input" the way every other
+ * shortcut in this phase is -- the palette is the escape hatch you
+ * reach for from inside the room-id input when you can't remember
+ * which button does something, matching how VS Code/Slack/Linear all
+ * treat their own palette binding as the one shortcut that works
+ * everywhere. */
+function initCommandPalette(getCommands) {
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      if (_paletteEl) closeCommandPalette();
+      else openCommandPalette(getCommands);
+    }
+  });
+}
+
+let _shortcutOverlayEl = null;
+let _shortcutOverlayReleaseFocus = null;
+
+/** The "?" overlay: `groups` is `[{ title, rows: [[key, description], ...] }]`.
+ * Styled like the command palette (same modal/search-row look) and
+ * live-searchable across every row's key *and* description, since
+ * "what does Ctrl+D do again" and "how do I duplicate something" are
+ * the same question asked from two directions. */
+function showShortcutOverlay(groups) {
+  if (_shortcutOverlayEl) { closeShortcutOverlay(); return; }
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay palette-overlay";
+  overlay.style.display = "flex";
+  const box = document.createElement("div");
+  box.className = "modal palette";
+  box.innerHTML =
+    '<div class="palette-input-row">' +
+    '<svg class="icon"><use href="#icon-search"></use></svg>' +
+    '<input id="shortcutSearchInput" type="text" placeholder="Search shortcuts..." autocomplete="off" />' +
+    "</div>" +
+    '<div class="palette-list" id="shortcutList"></div>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  _shortcutOverlayEl = overlay;
+
+  const input = box.querySelector("#shortcutSearchInput");
+  const list = box.querySelector("#shortcutList");
+
+  function renderRows() {
+    const q = input.value.trim();
+    let html = "";
+    for (const group of groups) {
+      const rows = !q ? group.rows : group.rows.filter(([k, v]) => fuzzyScore(q, k) !== -1 || fuzzyScore(q, v) !== -1);
+      if (!rows.length) continue;
+      html += `<div class="palette-group">${_escapeHtml(group.title)}</div>`;
+      html += rows
+        .map(
+          ([k, v]) =>
+            '<div class="palette-row palette-row-static">' +
+            `<span class="palette-shortcut">${_escapeHtml(k)}</span>` +
+            `<span class="palette-label">${_escapeHtml(v)}</span>` +
+            "</div>"
+        )
+        .join("");
+    }
+    list.innerHTML = html || '<div class="palette-empty">No matching shortcuts</div>';
+  }
+
+  input.addEventListener("input", renderRows);
+  input.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); closeShortcutOverlay(); } });
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeShortcutOverlay(); });
+
+  renderRows();
+  _shortcutOverlayReleaseFocus = trapFocusIn(box);
+  input.focus();
+}
+
+function closeShortcutOverlay() {
+  if (!_shortcutOverlayEl) return;
+  _shortcutOverlayEl.remove();
+  _shortcutOverlayEl = null;
+  if (_shortcutOverlayReleaseFocus) { _shortcutOverlayReleaseFocus(); _shortcutOverlayReleaseFocus = null; }
+}
+
 const ACTOR_COLORS = [
   "#ff6b6b", "#4dabf7", "#69db7c", "#ffd43b", "#da77f2",
   "#ff922b", "#38d9a9", "#f783ac", "#748ffc", "#94d82d",
@@ -1005,8 +1247,10 @@ function showMergePreviewModal(offlineOps, remoteOps, describeOps, onProceed) {
   `;
   overlay.appendChild(box);
   document.body.appendChild(overlay);
+  const releaseFocus = trapFocusIn(box);
   box.querySelector("#mergeProceedBtn").onclick = () => {
     overlay.remove();
+    releaseFocus();
     onProceed();
   };
 }

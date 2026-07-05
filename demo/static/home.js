@@ -115,20 +115,35 @@ async function loadRooms() {
 }
 
 // -- rename modal -------------------------------------------------------------
+//
+// Phase D4 keyboard reachability audit: these two modals predate this
+// phase (Phase 17) as plain `display:none` <div>s with no focus
+// management at all -- trapFocusIn (common.js, shared with the command
+// palette/shortcut overlay/Time-Travel Merge preview) keeps Tab inside
+// whichever is open and hands focus back to the "Rename"/"History"
+// button that opened it, and both now close on Esc or a backdrop click
+// like every other overlay in the app.
 
 let renameTarget = null; // { kind, roomId }
+let _releaseModalFocus = null;
 
 function openRenameModal(kind, roomId, currentName) {
   renameTarget = { kind, roomId };
   document.getElementById("renameInput").value = currentName;
   document.getElementById("renameModal").style.display = "flex";
-  document.getElementById("renameInput").focus();
+  _releaseModalFocus = trapFocusIn(document.querySelector("#renameModal .modal"));
+  document.getElementById("renameInput").focus(); // preferred over trapFocusIn's default "first focusable" (the close button)
 }
 
 function closeRenameModal() {
   document.getElementById("renameModal").style.display = "none";
   renameTarget = null;
+  if (_releaseModalFocus) { _releaseModalFocus(); _releaseModalFocus = null; }
 }
+
+document.getElementById("renameModal").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeRenameModal();
+});
 
 document.getElementById("renameModalClose").onclick = closeRenameModal;
 document.getElementById("renameCancelBtn").onclick = closeRenameModal;
@@ -156,11 +171,17 @@ document.getElementById("renameSaveBtn").onclick = async () => {
 
 // -- history / restore modal ---------------------------------------------------
 
+function closeHistoryModal() {
+  document.getElementById("historyModal").style.display = "none";
+  if (_releaseModalFocus) { _releaseModalFocus(); _releaseModalFocus = null; }
+}
+
 async function openHistoryModal(kind, roomId, name) {
   document.getElementById("historyModalTitle").textContent = `Version history -- ${name}`;
   const body = document.getElementById("historyModalBody");
   body.innerHTML = '<div class="empty-hint">Loading...</div>';
   document.getElementById("historyModal").style.display = "flex";
+  _releaseModalFocus = trapFocusIn(document.querySelector("#historyModal .modal"));
 
   const listPath = kind === "mesh" ? `/api/mesh/${encodeURIComponent(roomId)}/versions` : `/api/rooms/${encodeURIComponent(roomId)}/versions`;
   let versions;
@@ -215,16 +236,24 @@ async function restoreVersion(kind, roomId, versionId) {
     // prompt for the secret again.
     const token = roomTokenFor(kind, roomId);
     if (token) localStorage.setItem(`crdt_cad_token:${kind}:${newRoomId}`, token);
-    document.getElementById("historyModal").style.display = "none";
+    closeHistoryModal();
     location.href = roomHomeUrl(kind, newRoomId);
   } catch (err) {
     window.alert(`Restore failed: ${err.message}`);
   }
 }
 
-document.getElementById("historyModalClose").onclick = () => {
-  document.getElementById("historyModal").style.display = "none";
-};
+document.getElementById("historyModalClose").onclick = closeHistoryModal;
+
+document.getElementById("historyModal").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeHistoryModal();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (document.getElementById("historyModal").style.display === "flex") closeHistoryModal();
+  else if (document.getElementById("renameModal").style.display === "flex") closeRenameModal();
+});
 
 // -- new room ------------------------------------------------------------------
 
