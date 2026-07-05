@@ -1,5 +1,13 @@
+import math
+
 from crdt_cad.crdt.clock import LamportClock
-from crdt_cad.crdt.document import DocOp, DrawingDocument, curve_prop_key, flatten_path_to_polyline
+from crdt_cad.crdt.document import (
+    DocOp,
+    DrawingDocument,
+    bake_path_transform,
+    curve_prop_key,
+    flatten_path_to_polyline,
+)
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 
 
@@ -332,3 +340,181 @@ def test_ops_since_delta_sync_for_late_joiner_style_catchup():
 
     assert catchup.path_list() == doc.path_list()
     assert catchup.layer_list() == doc.layer_list()
+
+
+# -- whole-path transform / export baking (Phase 12) ----------------------------
+
+
+def test_bake_path_transform_is_a_no_op_when_transform_is_absent():
+    path = {"points": [(0.0, 0.0), (1.0, 1.0)], "point_ids": [None, None]}
+    assert bake_path_transform(path) is path
+
+
+def test_bake_path_transform_is_a_no_op_for_an_explicit_identity_transform():
+    path = {
+        "points": [(0.0, 0.0), (1.0, 1.0)],
+        "transform": {"tx": 0, "ty": 0, "rotation": 0, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    assert baked["points"] == path["points"]
+
+
+def test_bake_path_transform_translates_freehand_points():
+    path = {
+        "points": [(0.0, 0.0), (10.0, 0.0)],
+        "transform": {"tx": 5, "ty": 7, "rotation": 0, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    assert baked["points"] == [(5.0, 7.0), (15.0, 7.0)]
+
+
+def test_bake_path_transform_rotates_a_freehand_path_around_its_bounding_box_center():
+    # A horizontal segment from (0,0) to (10,0) has bbox center (5,0);
+    # rotating 180 degrees around that pivot flips it end-for-end.
+    path = {
+        "points": [(0.0, 0.0), (10.0, 0.0)],
+        "transform": {"tx": 0, "ty": 0, "rotation": 180, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    (x0, y0), (x1, y1) = baked["points"]
+    assert math.isclose(x0, 10.0, abs_tol=1e-9) and math.isclose(y0, 0.0, abs_tol=1e-9)
+    assert math.isclose(x1, 0.0, abs_tol=1e-9) and math.isclose(y1, 0.0, abs_tol=1e-9)
+
+
+def test_bake_path_transform_scales_a_circle_shape_around_its_own_center():
+    path = {
+        "points": [],
+        "shape": "circle",
+        "cx": 100.0,
+        "cy": 50.0,
+        "r": 10.0,
+        "transform": {"tx": 0, "ty": 0, "rotation": 0, "scale": 2},
+    }
+    baked = bake_path_transform(path)
+    assert baked["cx"] == 100.0 and baked["cy"] == 50.0  # center is the pivot, so it doesn't move
+    assert baked["r"] == 20.0
+
+
+def test_bake_path_transform_flattens_a_rotated_rect_into_its_actual_rotated_corners():
+    """A rotated rect can't be represented as axis-aligned x/y/w/h any
+    more -- that would silently export the wrong shape -- so a non-zero
+    rotation converts it to a plain closed point boundary instead."""
+    path = {
+        "points": [],
+        "shape": "rect",
+        "x": 100.0,
+        "y": 100.0,
+        "w": 100.0,
+        "h": 60.0,
+        "transform": {"tx": 0, "ty": 0, "rotation": 45, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    assert "shape" not in baked
+    pts = baked["points"]
+    assert pts[0] == pts[-1]  # closed
+    assert len(pts) == 5
+    # Consecutive edge lengths should still be 100 and 60 (a rotation is a
+    # rigid transform -- it must not distort the rectangle's own size).
+    def dist(a, b):
+        return math.hypot(b[0] - a[0], b[1] - a[1])
+    assert math.isclose(dist(pts[0], pts[1]), 100.0, abs_tol=1e-6)
+    assert math.isclose(dist(pts[1], pts[2]), 60.0, abs_tol=1e-6)
+
+
+def test_bake_path_transform_keeps_an_unrotated_rect_as_a_native_shape():
+    """Scale/translate alone (rotation == 0, the common case) never needs
+    to fall back to a point boundary -- confirms the flattening above is
+    specifically rotation-triggered, not a blanket behavior change."""
+    path = {
+        "points": [],
+        "shape": "rect",
+        "x": 0.0, "y": 0.0, "w": 10.0, "h": 20.0,
+        "transform": {"tx": 1, "ty": 1, "rotation": 0, "scale": 2},
+    }
+    baked = bake_path_transform(path)
+    assert baked["shape"] == "rect"
+
+
+def test_bake_path_transform_flattens_a_rotated_ellipse_into_a_sampled_boundary():
+    path = {
+        "points": [],
+        "shape": "ellipse",
+        "cx": 0.0,
+        "cy": 0.0,
+        "rx": 10.0,
+        "ry": 5.0,
+        "transform": {"tx": 0, "ty": 0, "rotation": 90, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    assert "shape" not in baked
+    xs = [p[0] for p in baked["points"]]
+    ys = [p[1] for p in baked["points"]]
+    # A 90-degree rotation swaps the ellipse's axes: it should now be
+    # ~5 wide (was rx=10) and ~10 tall (was ry=5).
+    assert math.isclose(max(xs) - min(xs), 10.0, abs_tol=1e-2)
+    assert math.isclose(max(ys) - min(ys), 20.0, abs_tol=1e-2)
+
+
+def test_bake_path_transform_rotates_an_arc_exactly_via_its_angles_not_flattening():
+    """Unlike rect/ellipse, an arc's rotation is exactly representable
+    as +rotation on both angles -- no point-flattening needed or done."""
+    path = {
+        "points": [],
+        "shape": "arc",
+        "cx": 0.0, "cy": 0.0, "r": 5.0,
+        "start_angle": 0.0, "end_angle": 90.0,
+        "transform": {"tx": 0, "ty": 0, "rotation": 30, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    assert baked["shape"] == "arc"
+    assert baked["start_angle"] == 30.0
+    assert baked["end_angle"] == 120.0
+
+
+def test_bake_path_transform_moves_and_scales_a_rect_shape():
+    path = {
+        "points": [],
+        "shape": "rect",
+        "x": 0.0,
+        "y": 0.0,
+        "w": 10.0,
+        "h": 20.0,
+        "transform": {"tx": 3, "ty": 4, "rotation": 0, "scale": 2},
+    }
+    baked = bake_path_transform(path)
+    # pivot is the rect's own center (5, 10); scaling by 2 around it moves
+    # the top-left corner from (0,0) to (5,10)-(10,20) = (-5, -10) + tx/ty
+    assert baked["w"] == 20.0 and baked["h"] == 40.0
+    assert math.isclose(baked["x"], -5.0 + 3, abs_tol=1e-9)
+    assert math.isclose(baked["y"], -10.0 + 4, abs_tol=1e-9)
+
+
+def test_bake_path_transform_adds_rotation_to_an_arcs_start_and_end_angle():
+    path = {
+        "points": [],
+        "shape": "arc",
+        "cx": 0.0,
+        "cy": 0.0,
+        "r": 5.0,
+        "start_angle": 0.0,
+        "end_angle": 90.0,
+        "transform": {"tx": 0, "ty": 0, "rotation": 30, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    assert baked["start_angle"] == 30.0
+    assert baked["end_angle"] == 120.0
+
+
+def test_bake_path_transform_also_transforms_curve_control_points():
+    """A rotated/scaled freehand path's Bezier handles (Phase 8) must move
+    along with its anchor points -- otherwise the exported curve would
+    visibly warp relative to its (correctly moved) endpoints."""
+    path = {
+        "points": [(0.0, 0.0), (10.0, 0.0)],
+        "point_ids": ["a", "b"],
+        curve_prop_key("b"): {"kind": "quad", "c": [5.0, 5.0]},
+        "transform": {"tx": 100, "ty": 0, "rotation": 0, "scale": 1},
+    }
+    baked = bake_path_transform(path)
+    assert baked["points"] == [(100.0, 0.0), (110.0, 0.0)]
+    assert baked[curve_prop_key("b")]["c"] == [105.0, 5.0]

@@ -47,9 +47,26 @@ const ui = {
   tool: "pen",
   activeLayer: null,
   hiddenLayers: new Set(),
-  selectedPath: null,
+  selectedPaths: new Set(), // Phase 12: multi-selection (marquee + shift-click)
   opsCount: 0,
 };
+
+// -- selection helpers (Phase 12) ----------------------------------------------
+
+function selectOnly(pathId) {
+  ui.selectedPaths = pathId ? new Set([pathId]) : new Set();
+}
+function toggleSelection(pathId) {
+  if (ui.selectedPaths.has(pathId)) ui.selectedPaths.delete(pathId);
+  else ui.selectedPaths.add(pathId);
+}
+/** The single selected path when there's exactly one -- used by panels
+ * (color/width, comments) that only make sense for one path at a time;
+ * a multi-selection shows a different, bulk-action panel instead (see
+ * renderSelectionPanel). */
+function primarySelectedPath() {
+  return ui.selectedPaths.size === 1 ? [...ui.selectedPaths][0] : null;
+}
 const undoStack = [];
 const redoStack = [];
 let pendingPolygon = [];
@@ -68,6 +85,17 @@ let lastMousePt = null; // world coordinates -- see the view transform section b
 // a shape tool's click-drag gesture is in progress, else null -- see the
 // "shape primitives" section further down for the full design.
 let shapeDraft = null;
+
+// Phase 12 selection editing: null, or one of
+//   {mode:"move", startWorld, selection:Set<pathId>, primaryId,
+//    primaryPivotWorld0:[wx,wy], liveDelta:[dx,dy], moved:bool}
+//   {mode:"marquee", startScreen:[sx,sy], currentScreen:[sx,sy], additive:bool}
+// -- see the "selection dragging" section further down.
+let selectDrag = null;
+// {pt:[wx,wy], kind:"endpoint"|"midpoint"|"center"} while the cursor is
+// snapped to nearby geometry (object snapping, Phase 12), else null.
+let activeSnapGlyph = null;
+let shortcutOverlayEl = null;
 
 // -- view transform (Phase 10) ------------------------------------------------
 // Pan (panX/panY, screen pixels the world origin is offset by) + zoom are
@@ -442,16 +470,18 @@ function addPath(layerId, points, color, width, extraProps = {}) {
     applyOp(op); ops.push(op);
   }
   let prevId = null;
+  const pointIds = [];
   for (const pt of points) {
     const insId = clock.tick();
     op = { target: "path_geom", scope: id, payload: rgaInsertOp(insId, prevId, pt) };
     applyOp(op); ops.push(op);
     prevId = insId;
+    pointIds.push(insId);
   }
   sendOps(ops);
   undoStack.push({ kind: "path_add", pathId: id });
   redoStack.length = 0;
-  return { id, lastPointId: prevId };
+  return { id, lastPointId: prevId, pointIds };
 }
 
 function appendPoint(pathId, lastPointId, pt) {
@@ -468,7 +498,7 @@ function removePath(pathId) {
   sendOps([op]);
   undoStack.push({ kind: "path_remove", pathId });
   redoStack.length = 0;
-  if (ui.selectedPath === pathId) ui.selectedPath = null;
+  ui.selectedPaths.delete(pathId);
 }
 
 function setPathProp(pathId, key, value) {
@@ -610,10 +640,15 @@ canvas.addEventListener("pointerdown", (e) => {
     return;
   }
   if (isShapeTool(ui.tool)) {
-    const pt = worldPoint(e);
+    const { point: pt, glyph } = resolveSnapPoint(worldPoint(e), new Set());
+    activeSnapGlyph = glyph;
     shapeDraft = { kind: ui.tool, anchor: pt, current: pt };
     render();
     renderShapeInputPanel();
+    return;
+  }
+  if (ui.tool === "select") {
+    beginSelectDrag(e);
     return;
   }
   if (ui.tool !== "pen") return;
@@ -621,7 +656,7 @@ canvas.addEventListener("pointerdown", (e) => {
   const pt = worldPoint(e);
   const { id, lastPointId } = addPath(ui.activeLayer, [pt], actorColor, 2.5);
   drawing = { pathId: id, lastPointId, lastScreenPt: canvasPoint(e) };
-  ui.selectedPath = id;
+  selectOnly(id);
   renderAll();
 });
 
@@ -638,8 +673,14 @@ canvas.addEventListener("pointermove", (e) => {
   sendPresence(pt[0], pt[1]);
   lastMousePt = pt;
   updateCursorReadout(pt);
+  if (selectDrag) {
+    handleSelectDragMove(screenPt, pt);
+    return;
+  }
   if (shapeDraft) {
-    shapeDraft.current = pt;
+    const { point: snapped, glyph } = resolveSnapPoint(pt, new Set());
+    shapeDraft.current = snapped;
+    activeSnapGlyph = glyph;
     render();
     renderShapeInputPanel();
     return;
@@ -667,6 +708,10 @@ window.addEventListener("pointerup", () => {
     canvas.style.cursor = ui.tool === "select" ? "default" : "crosshair";
     return;
   }
+  if (selectDrag) {
+    finishSelectDrag();
+    return;
+  }
   if (shapeDraft) {
     // A negligible drag (a plain click) leaves anchor === current --
     // skip committing a zero-size shape nobody meant to draw.
@@ -675,6 +720,7 @@ window.addEventListener("pointerup", () => {
       commitShape(shapePropsFromDraft(shapeDraft.kind, shapeDraft.anchor, shapeDraft.current));
     }
     shapeDraft = null;
+    activeSnapGlyph = null;
     renderShapeInputPanel();
     return;
   }
@@ -687,10 +733,7 @@ canvas.addEventListener("click", (e) => {
   if (justPanned) { justPanned = false; return; }
   const screenPt = canvasPoint(e);
   const pt = worldPoint(e);
-  if (ui.tool === "select") {
-    ui.selectedPath = hitTestPath(screenPt);
-    renderAll();
-  } else if (ui.tool === "polygon") {
+  if (ui.tool === "polygon") {
     if (pendingPolygon.length >= 3 && Math.hypot(...subtract(worldToScreen(...pendingPolygon[0]), screenPt)) < 10) {
       finishPolygon();
     } else {
@@ -718,6 +761,104 @@ function subtract(a, b) {
   return [a[0] - b[0], a[1] - b[1]];
 }
 
+// -- select tool: click/shift-click, move-drag, marquee-select (Phase 12) ------
+// A plain click on a path selects it (replacing the current selection);
+// shift-click toggles it into/out of the current selection without
+// starting a move. Dragging a path that's part of the (possibly
+// multi-path) current selection moves the whole selection together,
+// live-previewed locally and committed as one `transform` write per
+// path on release (not per-mousemove, to avoid flooding ops). Dragging
+// on empty canvas instead marquee-selects everything whose transformed
+// bounding box intersects the drawn rectangle on release.
+
+function beginSelectDrag(e) {
+  const screenPt = canvasPoint(e);
+  const hit = hitTestPath(screenPt);
+  if (hit) {
+    if (e.shiftKey) {
+      // Shift-click only ever adjusts the selection -- it never starts
+      // a move, so users can freely build up a multi-selection without
+      // accidentally dragging the last-clicked path.
+      toggleSelection(hit);
+      renderAll();
+      return;
+    }
+    if (!ui.selectedPaths.has(hit)) selectOnly(hit);
+    const primaryProps = state.pathProps.get(hit) || {};
+    selectDrag = {
+      mode: "move",
+      startWorld: worldPoint(e),
+      selection: new Set(ui.selectedPaths),
+      primaryId: hit,
+      primaryPivotWorld0: applyPathTransform(hit, primaryProps, pathBaseCenter(hit, primaryProps)),
+      liveDelta: [0, 0],
+      moved: false,
+    };
+    renderAll();
+    return;
+  }
+  // No hit: a plain click clears the selection (a marquee that ends up
+  // catching nothing should leave nothing selected); shift-click on
+  // empty canvas leaves the existing selection untouched so the
+  // marquee can only ever add to it.
+  if (!e.shiftKey) selectOnly(null);
+  selectDrag = { mode: "marquee", startScreen: screenPt, currentScreen: screenPt, additive: e.shiftKey };
+  renderAll();
+}
+
+function handleSelectDragMove(screenPt, pt) {
+  if (selectDrag.mode === "move") {
+    const rawDelta = [pt[0] - selectDrag.startWorld[0], pt[1] - selectDrag.startWorld[1]];
+    if (Math.hypot(rawDelta[0], rawDelta[1]) > 1e-6) selectDrag.moved = true;
+    const candidatePivot = [
+      selectDrag.primaryPivotWorld0[0] + rawDelta[0],
+      selectDrag.primaryPivotWorld0[1] + rawDelta[1],
+    ];
+    const { point: snappedPivot, glyph } = resolveSnapPoint(candidatePivot, selectDrag.selection);
+    activeSnapGlyph = glyph;
+    selectDrag.liveDelta = [
+      snappedPivot[0] - selectDrag.primaryPivotWorld0[0],
+      snappedPivot[1] - selectDrag.primaryPivotWorld0[1],
+    ];
+    render();
+  } else {
+    selectDrag.currentScreen = screenPt;
+    render();
+  }
+}
+
+function finishSelectDrag() {
+  if (selectDrag.mode === "move") {
+    if (selectDrag.moved) {
+      const [dx, dy] = selectDrag.liveDelta;
+      for (const pathId of selectDrag.selection) nudgePathTransform(pathId, dx, dy);
+    }
+  } else {
+    const [sx0, sy0] = selectDrag.startScreen;
+    const [sx1, sy1] = selectDrag.currentScreen;
+    const marquee = { minX: Math.min(sx0, sx1), maxX: Math.max(sx0, sx1), minY: Math.min(sy0, sy1), maxY: Math.max(sy0, sy1) };
+    // A negligible drag is just a click on empty space -- the selection
+    // was already handled (cleared, unless shift) in beginSelectDrag.
+    if (marquee.maxX - marquee.minX > 3 || marquee.maxY - marquee.minY > 3) {
+      const matched = [];
+      for (const pathId of state.pathIndex) {
+        const props = state.pathProps.get(pathId) || {};
+        if (ui.hiddenLayers.has(props.layer_id)) continue;
+        const bounds = pathWorldBounds(pathId, props);
+        if (!bounds) continue;
+        const [sMinX, sMinY] = worldToScreen(bounds.minX, bounds.minY);
+        const [sMaxX, sMaxY] = worldToScreen(bounds.maxX, bounds.maxY);
+        if (rectsIntersect(marquee, { minX: sMinX, minY: sMinY, maxX: sMaxX, maxY: sMaxY })) matched.push(pathId);
+      }
+      if (selectDrag.additive) for (const id of matched) ui.selectedPaths.add(id);
+      else ui.selectedPaths = new Set(matched);
+    }
+  }
+  selectDrag = null;
+  activeSnapGlyph = null;
+  renderAll();
+}
+
 canvas.addEventListener(
   "wheel",
   (e) => {
@@ -743,6 +884,21 @@ window.addEventListener("keydown", (e) => {
     canvas.style.cursor = "grab";
     e.preventDefault(); // don't let the page scroll on spacebar
   }
+  if (["INPUT", "TEXTAREA"].includes(e.target.tagName)) return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === "d") {
+    e.preventDefault();
+    duplicateSelection();
+  } else if (mod && e.key.toLowerCase() === "c") {
+    if (ui.selectedPaths.size) { e.preventDefault(); copySelectionToClipboard(); }
+  } else if (mod && e.key.toLowerCase() === "v") {
+    e.preventDefault();
+    pasteSelectionFromClipboard();
+  } else if (e.key === "Delete" || e.key === "Backspace") {
+    if (ui.selectedPaths.size) { e.preventDefault(); deleteSelection(); }
+  } else if (e.key === "?") {
+    toggleShortcutOverlay();
+  }
 });
 window.addEventListener("keyup", (e) => {
   if (e.code === "Space") {
@@ -756,7 +912,7 @@ function finishPolygon() {
   if (!ui.activeLayer) ui.activeLayer = addLayer("Layer 1");
   const closed = [...pendingPolygon, pendingPolygon[0]];
   const { id } = addPath(ui.activeLayer, closed, "#ffd43b", 2.5, { strict: true });
-  ui.selectedPath = id;
+  selectOnly(id);
   pendingPolygon = [];
   renderAll();
 }
@@ -778,11 +934,12 @@ function hitTestPath(screenPt) {
     if (ui.hiddenLayers.has(props.layer_id)) continue;
     if (props.shape) {
       // Shape primitives (Phase 11) have no path_geom points to walk --
-      // hitTestShape has its own dedicated per-kind boundary math.
-      if (hitTestShape(props, screenPt)) return pathId;
+      // hitTestShape has its own dedicated per-kind boundary math. Test
+      // against the *transformed* (Phase 12) shape, not the base one.
+      if (hitTestShape(transformedShapeProps(pathId, props), screenPt)) return pathId;
       continue;
     }
-    const pts = pathPoints(pathId).map(([wx, wy]) => worldToScreen(wx, wy));
+    const pts = pathPoints(pathId).map((p) => worldToScreen(...applyPathTransform(pathId, props, p)));
     for (let i = 0; i < pts.length - 1; i++) {
       const d = distToSegment(screenPt, pts[i], pts[i + 1]);
       if (d < bestDist) { bestDist = d; best = pathId; }
@@ -1045,7 +1202,7 @@ function commitShape(props) {
   if (!props) return;
   if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
   const { id } = addPath(ui.activeLayer, [], actorColor, 2.5, props);
-  ui.selectedPath = id;
+  selectOnly(id);
   renderAll();
   renderShapeInputPanel();
   return id;
@@ -1135,6 +1292,427 @@ function hitTestShape(shape, screenPt) {
   return false;
 }
 
+// -- whole-path transform: move/rotate/scale (Phase 12) -----------------------
+// A `transform` field ({tx, ty, rotation (degrees), scale}) on path_props
+// -- per the brief, deliberately *not* rewriting the underlying RGA points
+// or shape parametric fields: an LWW field write merges cleanly against a
+// concurrent point-append to the same path (or a concurrent color/width
+// edit), which rewriting every point would not. Absent == the identity
+// transform, so every path that existed before this feature does (and
+// every path with no transform applied) renders exactly as before --
+// nothing is baked into stored coordinates until export.
+
+function getTransform(props) {
+  return (props && props.transform) || { tx: 0, ty: 0, rotation: 0, scale: 1 };
+}
+
+function isIdentityTransform(t) {
+  return t.tx === 0 && t.ty === 0 && t.rotation === 0 && t.scale === 1;
+}
+
+/** The pivot rotation/scale happens around -- the shape's own natural
+ * center for a shape primitive, or the bounding-box center of a
+ * freehand/polygon path's *base* (untransformed) points. Computed fresh
+ * from base geometry every time, so it never drifts as the transform
+ * itself changes. */
+function pathBaseCenter(pathId, props) {
+  if (props.shape === "line") return [(props.x1 + props.x2) / 2, (props.y1 + props.y2) / 2];
+  if (props.shape === "rect") return [props.x + props.w / 2, props.y + props.h / 2];
+  if (props.shape === "circle" || props.shape === "ellipse" || props.shape === "arc") return [props.cx, props.cy];
+  const pts = pathPoints(pathId);
+  if (!pts.length) return [0, 0];
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  return [(Math.min(...xs) + Math.max(...xs)) / 2, (Math.min(...ys) + Math.max(...ys)) / 2];
+}
+
+/** Forward-transforms one base-space point into world space -- used by
+ * hit-testing (which doesn't go through canvas's own transform stack the
+ * way rendering does) and by duplicate/align/distribute. */
+function applyPathTransform(pathId, props, [x, y]) {
+  const t = getTransform(props);
+  if (isIdentityTransform(t)) return [x, y];
+  const pivot = pathBaseCenter(pathId, props);
+  const dx = (x - pivot[0]) * t.scale, dy = (y - pivot[1]) * t.scale;
+  const rad = (t.rotation * Math.PI) / 180;
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  return [pivot[0] + dx * cos - dy * sin + t.tx, pivot[1] + dx * sin + dy * cos + t.ty];
+}
+
+/** Same shape-prop dict, with every coordinate field forward-transformed
+ * -- lets hit-testing reuse hitTestShape's existing per-kind math
+ * unchanged against the *transformed* shape, rather than needing a
+ * transform-aware rewrite of every hit-test branch. Rotated Rect/
+ * Ellipse/Arc hit-testing is an accepted approximation (see
+ * hitTestShape): it still uses axis-aligned x/y/w/h or rx/ry math,
+ * which is exact for tx/ty/scale-only transforms and only approximate
+ * once rotation is non-zero -- rendering (the canvas's own nested
+ * transform, see beginPathTransform) and export baking (the Python
+ * `bake_path_transform`, which flattens a rotated rect/ellipse to its
+ * exact rotated boundary) are both fully exact regardless of rotation;
+ * only this in-app click-target hitbox is a deliberately cheaper
+ * approximation, since a slightly-off click radius on a rotated shape
+ * is a minor UX nit, not a data-correctness problem. */
+function transformedShapeProps(pathId, props) {
+  const t = getTransform(props);
+  if (isIdentityTransform(t)) return props;
+  const out = { ...props };
+  if (props.shape === "line") {
+    [out.x1, out.y1] = applyPathTransform(pathId, props, [props.x1, props.y1]);
+    [out.x2, out.y2] = applyPathTransform(pathId, props, [props.x2, props.y2]);
+  } else if (props.shape === "rect") {
+    [out.x, out.y] = applyPathTransform(pathId, props, [props.x, props.y]);
+    out.w = props.w * t.scale;
+    out.h = props.h * t.scale;
+  } else {
+    [out.cx, out.cy] = applyPathTransform(pathId, props, [props.cx, props.cy]);
+    if ("r" in props) out.r = props.r * t.scale;
+    if ("rx" in props) out.rx = props.rx * t.scale;
+    if ("ry" in props) out.ry = props.ry * t.scale;
+    if ("start_angle" in props) out.start_angle = props.start_angle + t.rotation;
+    if ("end_angle" in props) out.end_angle = props.end_angle + t.rotation;
+  }
+  return out;
+}
+
+/** Wraps the given path's drawing in canvas's own nested transform
+ * stack (pivot-translate, rotate, scale, then translate back) if it has
+ * a non-identity transform -- or is being live move-dragged right now
+ * (see the "select tool" section) -- leaving a ctx.save() pushed for
+ * the caller to ctx.restore() when done. Returns false (nothing
+ * pushed) for the common identity case, so every path that predates
+ * this feature renders exactly as before. Reuses the exact same
+ * drawing code for every path regardless of transform -- much simpler
+ * than manually transforming every point/curve-control/shape-field. */
+function beginPathTransform(pathId, props) {
+  let t = getTransform(props);
+  if (selectDrag && selectDrag.mode === "move" && selectDrag.selection.has(pathId)) {
+    t = { ...t, tx: t.tx + selectDrag.liveDelta[0], ty: t.ty + selectDrag.liveDelta[1] };
+  }
+  if (isIdentityTransform(t)) return false;
+  const pivot = pathBaseCenter(pathId, props);
+  ctx.save();
+  ctx.translate(pivot[0] + t.tx, pivot[1] + t.ty);
+  ctx.rotate((t.rotation * Math.PI) / 180);
+  ctx.scale(t.scale, t.scale);
+  ctx.translate(-pivot[0], -pivot[1]);
+  return true;
+}
+
+// -- object snapping (Phase 12) -------------------------------------------------
+// Client-side input assistance only -- no CRDT changes, per the brief.
+// While dragging a selection or drawing a new shape, the cursor snaps to
+// endpoints/midpoints/centers of *other* nearby (transformed) geometry,
+// with a small glyph showing what it snapped to (square=endpoint,
+// triangle=midpoint, circle=center).
+
+function snapCandidatesForPath(pathId, props) {
+  const out = [];
+  if (props.shape === "line") {
+    const p1 = applyPathTransform(pathId, props, [props.x1, props.y1]);
+    const p2 = applyPathTransform(pathId, props, [props.x2, props.y2]);
+    out.push({ pt: p1, kind: "endpoint" }, { pt: p2, kind: "endpoint" });
+    out.push({ pt: [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2], kind: "midpoint" });
+  } else if (props.shape === "rect") {
+    const corners = [
+      [props.x, props.y], [props.x + props.w, props.y],
+      [props.x + props.w, props.y + props.h], [props.x, props.y + props.h],
+    ].map((p) => applyPathTransform(pathId, props, p));
+    for (const c of corners) out.push({ pt: c, kind: "endpoint" });
+    for (let i = 0; i < 4; i++) {
+      const a = corners[i], b = corners[(i + 1) % 4];
+      out.push({ pt: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], kind: "midpoint" });
+    }
+    out.push({ pt: applyPathTransform(pathId, props, [props.x + props.w / 2, props.y + props.h / 2]), kind: "center" });
+  } else if (props.shape === "circle" || props.shape === "ellipse" || props.shape === "arc") {
+    out.push({ pt: applyPathTransform(pathId, props, [props.cx, props.cy]), kind: "center" });
+  } else {
+    const pts = pathPoints(pathId).map((p) => applyPathTransform(pathId, props, p));
+    for (const p of pts) out.push({ pt: p, kind: "endpoint" });
+    for (let i = 0; i < pts.length - 1; i++) {
+      out.push({ pt: [(pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2], kind: "midpoint" });
+    }
+  }
+  return out;
+}
+
+function collectSnapCandidates(excludePathIds) {
+  const out = [];
+  for (const pathId of state.pathIndex) {
+    if (excludePathIds.has(pathId)) continue;
+    const props = state.pathProps.get(pathId) || {};
+    if (ui.hiddenLayers.has(props.layer_id)) continue;
+    out.push(...snapCandidatesForPath(pathId, props));
+  }
+  return out;
+}
+
+/** Snaps `rawPt` (world coords) to the nearest candidate within a small
+ * constant on-screen radius, if any. Returns `{point, glyph}` --
+ * `glyph` is null (and `point` is `rawPt` unchanged) when nothing is
+ * close enough. `excludePathIds` keeps geometry currently being
+ * moved/drawn from snapping to itself. */
+function resolveSnapPoint(rawPt, excludePathIds) {
+  const thresholdWorld = 10 / view.zoom;
+  let best = null, bestDist = thresholdWorld;
+  for (const c of collectSnapCandidates(excludePathIds)) {
+    const d = Math.hypot(rawPt[0] - c.pt[0], rawPt[1] - c.pt[1]);
+    if (d < bestDist) { bestDist = d; best = c; }
+  }
+  return best ? { point: best.pt, glyph: best } : { point: rawPt, glyph: null };
+}
+
+function drawSnapGlyph(glyph) {
+  if (!glyph) return;
+  const [sx, sy] = worldToScreen(glyph.pt[0], glyph.pt[1]);
+  const s = 6;
+  ctx.save();
+  ctx.strokeStyle = "#51cf66";
+  ctx.lineWidth = 1.5;
+  if (glyph.kind === "endpoint") {
+    ctx.strokeRect(sx - s, sy - s, s * 2, s * 2);
+  } else if (glyph.kind === "midpoint") {
+    ctx.beginPath();
+    ctx.moveTo(sx, sy - s);
+    ctx.lineTo(sx + s, sy + s);
+    ctx.lineTo(sx - s, sy + s);
+    ctx.closePath();
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.arc(sx, sy, s, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// -- selection bounds / align / distribute (Phase 12) ---------------------------
+
+/** World-space bounding box of a path's *actual* (transformed) geometry
+ * -- marquee-select and align/distribute must both act on what's on
+ * screen, not a path's untransformed base data. */
+function pathWorldBounds(pathId, props) {
+  let pts;
+  if (props.shape) {
+    const t = transformedShapeProps(pathId, props);
+    if (t.shape === "line") pts = [[t.x1, t.y1], [t.x2, t.y2]];
+    else if (t.shape === "rect") pts = [[t.x, t.y], [t.x + t.w, t.y + t.h]];
+    else if (t.shape === "ellipse") pts = [[t.cx - t.rx, t.cy - t.ry], [t.cx + t.rx, t.cy + t.ry]];
+    else pts = [[t.cx - t.r, t.cy - t.r], [t.cx + t.r, t.cy + t.r]]; // circle/arc: conservative full-circle bound
+  } else {
+    pts = pathPoints(pathId).map((p) => applyPathTransform(pathId, props, p));
+  }
+  if (!pts.length) return null;
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  return { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
+}
+
+function rectsIntersect(a, b) {
+  return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
+}
+
+/** Nudges a path's transform by a world-space delta -- shared by
+ * move-drag commit, and align/distribute, which both just need to
+ * reposition a path without touching its base geometry. */
+function nudgePathTransform(pathId, dx, dy) {
+  const props = state.pathProps.get(pathId) || {};
+  const t = getTransform(props);
+  setPathProp(pathId, "transform", { ...t, tx: t.tx + dx, ty: t.ty + dy });
+}
+
+function alignSelection(mode) {
+  const ids = [...ui.selectedPaths];
+  const bounds = new Map(ids.map((id) => [id, pathWorldBounds(id, state.pathProps.get(id) || {})]));
+  const valid = ids.filter((id) => bounds.get(id));
+  if (valid.length < 2) return;
+  const minX = Math.min(...valid.map((id) => bounds.get(id).minX));
+  const maxX = Math.max(...valid.map((id) => bounds.get(id).maxX));
+  const minY = Math.min(...valid.map((id) => bounds.get(id).minY));
+  const maxY = Math.max(...valid.map((id) => bounds.get(id).maxY));
+  for (const id of valid) {
+    const b = bounds.get(id);
+    if (mode === "left") nudgePathTransform(id, minX - b.minX, 0);
+    else if (mode === "right") nudgePathTransform(id, maxX - b.maxX, 0);
+    else if (mode === "hcenter") nudgePathTransform(id, (minX + maxX) / 2 - (b.minX + b.maxX) / 2, 0);
+    else if (mode === "top") nudgePathTransform(id, 0, minY - b.minY);
+    else if (mode === "bottom") nudgePathTransform(id, 0, maxY - b.maxY);
+    else if (mode === "vcenter") nudgePathTransform(id, 0, (minY + maxY) / 2 - (b.minY + b.maxY) / 2);
+  }
+  renderAll();
+}
+
+function distributeSelection(axis) {
+  const entries = [...ui.selectedPaths]
+    .map((id) => ({ id, b: pathWorldBounds(id, state.pathProps.get(id) || {}) }))
+    .filter((e) => e.b);
+  if (entries.length < 3) return;
+  const center = (b) => (axis === "h" ? (b.minX + b.maxX) / 2 : (b.minY + b.maxY) / 2);
+  entries.sort((a, b) => center(a.b) - center(b.b));
+  const first = center(entries[0].b), last = center(entries[entries.length - 1].b);
+  const step = (last - first) / (entries.length - 1);
+  for (let i = 1; i < entries.length - 1; i++) {
+    const delta = first + step * i - center(entries[i].b);
+    if (axis === "h") nudgePathTransform(entries[i].id, delta, 0);
+    else nudgePathTransform(entries[i].id, 0, delta);
+  }
+  renderAll();
+}
+
+// -- duplicate / copy-paste / delete (Phase 12) ----------------------------------
+
+const DUPLICATE_OFFSET = 20; // world px -- keeps a copy visibly distinct, never sitting exactly on top of the original
+
+/** Deep-copies one path: fresh id, fresh RGA node ids for a freehand/
+ * polygon path's points, full path_props (transform, shape fields,
+ * color/width) offset by (dx, dy) via `transform` -- base geometry is
+ * never rewritten, consistent with how every other move works here.
+ * Curve segments (Phase 8) are keyed by their anchor's *old* node id, so
+ * they're explicitly remapped onto the new points' ids afterward --
+ * without this the copy would silently lose its curves, since none of
+ * its fresh node ids would match any `curve:` key carried over as-is. */
+function clonePath(pathId, dx, dy) {
+  const props = state.pathProps.get(pathId) || {};
+  const isFreehand = !props.shape;
+  const oldEntries = isFreehand ? liveEntries(state.pathNodes.get(pathId)) : [];
+  const pts = oldEntries.map((e) => e.v);
+  const extraProps = {};
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "layer_id" || k === "color" || k === "stroke_width" || k.startsWith("curve:")) continue;
+    extraProps[k] = v;
+  }
+  const t = getTransform(props);
+  extraProps.transform = { ...t, tx: t.tx + dx, ty: t.ty + dy };
+  const { id, pointIds } = addPath(props.layer_id || ui.activeLayer, pts, props.color || actorColor, props.stroke_width || 2.5, extraProps);
+  for (let i = 0; i < oldEntries.length; i++) {
+    const seg = props[curvePropKey(oldEntries[i].id)];
+    if (seg) setPathProp(id, curvePropKey(pointIds[i]), seg);
+  }
+  return id;
+}
+
+function duplicateSelection() {
+  const ids = [...ui.selectedPaths];
+  if (!ids.length) return;
+  const newIds = ids.map((id) => clonePath(id, DUPLICATE_OFFSET, DUPLICATE_OFFSET));
+  ui.selectedPaths = new Set(newIds);
+  renderAll();
+}
+
+function deleteSelection() {
+  const ids = [...ui.selectedPaths];
+  if (!ids.length) return;
+  for (const id of ids) removePath(id);
+  renderAll();
+}
+
+/** Serializes the selection to JSON on the clipboard (plain data, no
+ * room-specific ids referenced) -- paste works across rooms/tabs since
+ * it only ever creates fresh ids, exactly like duplicate. */
+async function copySelectionToClipboard() {
+  const ids = [...ui.selectedPaths];
+  if (!ids.length) return;
+  const items = ids.map((id) => {
+    const props = state.pathProps.get(id) || {};
+    const entries = props.shape ? [] : liveEntries(state.pathNodes.get(id));
+    // Raw [counter, actor] ids (not opIdKey's stringified form) -- these
+    // round-trip through JSON as plain arrays and pass straight back
+    // into curvePropKey unchanged on paste, exactly like clonePath.
+    return { props, points: entries.map((e) => e.v), pointIds: entries.map((e) => e.id) };
+  });
+  try {
+    await navigator.clipboard.writeText(JSON.stringify({ crdtCadShapes: items }));
+    showToast(`Copied ${items.length} path(s)`, "success");
+  } catch {
+    showToast("Clipboard write failed", "error");
+  }
+}
+
+async function pasteSelectionFromClipboard() {
+  let text;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch {
+    showToast("Clipboard read failed", "error");
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return; // clipboard doesn't hold our format -- silently ignore, not an error
+  }
+  if (!data || !Array.isArray(data.crdtCadShapes)) return;
+  if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
+  const newIds = [];
+  for (const item of data.crdtCadShapes) {
+    const props = item.props || {};
+    const extraProps = {};
+    for (const [k, v] of Object.entries(props)) {
+      if (k === "layer_id" || k === "color" || k === "stroke_width" || k.startsWith("curve:")) continue;
+      extraProps[k] = v;
+    }
+    const t = getTransform(props);
+    extraProps.transform = { ...t, tx: t.tx + DUPLICATE_OFFSET, ty: t.ty + DUPLICATE_OFFSET };
+    const { id, pointIds } = addPath(ui.activeLayer, item.points || [], props.color || actorColor, props.stroke_width || 2.5, extraProps);
+    const oldIds = item.pointIds || [];
+    for (let i = 0; i < oldIds.length; i++) {
+      const seg = props[curvePropKey(oldIds[i])];
+      if (seg) setPathProp(id, curvePropKey(pointIds[i]), seg);
+    }
+    newIds.push(id);
+  }
+  if (newIds.length) {
+    ui.selectedPaths = new Set(newIds);
+    renderAll();
+    showToast(`Pasted ${newIds.length} path(s)`, "success");
+  }
+}
+
+// -- keyboard shortcut overlay (Phase 12) ----------------------------------------
+
+function toggleShortcutOverlay() {
+  if (shortcutOverlayEl) {
+    shortcutOverlayEl.remove();
+    shortcutOverlayEl = null;
+    return;
+  }
+  const rows = [
+    ["Space + drag / middle-drag", "Pan"],
+    ["Scroll wheel", "Zoom (centered on cursor)"],
+    ["Click", "Select a path"],
+    ["Shift + click", "Add/remove a path from the selection"],
+    ["Drag on empty canvas", "Marquee-select"],
+    ["Drag a selected path", "Move the selection"],
+    ["Ctrl/Cmd + D", "Duplicate selection"],
+    ["Ctrl/Cmd + C / V", "Copy / paste selection"],
+    ["Delete / Backspace", "Delete selection"],
+    ["Esc", "Cancel the in-progress polygon"],
+    ["?", "Toggle this overlay"],
+  ];
+  const overlay = document.createElement("div");
+  overlay.style.cssText =
+    "position:fixed;inset:0;background:rgba(6,8,12,0.72);z-index:2000;" +
+    "display:flex;align-items:center;justify-content:center;";
+  const box = document.createElement("div");
+  box.style.cssText =
+    "background:#1c1f26;border:1px solid #2e333d;border-radius:10px;padding:20px 24px;" +
+    "max-width:420px;width:90%;color:#e7e9ee;font-size:13px;font-family:inherit;";
+  box.innerHTML =
+    '<h3 style="margin:0 0 10px;font-size:15px;">Keyboard shortcuts</h3>' +
+    '<div style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;">' +
+    rows
+      .map(
+        ([k, v]) =>
+          `<div style="color:#4dabf7;font-weight:600;white-space:nowrap;">${escapeHtml(k)}</div>` +
+          `<div style="color:#9aa1ad;">${escapeHtml(v)}</div>`
+      )
+      .join("") +
+    "</div>";
+  overlay.appendChild(box);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) toggleShortcutOverlay(); });
+  document.body.appendChild(overlay);
+  shortcutOverlayEl = overlay;
+}
+
 function distToSegment(p, a, b) {
   const [px, py] = p, [ax, ay] = a, [bx, by] = b;
   const dx = bx - ax, dy = by - ay;
@@ -1162,6 +1740,8 @@ function setTool(tool) {
   if (ui.tool === "polygon" && tool !== "polygon") cancelPolygon();
   if (ui.tool === "constrain" && tool !== "constrain") { constraintSelection = []; renderConstraintPanel(); }
   if (isShapeTool(ui.tool) && tool !== ui.tool) { shapeDraft = null; }
+  if (ui.tool === "select" && tool !== "select") selectDrag = null;
+  activeSnapGlyph = null;
   ui.tool = tool;
   for (const [t, id] of Object.entries(TOOL_BUTTON_IDS)) {
     document.getElementById(id).classList.toggle("active", tool === t);
@@ -1185,6 +1765,8 @@ function renderToolHint() {
     hint.textContent = "Click two points (any paths) to relate them -- coincident, parallel, perpendicular, or a fixed distance apart.";
   } else if (isShapeTool(ui.tool)) {
     hint.textContent = "Drag to size and place, or type exact dimensions below.";
+  } else if (ui.tool === "select") {
+    hint.textContent = "Click to select, shift-click to add/remove, drag empty space to marquee-select, drag a selected path to move it. Press ? for all shortcuts.";
   } else {
     hint.textContent = "Click a path to select it.";
   }
@@ -1349,13 +1931,22 @@ function render() {
   for (const pathId of state.pathIndex) {
     const props = state.pathProps.get(pathId) || {};
     if (ui.hiddenLayers.has(props.layer_id)) continue;
+    // Phase 12: wraps this path's own drawing in canvas's nested transform
+    // stack (around its pivot) when it has a move/rotate/scale applied --
+    // see beginPathTransform's docstring. Everything below keeps using raw,
+    // untransformed coordinates either way.
+    const wrapped = beginPathTransform(pathId, props);
     if (props.shape) {
-      drawShapePath(props, pathId === ui.selectedPath);
+      drawShapePath(props, ui.selectedPaths.has(pathId));
+      if (wrapped) ctx.restore();
       continue;
     }
     const entries = liveEntries(state.pathNodes.get(pathId));
     const pts = entries.map((n) => n.v);
-    if (pts.length === 0) continue;
+    if (pts.length === 0) {
+      if (wrapped) ctx.restore();
+      continue;
+    }
     ctx.beginPath();
     ctx.moveTo(pts[0][0], pts[0][1]);
     for (let i = 1; i < pts.length; i++) {
@@ -1378,7 +1969,7 @@ function render() {
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.stroke();
-    if (pathId === ui.selectedPath) {
+    if (ui.selectedPaths.has(pathId)) {
       ctx.save();
       ctx.strokeStyle = "#4dabf7";
       ctx.lineWidth = (props.stroke_width || 2.5) + 4;
@@ -1392,6 +1983,7 @@ function render() {
       ctx.fillStyle = props.color || "#e7e9ee";
       ctx.fill();
     }
+    if (wrapped) ctx.restore();
   }
 
   if (ui.tool === "polygon" && pendingPolygon.length) {
@@ -1449,6 +2041,22 @@ function render() {
     ctx.restore();
   }
 
+  if (selectDrag && selectDrag.mode === "marquee") {
+    const [sx0, sy0] = selectDrag.startScreen;
+    const [sx1, sy1] = selectDrag.currentScreen;
+    ctx.save();
+    ctx.strokeStyle = "#4dabf7";
+    ctx.fillStyle = "rgba(77,171,247,0.12)";
+    ctx.lineWidth = 1;
+    const x = Math.min(sx0, sx1), y = Math.min(sy0, sy1);
+    const w = Math.abs(sx1 - sx0), h = Math.abs(sy1 - sy0);
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
+  }
+
+  drawSnapGlyph(activeSnapGlyph);
+
   renderPresence();
 }
 
@@ -1503,36 +2111,98 @@ function renderPathList() {
   for (const pathId of state.pathIndex) {
     const props = state.pathProps.get(pathId) || {};
     const row = document.createElement("div");
-    row.className = "path-row" + (pathId === ui.selectedPath ? " active" : "");
+    row.className = "path-row" + (ui.selectedPaths.has(pathId) ? " active" : "");
     const label = props.shape ? `${props.shape}` : `${pathPoints(pathId).length} pts`;
     row.innerHTML = `
       <span class="path-swatch" style="background:${props.color || "#eee"}"></span>
       <span class="name">${label} · ${escapeHtml((state.layers.get(props.layer_id) || {}).name || "?")}</span>
       <button class="ghost-btn" data-act="del">✕</button>
     `;
-    row.querySelector(".name").onclick = () => { ui.selectedPath = pathId; renderAll(); };
+    row.querySelector(".name").onclick = (e) => {
+      if (e.shiftKey) toggleSelection(pathId);
+      else selectOnly(pathId);
+      renderAll();
+    };
     row.querySelector('[data-act="del"]').onclick = (e) => { e.stopPropagation(); removePath(pathId); renderAll(); };
     list.appendChild(row);
   }
 }
 
+/** Bulk-action panel shown when more than one path is selected --
+ * per-path fields (color/width/rotation) don't make sense for a mixed
+ * group, so this offers group-level operations instead: duplicate,
+ * delete, align, and (3+ paths) distribute. */
+function renderBulkSelectionPanel(panel) {
+  const count = ui.selectedPaths.size;
+  panel.innerHTML = `
+    <div class="empty-hint">${count} paths selected.</div>
+    <button style="width:100%;margin-top:6px" id="bulkDuplicate">Duplicate (Ctrl/Cmd+D)</button>
+    <div class="field-row" style="margin-top:6px"><label>Align</label></div>
+    <div class="tool-row">
+      <button id="alignLeft" title="Align left">⟸</button>
+      <button id="alignHCenter" title="Align center">⟺</button>
+      <button id="alignRight" title="Align right">⟹</button>
+    </div>
+    <div class="tool-row" style="margin-top:4px">
+      <button id="alignTop" title="Align top">⟰</button>
+      <button id="alignVCenter" title="Align middle">⇕</button>
+      <button id="alignBottom" title="Align bottom">⟱</button>
+    </div>
+    <div class="field-row" style="margin-top:6px"><label>Distribute (3+)</label></div>
+    <div class="tool-row">
+      <button id="distH" ${count < 3 ? "disabled" : ""}>Horiz.</button>
+      <button id="distV" ${count < 3 ? "disabled" : ""}>Vert.</button>
+    </div>
+    <button class="danger" id="bulkDelete" style="width:100%;margin-top:8px">Delete ${count} paths</button>
+  `;
+  document.getElementById("bulkDuplicate").onclick = duplicateSelection;
+  document.getElementById("bulkDelete").onclick = deleteSelection;
+  document.getElementById("alignLeft").onclick = () => alignSelection("left");
+  document.getElementById("alignHCenter").onclick = () => alignSelection("hcenter");
+  document.getElementById("alignRight").onclick = () => alignSelection("right");
+  document.getElementById("alignTop").onclick = () => alignSelection("top");
+  document.getElementById("alignVCenter").onclick = () => alignSelection("vcenter");
+  document.getElementById("alignBottom").onclick = () => alignSelection("bottom");
+  document.getElementById("distH").onclick = () => distributeSelection("h");
+  document.getElementById("distV").onclick = () => distributeSelection("v");
+}
+
 function renderSelectionPanel() {
   const panel = document.getElementById("selectionPanel");
   const commentPanel = document.getElementById("commentList");
-  if (!ui.selectedPath || !state.pathProps.has(ui.selectedPath)) {
+  if (ui.selectedPaths.size === 0) {
     panel.innerHTML = '<div class="empty-hint">Select a path to edit its color, stroke width, or leave a comment.</div>';
     commentPanel.innerHTML = '<div class="empty-hint">No path selected.</div>';
     return;
   }
-  const pathId = ui.selectedPath;
+  if (ui.selectedPaths.size > 1) {
+    renderBulkSelectionPanel(panel);
+    commentPanel.innerHTML = '<div class="empty-hint">Comments need exactly one selected path.</div>';
+    return;
+  }
+  const pathId = primarySelectedPath();
+  if (!pathId || !state.pathProps.has(pathId)) {
+    panel.innerHTML = '<div class="empty-hint">Select a path to edit its color, stroke width, or leave a comment.</div>';
+    commentPanel.innerHTML = '<div class="empty-hint">No path selected.</div>';
+    return;
+  }
   const props = state.pathProps.get(pathId) || {};
+  const t = getTransform(props);
   panel.innerHTML = `
     <div class="field-row"><label>Color</label><input id="selColor" type="text" value="${props.color || "#ffffff"}" style="width:90px"/></div>
     <div class="field-row"><label>Width</label><input id="selWidth" type="number" min="1" max="20" step="0.5" value="${props.stroke_width || 2.5}" style="width:70px"/></div>
+    <div class="field-row"><label>Rotation (°)</label><input id="selRotation" type="number" step="1" value="${t.rotation}" style="width:70px"/></div>
+    <div class="field-row"><label>Scale</label><input id="selScale" type="number" min="0.01" step="0.1" value="${t.scale}" style="width:70px"/></div>
+    <button style="width:100%;margin-top:4px" id="selDuplicate">Duplicate (Ctrl/Cmd+D)</button>
     <button class="danger" id="selDelete" style="width:100%;margin-top:6px">Delete path</button>
   `;
   document.getElementById("selColor").onchange = (e) => setPathProp(pathId, "color", e.target.value);
   document.getElementById("selWidth").onchange = (e) => setPathProp(pathId, "stroke_width", parseFloat(e.target.value));
+  document.getElementById("selRotation").onchange = (e) =>
+    setPathProp(pathId, "transform", { ...getTransform(state.pathProps.get(pathId) || {}), rotation: parseFloat(e.target.value) || 0 });
+  document.getElementById("selScale").onchange = (e) =>
+    setPathProp(pathId, "transform", { ...getTransform(state.pathProps.get(pathId) || {}), scale: parseFloat(e.target.value) || 1 });
+  document.getElementById("selDuplicate").onclick = duplicateSelection;
   document.getElementById("selDelete").onclick = () => { removePath(pathId); renderAll(); };
 
   commentPanel.innerHTML = "";

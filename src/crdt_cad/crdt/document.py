@@ -31,6 +31,7 @@ concurrent changes made by anyone else.
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -147,6 +148,148 @@ def flatten_path_to_polyline(
                 out.append(_quad_point(p0, c, p1, s / samples_per_curve))
         else:
             out.append(p1)
+    return out
+
+
+# -- whole-path transform (Phase 12) -------------------------------------------
+#
+# A path's move/rotate/scale lives entirely in its `transform` path_prop
+# ({tx, ty, rotation (degrees), scale}), never rewriting the underlying
+# RGA points or a shape's own parametric fields -- see sketch.js's
+# matching comment for the full CRDT-merge rationale. Exporters (SVG,
+# DXF) have no transform concept of their own, so the transform is baked
+# into plain coordinates only at export time, via this function --
+# mirrors sketch.js's getTransform/pathBaseCenter/applyPathTransform/
+# transformedShapeProps exactly, so an exported file matches what the
+# browser already renders.
+_IDENTITY_TRANSFORM = {"tx": 0.0, "ty": 0.0, "rotation": 0.0, "scale": 1.0}
+
+
+def _path_base_center(points: list[Point], props: dict) -> Point:
+    shape = props.get("shape")
+    if shape == "line":
+        return ((props["x1"] + props["x2"]) / 2, (props["y1"] + props["y2"]) / 2)
+    if shape == "rect":
+        return (props["x"] + props["w"] / 2, props["y"] + props["h"] / 2)
+    if shape in ("circle", "ellipse", "arc"):
+        return (props["cx"], props["cy"])
+    if not points:
+        return (0.0, 0.0)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+
+
+def _apply_point_transform(pt: Point, pivot: Point, t: dict) -> Point:
+    dx = (pt[0] - pivot[0]) * t["scale"]
+    dy = (pt[1] - pivot[1]) * t["scale"]
+    rad = math.radians(t["rotation"])
+    cos_r, sin_r = math.cos(rad), math.sin(rad)
+    return (
+        pivot[0] + dx * cos_r - dy * sin_r + t["tx"],
+        pivot[1] + dx * sin_r + dy * cos_r + t["ty"],
+    )
+
+
+def _rect_corners(x: float, y: float, w: float, h: float) -> list[Point]:
+    return [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]  # closed: repeats the first corner
+
+
+def _ellipse_boundary(cx: float, cy: float, rx: float, ry: float, samples: int = 64) -> list[Point]:
+    return [
+        (cx + rx * math.cos(2 * math.pi * i / samples), cy + ry * math.sin(2 * math.pi * i / samples))
+        for i in range(samples + 1)  # +1 closes the loop (repeats the first point)
+    ]
+
+
+_SHAPE_FIELD_KEYS = ("shape", "x", "y", "w", "h", "cx", "cy", "r", "rx", "ry", "start_angle", "end_angle")
+
+
+def bake_path_transform(path_dict: dict) -> dict:
+    """Returns a copy of `path_dict` (as produced by `path_list()`) with
+    its `transform` field (if any, and non-identity) applied directly to
+    `points` / shape fields / any curve control points -- for exporters
+    that have no transform concept of their own. Absent or identity
+    transform returns `path_dict` unchanged (the overwhelmingly common
+    case, and every path that predates this feature).
+
+    A rotated rect/ellipse can't be expressed as axis-aligned
+    `x/y/w/h`/`cx/cy/rx/ry` any more (a rotated box or off-axis ellipse
+    just isn't that shape), so under non-zero rotation those two kinds
+    are converted to a plain point boundary instead -- sampled exactly
+    (rect: its 4 corners; ellipse: densely around its rim) and forward-
+    transformed like any other point, then exported as a closed
+    polyline/polygon by the same fallback path a freehand path already
+    uses. Line, circle, and arc never need this: a line is just 2
+    points (any rotation is exact), a circle is rotation-invariant, and
+    an arc's rotation is exactly "add rotation to both angles" -- all
+    three stay native shape elements at any transform."""
+    raw_t = path_dict.get("transform") or _IDENTITY_TRANSFORM
+    t = {
+        "tx": raw_t.get("tx", 0.0),
+        "ty": raw_t.get("ty", 0.0),
+        "rotation": raw_t.get("rotation", 0.0),
+        "scale": raw_t.get("scale", 1.0),
+    }
+    if t["tx"] == 0 and t["ty"] == 0 and t["rotation"] == 0 and t["scale"] == 1:
+        return path_dict
+
+    out = dict(path_dict)
+    points = out.get("points") or []
+    pivot = _path_base_center(points, out)
+    if points:
+        out["points"] = [_apply_point_transform(p, pivot, t) for p in points]
+
+    shape = out.get("shape")
+    flatten_to_boundary = shape in ("rect", "ellipse") and t["rotation"] % 360 != 0
+    if flatten_to_boundary:
+        if shape == "rect":
+            base_pts = _rect_corners(out["x"], out["y"], out["w"], out["h"])
+        else:
+            base_pts = _ellipse_boundary(out["cx"], out["cy"], out["rx"], out["ry"])
+        out["points"] = [_apply_point_transform(p, pivot, t) for p in base_pts]
+        for key in _SHAPE_FIELD_KEYS:
+            out.pop(key, None)
+        out.pop("point_ids", None)
+    elif shape == "line":
+        out["x1"], out["y1"] = _apply_point_transform((out["x1"], out["y1"]), pivot, t)
+        out["x2"], out["y2"] = _apply_point_transform((out["x2"], out["y2"]), pivot, t)
+    elif shape == "rect":
+        out["x"], out["y"] = _apply_point_transform((out["x"], out["y"]), pivot, t)
+        out["w"] = out["w"] * t["scale"]
+        out["h"] = out["h"] * t["scale"]
+    elif shape in ("circle", "ellipse", "arc"):
+        out["cx"], out["cy"] = _apply_point_transform((out["cx"], out["cy"]), pivot, t)
+        if "r" in out:
+            out["r"] = out["r"] * t["scale"]
+        if "rx" in out:
+            out["rx"] = out["rx"] * t["scale"]
+        if "ry" in out:
+            out["ry"] = out["ry"] * t["scale"]
+        if "start_angle" in out:
+            out["start_angle"] = out["start_angle"] + t["rotation"]
+        if "end_angle" in out:
+            out["end_angle"] = out["end_angle"] + t["rotation"]
+
+    # Curve control points (Phase 8) are stored raw/untransformed and keyed
+    # by anchor node id -- without this, a rotated/scaled freehand path's
+    # anchors would move but its Bezier handles wouldn't, visibly warping
+    # the curve on export. A flattened rect/ellipse boundary (above) never
+    # has curve entries of its own, so this is a no-op for it.
+    point_ids = out.get("point_ids")
+    if point_ids:
+        for node_id in point_ids:
+            key = curve_prop_key(node_id)
+            seg = out.get(key)
+            if seg is None:
+                continue
+            new_seg = dict(seg)
+            if seg["kind"] == "cubic":
+                new_seg["c1"] = list(_apply_point_transform(tuple(seg["c1"]), pivot, t))
+                new_seg["c2"] = list(_apply_point_transform(tuple(seg["c2"]), pivot, t))
+            elif seg["kind"] == "quad":
+                new_seg["c"] = list(_apply_point_transform(tuple(seg["c"]), pivot, t))
+            out[key] = new_seg
     return out
 
 

@@ -35,6 +35,7 @@ over gaps.
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9) -- coincident/parallel/perpendicular/fixed-distance, live-verified with real point convergence, see below |
 | 2D viewport: pan/zoom/adaptive grid/snap-to-grid (Phase 10) | **Done** -- client-local view transform, never synced; live-verified incl. presence cursors through an asymmetric transform, see below |
 | Shape primitives: Line/Rect/Circle/Ellipse/Arc, numeric input, document units (Phase 11) | **Done** -- parametric `path_props` fields, native render/hit-test/SVG/DXF export per shape, see below |
+| Selection editing: move/rotate/scale, multi-select, duplicate, copy/paste, align/distribute, object snap (Phase 12) | **Done** -- `transform` path_prop baked only at export time, canvas's own nested transform for rendering, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -48,7 +49,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 14 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 19 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -63,7 +64,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 260 tests, ~15s
+./.venv/Scripts/python -m pytest tests/ -v   # 289 tests, ~15s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -823,17 +824,19 @@ npm project. The 3D demo additionally loads Three.js + OrbitControls
 from a CDN via an import map (the only external runtime dependency
 either frontend has).
 
-**2D sketch (`/`)**: pen tool, select tool, a strict **Polygon** tool
-that demonstrates the geometry validity gate, **Line/Rect/Circle/
-Ellipse/Arc** shape tools with numeric dimension input (Phase 11 -- see
-below), a **Constrain** tool (Phase 9 -- coincident/parallel/
-perpendicular/fixed-distance via the tested Gauss-Newton solver), a real
-pan/zoom/grid/snap **viewport** and a **document units** (px/mm/in)
-selector (Phase 10/11 -- see below), per-layer visibility, undo/redo,
-live multi-user cursors, comments, **Save**/**.json/.svg/.dxf
-download**/**Import SVG or DXF**/**Share** (copies an invite link), and
-an offline toggle that closes both the WebSocket and any P2P
-connection.
+**2D sketch (`/`)**: pen tool, a **select** tool with multi-select
+(shift-click/marquee), move/rotate/scale, duplicate, copy/paste,
+align/distribute, and object snapping (Phase 12 -- see below), a strict
+**Polygon** tool that demonstrates the geometry validity gate,
+**Line/Rect/Circle/Ellipse/Arc** shape tools with numeric dimension
+input (Phase 11 -- see below), a **Constrain** tool (Phase 9 --
+coincident/parallel/perpendicular/fixed-distance via the tested
+Gauss-Newton solver), a real pan/zoom/grid/snap **viewport** and a
+**document units** (px/mm/in) selector (Phase 10/11 -- see below),
+per-layer visibility, undo/redo, live multi-user cursors, comments,
+**Save**/**.json/.svg/.dxf download**/**Import SVG or DXF**/**Share**
+(copies an invite link), a keyboard shortcut overlay (`?`), and an
+offline toggle that closes both the WebSocket and any P2P connection.
 
 **3D mesh (`/3d`)**: click the ground grid to place vertices, click 3+
 vertices in order (then the first one again, or "Finish") to build a
@@ -993,13 +996,114 @@ behavior.
   tab A is visible in tab B's own units dropdown, not just tab A's
   cursor readout.
 
+## Selection editing: transform, duplicate, snap (Phase 12)
+
+**Representation**: a path's move/rotate/scale lives entirely in a new
+`transform` field on `path_props` -- `{tx, ty, rotation (degrees),
+scale}`, absent/identity by default so every path that predates this
+feature (and every path nobody has moved) renders exactly as before.
+Per the brief, this deliberately never rewrites the underlying RGA
+points or a shape's own parametric fields: an LWW field write merges
+cleanly against a concurrent point-append to the same path, or a
+concurrent color/width edit, which rewriting every point on every move
+would not -- the same "independently-mutable prop-bag field" rationale
+already used for Phase 11's shape fields and Phase 8's curve segments,
+applied to a new kind of edit instead of new data.
+
+- **Rendering** wraps each path's *existing, unchanged* drawing code in
+  canvas's own nested transform stack (translate to the pivot,
+  translate by `tx/ty`, rotate, scale, translate back) rather than
+  manually transforming every point -- works uniformly for freehand
+  curves and shape primitives alike, and correctly scales `stroke_width`
+  the same way real ink would (`beginPathTransform` in `sketch.js`).
+  The pivot is the shape's own natural center (line: midpoint; rect:
+  `x+w/2, y+h/2`; circle/ellipse/arc: `cx,cy`) or a freehand/polygon
+  path's live bounding-box center, recomputed fresh from *base*
+  (untransformed) geometry every time so it never drifts.
+- **Hit-testing** can't use the canvas transform (it doesn't run inside
+  a `render()` call), so it forward-transforms points/shape-fields
+  explicitly (`applyPathTransform`/`transformedShapeProps`) and reuses
+  the exact same per-kind boundary math Phase 11 already built. Accepted
+  approximation, unchanged in scope from Phase 11: a rotated Rect/
+  Ellipse/Arc's *hitbox* still uses axis-aligned math, exact for
+  translate/scale-only transforms and only approximate once rotation is
+  non-zero -- a slightly-off click radius on a rotated shape, not a
+  data-correctness problem (rendering and export are both exact
+  regardless of rotation, see below).
+- **Multi-selection**: `ui.selectedPaths` is a `Set`, built via a
+  plain click (replaces the selection), shift-click (toggles a path
+  into/out of it without starting a move), or a marquee drag over empty
+  canvas (selects everything whose *transformed* bounding box
+  intersects the drawn rectangle). Dragging a path that's already part
+  of the current selection moves the whole group together -- live-
+  previewed locally frame-by-frame, committed as one `transform` write
+  per path *on release*, not per `pointermove`, so a drag never floods
+  the relay with ops.
+- **Numeric rotate/scale**: the single-selection panel gets Rotation
+  (degrees) and Scale fields writing straight to `transform` -- a
+  deliberate, documented scope reduction from interactive drag handles/
+  gizmos, consistent with Phase 11's numeric-input-first approach to
+  shape editing.
+- **Duplicate** (`Ctrl`/`Cmd`+`D`, or a button in either selection
+  panel) and **copy/paste** (`Ctrl`/`Cmd`+`C`/`V`, plain JSON on the
+  system clipboard, so it works across rooms and tabs since it only
+  ever mints fresh ids) both deep-copy full `path_props` -- including
+  `transform` and shape fields -- offset by a small delta via
+  `transform`, never by rewriting base geometry. A freehand/polygon
+  path's curve segments (Phase 8, keyed by their anchor's *old* node id)
+  are explicitly remapped onto the copy's *new* node ids; without that
+  remap the copy would silently lose its curves, since none of its
+  fresh ids would match a carried-over `curve:` key.
+- **Delete** (`Delete`/`Backspace`) removes the entire current
+  selection; both it and duplicate reuse the existing per-path
+  `addPath`/`removePath` undo-stack entries rather than inventing a new
+  batch-undo mechanism -- undoing a multi-path move/duplicate/delete
+  takes one Undo click per path, consistent with how every other
+  multi-op action in this codebase already works (there was no
+  batch-undo grouping anywhere before this phase either).
+- **Align** (left/center/right, top/middle/bottom) and **distribute**
+  (3+ paths, horizontal/vertical even spacing) compute a new `tx/ty`
+  per selected path from the group's bounding box, using each path's
+  *transformed* (on-screen) geometry, not its raw stored points.
+- **Object snapping**: while dragging a selection or drawing a new
+  shape, the cursor snaps to endpoints/midpoints/centers of *other*
+  nearby (transformed) geometry, with a small glyph showing what it
+  snapped to (square=endpoint, triangle=midpoint, circle=center) --
+  client-side input assistance only, no CRDT changes, per the brief.
+- **A keyboard shortcut overlay** (`?`) lists every binding above plus
+  the pre-existing pan/zoom/select ones, dismissed by `?` again or a
+  click outside it.
+
+**Export baking** (`bake_path_transform` in `document.py`): SVG/DXF
+have no `transform` concept of their own, so it's applied to plain
+coordinates *only at export time*, mirroring `sketch.js`'s
+`getTransform`/`pathBaseCenter`/`applyPathTransform` math exactly. This
+caught a real bug during verification, not just in code review: a
+naive bake that only translated a rect's `(x, y)` corner and scaled
+`w`/`h` produces the *wrong shape* under rotation, because a rotated
+box simply isn't expressible as an axis-aligned `x/y/w/h` box any more.
+Fixed by having `bake_path_transform` detect a non-zero rotation on a
+Rect or Ellipse specifically and convert it to a plain closed-point
+boundary instead (the rect's 4 actual rotated corners; the ellipse
+sampled at 64 points around its rim) -- both forward-transformed like
+any other point, then exported through the exact same point-list
+fallback path a freehand path already uses. Line, Circle, and Arc never
+need this: a line is just 2 points (any rotation is exact as-is), a
+circle is rotation-invariant, and an arc's rotation is exactly "add
+rotation to both `start_angle`/`end_angle`" -- all three stay native
+shape elements at any transform, confirmed with a dedicated regression
+test (`test_bake_path_transform_rotates_an_arc_exactly_via_its_angles_not_flattening`)
+alongside the ones proving the rect/ellipse fallback actually
+preserves edge lengths (a rotation is rigid -- it must not resize
+anything) rather than just "doesn't crash."
+
 ## Testing
 
 ```bash
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-277 tests: unit tests per CRDT type and geometry module, serialization
+289 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -1072,7 +1176,15 @@ snapshot has no `"settings"` key at all), and 12 across
 element/entity (checked by reading the actual element/`dxftype()` back,
 not just that the file parses) and unit scaling (mm/in coordinate
 scaling, the `$INSUNITS` header variable, and that `units="px"` is
-byte-for-byte identical to the pre-Phase-11 default).
+byte-for-byte identical to the pre-Phase-11 default). Also 12 new
+Phase 12 tests in `tests/test_document.py` for `bake_path_transform`:
+identity/no-op short-circuit, freehand translate and bounding-box-pivot
+rotation, circle/rect/arc scale-and-rotate, curve control points
+transforming alongside their anchor points, and -- the two that caught
+the rotated-rect/ellipse bug described above -- confirming a rotated
+Rect/Ellipse actually flattens to its true rotated boundary (with edge
+lengths preserved, not just "doesn't crash") while an unrotated one and
+a rotated Arc both stay native shape elements as before.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -1170,11 +1282,39 @@ both demos' `loadSnapshot()`/`applyOp()`, so a replica's clock always
 catches up to the highest counter it has seen before minting its next
 local op.
 
+Phase 12's selection editing was verified in one long real-browser
+pass: a rect dragged and rotated 45 degrees (screenshot-confirmed it
+actually renders as a rotated diamond, not just the raw shape at a new
+offset), align-left pulling a far-off circle flush with a rect's left
+edge, shift-click and a marquee drag independently converging on the
+same two-path selection, duplicate/copy/paste creating visibly offset
+copies (confirmed via a "Copied N path(s)"/"Pasted N path(s)" toast,
+not just a silent op count), Delete removing exactly the intended
+selection, and the `?` shortcut overlay opening and closing. This pass
+is what caught the rotated-rect/ellipse export bug described in the
+"Selection editing" section above -- the in-app rendering and
+hit-testing were both already correct (the canvas transform and
+`applyPathTransform` math worked from the first try), so a
+purely-unit-tested `bake_path_transform` looked fine in isolation until
+the actual exported SVG was inspected and turned out to describe an
+axis-aligned box sitting in the wrong place, not the rotated one
+visible on screen -- a reminder that a function can pass every test
+written against its own stated contract while still not doing what the
+*whole system* needs, if nobody checks its output against the thing
+it's supposed to mirror. It also surfaced a test-authoring mistake of
+its own, worth recording alongside Phase 9's `steps=2` one: an early
+verification script tried to drag-move a rectangle starting from a
+point *inside* its interior, which correctly did nothing, since shapes
+are unfilled outlines (Phase 11) and a drag has to *start* on the
+actual boundary stroke to grab the shape at all -- not a bug, but
+exactly the kind of assumption a live run catches that a purely
+hand-reasoned test would not.
+
 ### Committed e2e suite + CI
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (14 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (19 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1207,7 +1347,14 @@ circle's actual boundary stroke (not its unfilled interior -- clicking
 well inside must *not* select it), the numeric panel creating a shape
 with no drag at all, and the `units` document setting (a real CRDT
 setting, unlike Phase 10's deliberately-local view transform) actually
-syncing to a second tab's own dropdown.
+syncing to a second tab's own dropdown; and (Phase 12)
+`test_selection_editing_e2e.py` -- dragging a selected shape's boundary
+actually writes a `transform` (not silently doing nothing), shift-click
+and marquee independently building the same multi-selection,
+align-left equalizing two shapes' left edges via the server's own JSON,
+duplicate-then-Delete round-tripping the path count, and -- the
+regression test for the export bug described below -- a rotated rect's
+SVG export containing a `<path>` polygon and no `<rect>` at all.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

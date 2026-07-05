@@ -74,7 +74,7 @@ from pydantic import BaseModel
 
 from crdt_cad.ai.generator import DEFAULT_ACTOR_ID, generate_mesh_ops
 from crdt_cad.crdt.clock import LamportClock, VectorClock
-from crdt_cad.crdt.document import DocOp, DrawingDocument
+from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
 from crdt_cad.export.dxf_io import drawing_from_dxf_bytes, drawing_to_dxf_bytes
 from crdt_cad.export.step_export import mesh_to_step_bytes
@@ -527,7 +527,8 @@ async def export_drawing_json(room_id: str) -> Response:
 async def export_drawing_svg(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     units = room.doc.settings_dict().get("units", "px")
-    svg = drawing_to_svg_string(room.doc.path_list(), units=units)
+    paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    svg = drawing_to_svg_string(paths, units=units)
     return _attachment(svg, "image/svg+xml", f"{room_id}.svg")
 
 
@@ -535,7 +536,8 @@ async def export_drawing_svg(room_id: str) -> Response:
 async def export_drawing_dxf(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     units = room.doc.settings_dict().get("units", "px")
-    data = drawing_to_dxf_bytes(room.doc.path_list(), units=units)
+    paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    data = drawing_to_dxf_bytes(paths, units=units)
     return _attachment(data, "application/dxf", f"{room_id}.dxf")
 
 
