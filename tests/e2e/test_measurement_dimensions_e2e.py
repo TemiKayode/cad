@@ -29,7 +29,7 @@ def test_measure_distance_is_read_only_and_never_sends_an_op(live_server, browse
     room = "e2e-measure-distance"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -65,7 +65,7 @@ def test_measure_area_and_perimeter_on_a_rect_shape(live_server, browser):
     room = "e2e-measure-area"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -91,7 +91,7 @@ def test_dimension_persists_and_syncs_to_a_second_tab(live_server, browser):
     page_a = browser.new_page()
     page_b = browser.new_page()
     try:
-        page_a.goto(f"{live_server}/?room={room}")
+        page_a.goto(f"{live_server}/2d?room={room}")
         page_a.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page_a.locator("#canvas")
         box = canvas.bounding_box()
@@ -109,7 +109,7 @@ def test_dimension_persists_and_syncs_to_a_second_tab(live_server, browser):
         doc = json.loads(resp.text())
         assert len(doc["dimensions"]["entries"]) == 1
 
-        page_b.goto(f"{live_server}/?room={room}")
+        page_b.goto(f"{live_server}/2d?room={room}")
         page_b.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         page_b.wait_for_function(
             "document.querySelectorAll('#dimensionList .path-row').length === 1", timeout=5000
@@ -130,7 +130,7 @@ def test_dimension_auto_updates_after_its_anchor_point_moves_via_a_constraint(li
     room = "e2e-dimension-autoupdate"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -177,7 +177,7 @@ def test_dimension_export_contains_a_real_dxf_dimension_entity_and_svg_group(liv
     room = "e2e-dimension-export"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()

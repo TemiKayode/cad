@@ -9,6 +9,12 @@ const room = new URLSearchParams(location.search).get("room") || "demo";
 document.getElementById("roomInput").value = room;
 document.getElementById("actorLabel").textContent = `${actorName} (${actorId})`;
 
+// Phase 17 read-only share links: true once the server's own snapshot/delta
+// reply says this connection is a "viewer" (see RelayConnection's onRole) --
+// gates the canvas pointerdown handler further down so a viewer can pan/zoom
+// but never start an edit gesture.
+let viewerMode = false;
+
 const clock = new LocalClock(actorId);
 const rid = () => Math.random().toString(36).slice(2, 10);
 
@@ -368,6 +374,9 @@ let conn, p2p;
     },
     onSaved: () => showToast("Saved", "success"),
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeDocOps, proceed),
+    onRole: (role) => {
+      viewerMode = applyViewerModeUI(role);
+    },
     token,
     kind: "drawing",
     room,
@@ -393,6 +402,17 @@ function updateP2pPill() {
 }
 
 function sendOps(ops) {
+  if (viewerMode) {
+    // Robust chokepoint: every mutating code path in this file (tool
+    // gestures, keyboard shortcuts, bulk-action buttons, import, AI
+    // generate) funnels through this one function before anything is
+    // transmitted -- gating here (rather than only at each call site)
+    // is what guarantees a viewer's optimistic local edit never leaks
+    // out over *either* channel, including the direct WebRTC P2P path
+    // conn.send()'s own viewer guard can't see at all.
+    console.warn("sendOps() called while connected as a read-only viewer -- dropped, not sent");
+    return;
+  }
   ui.opsCount += ops.length;
   conn.send(ops);
   if (!conn.userWantsOffline) p2p.broadcastOps(ops);
@@ -528,7 +548,7 @@ document.getElementById("importFileInput").addEventListener("change", async (e) 
 });
 
 document.getElementById("shareBtn").onclick = async () => {
-  let url = `${location.origin}/?room=${encodeURIComponent(room)}`;
+  let url = `${location.origin}/2d?room=${encodeURIComponent(room)}`;
   const token = roomTokenFor("drawing", room);
   if (token) url += `&token=${encodeURIComponent(token)}`;
   try {
@@ -537,6 +557,43 @@ document.getElementById("shareBtn").onclick = async () => {
   } catch (err) {
     showToast(url, "info");
   }
+};
+
+document.getElementById("shareViewOnlyBtn").onclick = async () => {
+  // Phase 17: mints a fresh viewer-role token via the dedicated share-link
+  // endpoint (needs *editor* access to this room, so a viewer can't mint
+  // themselves -- or anyone else -- an escalated link) and copies an
+  // invite URL carrying it, instead of the current session's own token
+  // (which is whatever role this browser already holds).
+  try {
+    const resp = await fetch(withToken(`/api/rooms/${encodeURIComponent(room)}/share-link`, "drawing", room), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: "viewer" }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    const { token } = await resp.json();
+    const url = `${location.origin}/2d?room=${encodeURIComponent(room)}&token=${encodeURIComponent(token)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast("Read-only invite link copied to clipboard", "success");
+    } catch {
+      showToast(url, "info");
+    }
+  } catch (err) {
+    showToast(`Could not create a view-only link: ${err.message}`, "error");
+  }
+};
+
+document.getElementById("renameActorBtn").onclick = () => {
+  const next = window.prompt("Your display name (shown to collaborators):", actorName);
+  const updated = setActorName(next);
+  if (!updated) return;
+  actorName = updated;
+  document.getElementById("actorLabel").textContent = `${actorName} (${actorId})`;
 };
 
 // -- local mutation helpers (mirrors crdt_cad.crdt.document.DrawingDocument) ---
@@ -780,6 +837,7 @@ canvas.addEventListener("pointerdown", (e) => {
     canvas.style.cursor = "grabbing";
     return;
   }
+  if (viewerMode) return; // Phase 17: a read-only viewer can pan/zoom/inspect but never start an edit gesture
   if (isShapeTool(ui.tool)) {
     const { point: pt, glyph } = resolveSnapPoint(worldPoint(e), new Set());
     activeSnapGlyph = glyph;

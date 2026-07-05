@@ -29,7 +29,7 @@ def test_applying_a_constraint_persists_it_as_real_document_state(live_server, b
     room = "e2e-constraint-persist"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -64,7 +64,7 @@ def test_undo_reverts_a_constraint_driven_point_move(live_server, browser):
     room = "e2e-constraint-undo"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -99,7 +99,7 @@ def test_tangent_constraint_picks_a_circle_shape_and_persists(live_server, brows
     room = "e2e-constraint-tangent"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -131,7 +131,7 @@ def test_dragging_a_constrained_point_resolves_on_release_without_duplicating(li
     room = "e2e-constraint-drag-resolve"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()

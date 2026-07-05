@@ -18,8 +18,15 @@ Client -> server, first frame after connecting::
 
 Server -> client, in reply to ``hello``::
 
-    {"type": "snapshot", "doc": {...}, "frontier": {...}}          # new client
-    {"type": "delta", "ops": [...], "frontier": {...}}             # reconnect
+    {"type": "snapshot", "doc": {...}, "frontier": {...}, "role": "editor"}  # new client
+    {"type": "delta", "ops": [...], "frontier": {...}, "role": "editor"}     # reconnect
+
+``role`` (Phase 17) is ``"editor"`` (full read/write, and the only role
+that ever existed before this) or ``"viewer"`` (read-only -- see
+``crdt_cad.server.security.token_role``): a viewer still receives every
+snapshot/delta/ops/frontier message normally, but any ``"ops"`` message
+*it* submits is refused (see the ``"rejected"`` reply below). Always
+``"editor"`` when room auth isn't configured at all.
 
 Either direction, at any time afterwards::
 
@@ -63,6 +70,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -92,6 +100,7 @@ logger = logging.getLogger("crdt_cad.server")
 logging.basicConfig(level=logging.INFO)
 
 SNAPSHOT_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_SNAPSHOT_INTERVAL_SECONDS", "30"))
+VERSION_CHECKPOINT_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_VERSION_CHECKPOINT_INTERVAL_SECONDS", "300"))
 GENERATION_TIMEOUT_SECONDS = float(os.environ.get("CRDT_CAD_GENERATION_TIMEOUT_SECONDS", "60"))
 GENERATION_OPS_BATCH_SIZE = int(os.environ.get("CRDT_CAD_GENERATION_BATCH_SIZE", "150"))
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -157,13 +166,21 @@ class Room:
             self.doc = doc_class(self.clock)
 
         self.clients: dict[str, WebSocket] = {}
+        # Phase 17: each connected actor's role ("editor" or "viewer"),
+        # keyed the same as `clients` -- populated in `_serve_room` from
+        # the "hello" token, consulted in `_handle_message` to reject an
+        # `ops` message from a read-only viewer connection.
+        self.client_roles: dict[str, str] = {}
         self._snapshot_task: asyncio.Task | None = None
         self._redis_task: asyncio.Task | None = None
         self._dirty_since_snapshot = False
+        self._dirty_since_version = False
+        self._last_version_checkpoint = time.monotonic()
         self.ops_rate_limiter = security.new_room_ops_bucket()
 
     def mark_dirty(self) -> None:
         self._dirty_since_snapshot = True
+        self._dirty_since_version = True
 
     def persist(self) -> None:
         self.store.save(self.kind, self.room_id, self.doc.to_bytes())
@@ -177,6 +194,25 @@ class Room:
         for the default thread pool to drain). Persistence is fast
         (SQLite/in-memory), so awaiting it adds negligible latency."""
         await asyncio.to_thread(self.persist)
+
+    def checkpoint_version(self) -> None:
+        """Phase 17 (version history): appends an immutable checkpoint
+        snapshot -- distinct from `persist()`'s single overwritten "latest"
+        row -- pruned to `security.max_versions_per_room()`. Deliberately
+        *not* called from every `persist()` (which fires after nearly
+        every accepted ops batch, i.e. on every drag tick): that would
+        make "version history" indistinguishable from "every keystroke,"
+        defeating the point. Instead this is called at a much coarser
+        cadence -- see `_snapshot_loop` (periodic, every
+        `VERSION_CHECKPOINT_INTERVAL_SECONDS`, only when something
+        actually changed) and the explicit `"save"` message handler
+        (an intentional user checkpoint, regardless of the timer)."""
+        self.store.save_version(self.kind, self.room_id, self.doc.to_bytes(), keep=security.max_versions_per_room())
+
+    async def checkpoint_version_async(self) -> None:
+        await asyncio.to_thread(self.checkpoint_version)
+        self._dirty_since_version = False
+        self._last_version_checkpoint = time.monotonic()
 
     def start_snapshot_loop(self) -> None:
         if self._snapshot_task is None or self._snapshot_task.done():
@@ -210,11 +246,22 @@ class Room:
                     # outright (no known frontier yet).
                     await self.broadcast({"type": "frontier", "frontier": self.doc.frontier().to_dict()})
                     self._dirty_since_snapshot = False
+                if (
+                    self.clients
+                    and self._dirty_since_version
+                    and (time.monotonic() - self._last_version_checkpoint) >= VERSION_CHECKPOINT_INTERVAL_SECONDS
+                ):
+                    await self.checkpoint_version_async()
         except asyncio.CancelledError:
             pass
 
-    def snapshot_message(self) -> dict:
-        return {"type": "snapshot", "doc": self.doc.to_dict(), "frontier": self.doc.frontier().to_dict()}
+    def snapshot_message(self, role: str = "editor") -> dict:
+        """`role` (Phase 17) tells *this* connecting client whether it's a
+        full editor or a read-only viewer -- see the "role" field in the
+        WS protocol docstring above. Defaults to "editor" so every
+        internal call site that doesn't care about a specific actor (e.g.
+        tests constructing a snapshot directly) keeps today's behavior."""
+        return {"type": "snapshot", "doc": self.doc.to_dict(), "frontier": self.doc.frontier().to_dict(), "role": role}
 
     def _redis_channel(self) -> str:
         return f"room:{self.kind}:{self.room_id}"
@@ -401,7 +448,15 @@ if DEMO_STATIC_DIR.exists():
 
 
 @app.get("/")
-async def index() -> FileResponse:
+async def home() -> FileResponse:
+    """Phase 17: the workspace home page -- lists existing rooms (both
+    kinds) via `DocumentStore.list_rooms_detailed`. The 2D demo itself
+    moved to `/2d` to make room for this; `/3d` is unchanged."""
+    return FileResponse(str(DEMO_STATIC_DIR / "home.html"))
+
+
+@app.get("/2d")
+async def index_2d() -> FileResponse:
     return FileResponse(str(DEMO_STATIC_DIR / "index.html"))
 
 
@@ -495,13 +550,207 @@ def require_room_access(kind: str):
     a valid room token -- a no-op (always passes) when
     ``CRDT_CAD_SECRET`` isn't configured, matching every other auth check
     in this module. FastAPI binds the returned callable's ``room_id``
-    parameter from the route's own path parameter automatically."""
+    parameter from the route's own path parameter automatically. Accepts
+    *either* role (editor or viewer) -- read-only endpoints (export,
+    thumbnail, version history) use this; endpoints that mutate the room
+    use :func:`require_editor_access` instead."""
 
     async def _dep(room_id: str, request: Request) -> None:
         if not security.verify_room_token(_extract_token(request), kind, room_id):
             raise HTTPException(status_code=401, detail="missing or invalid room token")
 
     return _dep
+
+
+def require_editor_access(kind: str):
+    """Like :func:`require_room_access`, but additionally refuses a
+    verified **viewer**-role token (403) -- for REST endpoints that
+    mutate a room (import, generate, rename, restore, minting further
+    share links), so a read-only share link recipient can't bypass the
+    WS-level ops rejection (Phase 17) just by calling these directly."""
+
+    async def _dep(room_id: str, request: Request) -> None:
+        token = _extract_token(request)
+        if not security.verify_room_token(token, kind, room_id):
+            raise HTTPException(status_code=401, detail="missing or invalid room token")
+        if security.token_role(token, kind, room_id) == "viewer":
+            raise HTTPException(status_code=403, detail="editor access required -- this token is read-only")
+
+    return _dep
+
+
+# ---------------------------------------------------------------------------
+# Workspace: rooms as projects (Phase 17)
+# ---------------------------------------------------------------------------
+
+
+class RoomSummary(BaseModel):
+    kind: str  # "drawing" | "mesh"
+    room_id: str
+    display_name: Optional[str] = None
+    updated_at: float
+
+
+@app.get("/api/workspace/rooms", response_model=list[RoomSummary])
+async def list_workspace_rooms() -> list[RoomSummary]:
+    """Backs the home page's room list. Deliberately ungated by any room
+    token -- like the pre-existing `/api/rooms`/`/api/mesh-rooms`, a room
+    id/kind/last-modified time isn't itself scoped to one room the way
+    its *contents* are, so there's nothing here for `require_room_access`
+    to check against. When auth is enabled, this still means every
+    room's existence and last-modified time is visible workspace-wide;
+    its content, thumbnail, and rename action remain individually
+    token-gated (see below) -- documented in the README as an accepted,
+    honest scope boundary, not a silent gap."""
+    rows = [RoomSummary(kind=kind, **row) for kind in ("drawing", "mesh") for row in store.list_rooms_detailed(kind)]
+    rows.sort(key=lambda r: r.updated_at, reverse=True)
+    return rows
+
+
+class RenameRequest(BaseModel):
+    display_name: str
+
+
+async def _rename_room(kind: str, room_id: str, display_name: str) -> None:
+    if not store.set_display_name(kind, room_id, display_name.strip()):
+        raise HTTPException(status_code=404, detail="room not found")
+
+
+@app.post("/api/rooms/{room_id}/rename", dependencies=[Depends(require_editor_access("drawing"))])
+async def rename_drawing_room(room_id: str, req: RenameRequest) -> dict:
+    await _rename_room("drawing", room_id, req.display_name)
+    return {"ok": True}
+
+
+@app.post("/api/mesh/{room_id}/rename", dependencies=[Depends(require_editor_access("mesh"))])
+async def rename_mesh_room(room_id: str, req: RenameRequest) -> dict:
+    await _rename_room("mesh", room_id, req.display_name)
+    return {"ok": True}
+
+
+@app.get("/api/rooms/{room_id}/thumbnail.svg", dependencies=[Depends(require_room_access("drawing"))])
+async def drawing_thumbnail(room_id: str) -> Response:
+    """2D rooms get a real server-rendered thumbnail -- exactly the same
+    SVG the export button produces, just displayed small by the home
+    page's own CSS, not a separate rendering path to keep in sync. 3D
+    rooms deliberately get a static placeholder icon instead (see
+    home.js) -- the brief explicitly allows this, and a real 3D preview
+    would need either an offscreen Three.js render (a second renderer to
+    maintain) or a client-captured-on-save screenshot (a new upload path)
+    for comparatively little payoff for a home-page icon."""
+    room = await drawing_room_manager.get_or_create(room_id)
+    units = room.doc.settings_dict().get("units", "px")
+    paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    layer_order = [layer["id"] for layer in room.doc.layer_list()]
+    svg = drawing_to_svg_string(paths, units=units, dimensions=room.doc.dimension_list(), layer_order=layer_order)
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+# -- version history ---------------------------------------------------------
+
+
+class VersionSummary(BaseModel):
+    version_id: int
+    created_at: float
+
+
+class RestoreResult(BaseModel):
+    new_room_id: str
+
+
+async def _list_versions(kind: str, room_id: str) -> list[VersionSummary]:
+    return [VersionSummary(**v) for v in store.list_versions(kind, room_id)]
+
+
+async def _restore_version(kind: str, room_id: str, version_id: int) -> RestoreResult:
+    """Forks `version_id` into a brand-new room rather than overwriting
+    `room_id` in place -- the brief's own reasoning, restated here: a
+    live room's causal history (its CRDT ops/frontier) can't be rewound
+    without breaking convergence for anyone still connected to it or
+    reconnecting later, so "restore" instead means "create a new room
+    whose *starting* snapshot is that old version" -- always safe, since
+    it never touches `room_id`'s own persisted state or in-memory Room at
+    all. An "advanced restore in place" via generated inverse ops (the
+    brief's optional stretch) was not attempted -- see the README for why
+    (there's no general way to invert an arbitrary historical diff back
+    through RGA/LWW's normal op path for every op kind this document
+    supports, so it would need its own bespoke, unverified merge logic --
+    exactly the kind of unverifiable feature this project avoids shipping)."""
+    data = store.load_version(kind, room_id, version_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="version not found")
+    new_room_id = f"{room_id}-restored-{uuid.uuid4().hex[:8]}"
+    store.save(kind, new_room_id, data)
+    return RestoreResult(new_room_id=new_room_id)
+
+
+@app.get("/api/rooms/{room_id}/versions", response_model=list[VersionSummary], dependencies=[Depends(require_room_access("drawing"))])
+async def list_drawing_versions(room_id: str) -> list[VersionSummary]:
+    return await _list_versions("drawing", room_id)
+
+
+@app.get("/api/mesh/{room_id}/versions", response_model=list[VersionSummary], dependencies=[Depends(require_room_access("mesh"))])
+async def list_mesh_versions(room_id: str) -> list[VersionSummary]:
+    return await _list_versions("mesh", room_id)
+
+
+@app.post(
+    "/api/rooms/{room_id}/versions/{version_id}/restore",
+    response_model=RestoreResult,
+    dependencies=[Depends(require_editor_access("drawing"))],
+)
+async def restore_drawing_version(room_id: str, version_id: int) -> RestoreResult:
+    return await _restore_version("drawing", room_id, version_id)
+
+
+@app.post(
+    "/api/mesh/{room_id}/versions/{version_id}/restore",
+    response_model=RestoreResult,
+    dependencies=[Depends(require_editor_access("mesh"))],
+)
+async def restore_mesh_version(room_id: str, version_id: int) -> RestoreResult:
+    return await _restore_version("mesh", room_id, version_id)
+
+
+# -- read-only share links ----------------------------------------------------
+
+
+class ShareLinkRequest(BaseModel):
+    role: str = "viewer"  # "viewer" | "editor"
+
+
+class ShareLinkResponse(BaseModel):
+    token: str
+    role: str
+
+
+async def _create_share_link(kind: str, room_id: str, role: str) -> ShareLinkResponse:
+    if not security.auth_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="read-only share links need CRDT_CAD_SECRET configured on this server",
+        )
+    if role not in ("viewer", "editor"):
+        raise HTTPException(status_code=400, detail="role must be 'viewer' or 'editor'")
+    return ShareLinkResponse(token=security.mint_room_token(kind, room_id, role=role), role=role)
+
+
+@app.post(
+    "/api/rooms/{room_id}/share-link",
+    response_model=ShareLinkResponse,
+    dependencies=[Depends(require_editor_access("drawing"))],
+)
+async def create_drawing_share_link(room_id: str, req: ShareLinkRequest) -> ShareLinkResponse:
+    return await _create_share_link("drawing", room_id, req.role)
+
+
+@app.post(
+    "/api/mesh/{room_id}/share-link",
+    response_model=ShareLinkResponse,
+    dependencies=[Depends(require_editor_access("mesh"))],
+)
+async def create_mesh_share_link(room_id: str, req: ShareLinkRequest) -> ShareLinkResponse:
+    return await _create_share_link("mesh", room_id, req.role)
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +821,7 @@ async def _import_paths(room_id: str, paths: list[dict], layer_name: str) -> Imp
     return ImportResult(layer_id=layer_id, path_count=count)
 
 
-@app.post("/api/rooms/{room_id}/import/svg", response_model=ImportResult, dependencies=[Depends(require_room_access("drawing"))])
+@app.post("/api/rooms/{room_id}/import/svg", response_model=ImportResult, dependencies=[Depends(require_editor_access("drawing"))])
 async def import_drawing_svg(room_id: str, request: Request) -> ImportResult:
     body = await request.body()
     try:
@@ -582,7 +831,7 @@ async def import_drawing_svg(room_id: str, request: Request) -> ImportResult:
     return await _import_paths(room_id, paths, "Imported SVG")
 
 
-@app.post("/api/rooms/{room_id}/import/dxf", response_model=ImportResult, dependencies=[Depends(require_room_access("drawing"))])
+@app.post("/api/rooms/{room_id}/import/dxf", response_model=ImportResult, dependencies=[Depends(require_editor_access("drawing"))])
 async def import_drawing_dxf(room_id: str, request: Request) -> ImportResult:
     body = await request.body()
     try:
@@ -654,7 +903,7 @@ class GenerateMeshResult(BaseModel):
 @app.post(
     "/api/mesh/{room_id}/generate",
     response_model=GenerateMeshResult,
-    dependencies=[Depends(require_room_access("mesh"))],
+    dependencies=[Depends(require_editor_access("mesh"))],
 )
 async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request) -> GenerateMeshResult:
     """Text -> 3D: interprets ``req.prompt`` into a :class:`HouseSpec`
@@ -830,11 +1079,15 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
         return
 
     actor = str(hello["actor"])
+    role = security.token_role(hello.get("token"), manager.kind, room_id) or "editor"
     room.clients[actor] = websocket
+    room.client_roles[actor] = role
     room.start_snapshot_loop()
     room.start_redis_relay_loop()
     metrics.connections_total.inc()
-    logger.info("room %s/%s: actor %s connected (%d clients)", room.kind, room_id, actor, len(room.clients))
+    logger.info(
+        "room %s/%s: actor %s connected as %s (%d clients)", room.kind, room_id, actor, role, len(room.clients)
+    )
 
     known_frontier = hello.get("known_frontier")
     if known_frontier:
@@ -845,11 +1098,12 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
                 "type": "delta",
                 "ops": [op.to_dict() for op in delta],
                 "frontier": room.doc.frontier().to_dict(),
+                "role": role,
             }
         )
         logger.info("room %s/%s: sent %d-op reconnect delta to %s", room.kind, room_id, len(delta), actor)
     else:
-        await websocket.send_json(room.snapshot_message())
+        await websocket.send_json(room.snapshot_message(role))
 
     ops_bucket = security.new_ws_ops_bucket()
 
@@ -870,6 +1124,7 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
         logger.exception("room %s/%s: error handling messages from %s", room.kind, room_id, actor)
     finally:
         room.clients.pop(actor, None)
+        room.client_roles.pop(actor, None)
         metrics.active_connections.dec()
         logger.info(
             "room %s/%s: actor %s disconnected (%d clients left)",
@@ -975,6 +1230,12 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
 
     if msg_type == "save":
         await room.persist_async()
+        # An explicit user-initiated save is exactly the kind of
+        # intentional checkpoint version history should capture, so it
+        # takes one immediately instead of waiting for the next periodic
+        # tick -- see checkpoint_version's docstring for why persist()
+        # itself doesn't do this on every call.
+        await room.checkpoint_version_async()
         ws = room.clients.get(actor)
         if ws is not None:
             await ws.send_json({"type": "saved", "at": time.time()})
@@ -990,17 +1251,35 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
         if ws is None:
             return
         known_frontier = message.get("known_frontier")
+        role = room.client_roles.get(actor, "editor")
         if not known_frontier:
-            await ws.send_json(room.snapshot_message())
+            await ws.send_json(room.snapshot_message(role))
             return
         vc = VectorClock.from_dict(known_frontier)
         delta = room.doc.ops_since(vc)
         await ws.send_json(
-            {"type": "delta", "ops": [op.to_dict() for op in delta], "frontier": room.doc.frontier().to_dict()}
+            {
+                "type": "delta",
+                "ops": [op.to_dict() for op in delta],
+                "frontier": room.doc.frontier().to_dict(),
+                "role": role,
+            }
         )
         return
 
     if msg_type != "ops":
+        return
+
+    if room.client_roles.get(actor) == "viewer":
+        # Phase 17 read-only share links: a viewer-role connection still
+        # receives every snapshot/delta/ops broadcast normally (so it can
+        # render the live document), but anything *it* submits as an edit
+        # is refused here, server-side -- the UI also hides editing tools
+        # and shows a "view only" badge (see mesh3d.js/sketch.js), but
+        # that's a courtesy, not the actual enforcement boundary.
+        ws = room.clients.get(actor)
+        if ws is not None:
+            await ws.send_json({"type": "rejected", "reason": "connected as a read-only viewer -- editing is disabled"})
         return
 
     ops_wire = message.get("ops", [])

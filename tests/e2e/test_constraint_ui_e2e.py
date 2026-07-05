@@ -30,8 +30,8 @@ def test_coincident_constraint_converges_points_and_syncs_to_a_second_tab(live_s
     page_a = browser.new_page()
     page_b = browser.new_page()
     try:
-        page_a.goto(f"{live_server}/?room={room}")
-        page_b.goto(f"{live_server}/?room={room}")
+        page_a.goto(f"{live_server}/2d?room={room}")
+        page_b.goto(f"{live_server}/2d?room={room}")
         page_a.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         page_b.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 

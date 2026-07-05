@@ -40,6 +40,7 @@ over gaps.
 | Persistent sketch constraints, tangent, re-solve-on-drag (Phase 14) | **Done** -- new `constraints` document component, `movePathPoint` now undoable and remaps both dimensions and constraints onto a moved point's new node id, see below |
 | Designer features: text, fills, stroke styles, groups, PNG export (Phase 15) | **Done** -- new `groups` component, filled shapes now hit-test their interior (not just the boundary), real z-order (layer then creation order) fixed both client- and server-side, see below |
 | 3D usability: parametric primitives, snapping, axis-aligned views (Phase 16) | **Done** -- Box/Cylinder/Pyramid/Plane built from the same batched-op/composite-undo idiom as `extrudeFace`, no new CRDT machinery; view buttons reposition the existing perspective camera (not a true orthographic swap, see below) |
+| Workspace: home page, version history, read-only share links, display names (Phase 17) | **Done** -- rooms are no longer bare URLs to remember: a home page lists/renames them with a real thumbnail, restore forks a version into a new room (never rewrites live history), and viewer-role tokens are enforced server-side at both the WS and REST layer, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -53,7 +54,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 38 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 44 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -68,7 +69,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 328 tests, ~15s
+./.venv/Scripts/python -m pytest tests/ -v   # 371 tests, ~25s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -88,14 +89,16 @@ behavior when omitted.
 docker compose up --build
 ```
 
-Either way, open two browser tabs:
+Either way, start at the workspace home page, which lists every room
+that's ever been saved (Phase 17 -- see below):
 
-- `http://127.0.0.1:8000/` -- 2D sketch demo
+- `http://127.0.0.1:8000/` -- workspace home (room list, rename, history)
+- `http://127.0.0.1:8000/2d` -- 2D sketch demo
 - `http://127.0.0.1:8000/3d` -- 3D mesh demo
 
-Both tabs on the same `?room=` name see each other's edits live (over a
-direct WebRTC data channel when negotiation succeeds, and always over
-the WebSocket relay too). Click **"Go offline"** in one tab, keep
+Open two browser tabs on the same `/2d?room=` or `/3d?room=` name to see
+each other's edits live (over a direct WebRTC data channel when
+negotiation succeeds, and always over the WebSocket relay too). Click **"Go offline"** in one tab, keep
 editing, then click it again to reconnect -- if the other tab also
 changed something while you were away, a **Time-Travel Merge** panel
 shows both branches before merging; otherwise it merges instantly.
@@ -825,14 +828,23 @@ rate-limit test that (accidentally, at first) sent a payload missing its
 geometry-invalid op is (see `test_malformed_op_is_rejected_cleanly...`
 in `tests/test_security.py`).
 
-## The two demos
+## The home page and the two demos
 
-Both are plain HTML/CSS/vanilla-JS (`demo/static/`) -- no build step, no
-npm project. The 3D demo additionally loads Three.js + OrbitControls
-from a CDN via an import map (the only external runtime dependency
-either frontend has).
+All three pages are plain HTML/CSS/vanilla-JS (`demo/static/`) -- no
+build step, no npm project. The 3D demo additionally loads Three.js +
+OrbitControls from a CDN via an import map (the only external runtime
+dependency any of the three frontends has).
 
-**2D sketch (`/`)**: pen tool, a **select** tool with multi-select
+**Workspace home (`/`, Phase 17 -- see below)**: lists every room
+that's ever been saved, each with a kind badge (2D/3D), a real
+server-rendered SVG thumbnail for 2D rooms (a static placeholder icon
+for 3D), last-modified time, **Rename**, and **History** (lists
+checkpoint snapshots with a one-click **Restore**, which forks the
+chosen version into a brand-new room rather than rewriting the live
+one -- see "Workspace" below for why). "New 2D drawing"/"New 3D mesh"
+buttons prompt for a room name and open straight into it.
+
+**2D sketch (`/2d`)**: pen tool, a **select** tool with multi-select
 (shift-click/marquee), move/rotate/scale, duplicate, copy/paste,
 align/distribute, and object snapping (Phase 12 -- see below), a strict
 **Polygon** tool that demonstrates the geometry validity gate,
@@ -850,9 +862,13 @@ opacity**/**stroke style** (solid/dashed/dotted), and **Group**/
 **Ungroup** for multi-selections (Phase 15 -- see below), per-layer
 visibility, undo/redo, live multi-user cursors, comments,
 **Save**/**.json/.svg/.dxf/.png download**/**Import SVG or DXF**/
-**Share** (copies an invite link), a keyboard shortcut overlay (`?`),
-and an offline toggle that closes both the WebSocket and any P2P
-connection.
+**Share** (copies a full-access invite link) and **View-only link**
+(Phase 17 -- copies a read-only one instead, see below), a keyboard
+shortcut overlay (`?`), a display-name **✎** button next to the actor
+label in the status bar (Phase 17 -- prompts for a name, persisted in
+`localStorage`, fed into presence/comments the same way the randomly-
+generated "Guest ###" default always was), and an offline toggle that
+closes both the WebSocket and any P2P connection.
 
 **3D mesh (`/3d`)**: click the ground grid to place vertices, click 3+
 vertices in order (then the first one again, or "Finish") to build a
@@ -861,17 +877,17 @@ list), select a face to **recolor it, tag its material, extrude it
 into a prism, or delete it**, **Undo/Redo** buttons and Ctrl+Z/Ctrl+Y
 (or Ctrl+Shift+Z) for every one of those actions -- extrude included,
 as one bundled undo step -- the same **Save**/download(**.json/.stl**)/**Share**/
-offline toggle set, plus an **AI Generate** box -- describe a house in
-plain English and a real procedurally-built mesh streams into the scene
-as CRDT ops, exactly like any other collaborator's edit. **Box**/
-**Cylinder**/**Pyramid**/**Plane** parametric primitive tools (Phase
-16 -- see below) drop a fully-formed shape with one click, a **Snap**
-toggle for grid- and vertex-snapped placement/dragging, and
-**Top**/**Front**/**Right**/**Persp.** view buttons for quickly
-squaring up the camera. Every one of these -- including a face's color
-and material -- is a `face_prop` `LWWMap` write, so recoloring a face
-you didn't create merges the same conflict-free way a vertex move
-does.
+**View-only link**/display-name/offline toggle set as the 2D demo,
+plus an **AI Generate** box -- describe a house in plain English and a
+real procedurally-built mesh streams into the scene as CRDT ops,
+exactly like any other collaborator's edit. **Box**/**Cylinder**/
+**Pyramid**/**Plane** parametric primitive tools (Phase 16 -- see
+below) drop a fully-formed shape with one click, a **Snap** toggle for
+grid- and vertex-snapped placement/dragging, and **Top**/**Front**/
+**Right**/**Persp.** view buttons for quickly squaring up the camera.
+Every one of these -- including a face's color and material -- is a
+`face_prop` `LWWMap` write, so recoloring a face you didn't create
+merges the same conflict-free way a vertex move does.
 
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
@@ -1381,13 +1397,126 @@ undo/redo handling either.
   below), since every behavior here -- primitive topology, snapping,
   camera framing -- only exists in the client.
 
+## Workspace: rooms as projects (Phase 17)
+
+The final phase of the brief: rooms stop being bare URLs you have to
+remember and start being a real workspace -- a home page, version
+history, read-only share links, and proper display names. Every piece
+here builds on machinery that already existed (`DocumentStore`, the
+Phase 1 signed room tokens, `Room`'s own persist cycle) rather than
+inventing new infrastructure.
+
+- **Home page** (`/`, moving the 2D demo to `/2d`): `GET
+  /api/workspace/rooms` lists every room across both kinds via a new
+  `DocumentStore.list_rooms_detailed()`, sorted newest-first. Each card
+  shows a kind badge, last-modified time, **Rename**, and **History**.
+  2D rooms get a real thumbnail -- `GET /api/rooms/{id}/thumbnail.svg`
+  reuses the *exact same* `drawing_to_svg_string` export path the
+  `.svg` download button already calls, just rendered small by CSS, so
+  there's no second rendering path to keep in sync. 3D rooms get a
+  static placeholder icon instead -- the brief explicitly allows this,
+  and a real 3D preview would need either an offscreen Three.js
+  renderer (a second render path to maintain) or a client-captured-on-
+  save screenshot (a new upload endpoint) for comparatively little
+  payoff for a home-page icon.
+- **Display names**: `getOrCreateActorName()` (localStorage-persisted)
+  already existed and already fed presence/comments -- what was
+  actually missing, per the brief, was a "proper name prompt": before
+  this phase there was no UI to ever change the randomly-generated
+  "Guest ###" default. A **✎** button next to the actor label now
+  prompts for a name and updates it immediately, including for anyone
+  already watching this actor's presence.
+- **Version history**: a new `room_versions` table (SQLite/Postgres;
+  `InMemoryStore` mirrors it with a plain list) holds immutable
+  checkpoint snapshots, separate from the existing `documents` table's
+  single overwritten "latest" row used for hydration -- `Room.
+  checkpoint_version` writes one, pruned to `CRDT_CAD_MAX_VERSIONS_PER_ROOM`
+  (default 20). Deliberately **not** taken on every `persist()` call
+  (which fires after nearly every accepted ops batch -- i.e. on every
+  drag tick): that would make "version history" indistinguishable from
+  "every keystroke." Instead a checkpoint is taken at a much coarser,
+  independent cadence -- periodically (`CRDT_CAD_VERSION_CHECKPOINT_INTERVAL_SECONDS`,
+  default 300s, only when something actually changed since the last
+  one) and immediately on an explicit **Save**/Ctrl+S, which is exactly
+  the kind of intentional checkpoint a user expects to be able to
+  return to.
+- **Restore forks, it doesn't rewrite**: clicking **Restore** on a
+  version calls `POST /api/rooms/{id}/versions/{version_id}/restore`,
+  which loads that version's bytes and saves them under a brand-new
+  room id (`{id}-restored-{8 hex chars}`) -- the *original* room's own
+  persisted state and in-memory `Room` are never touched. This is the
+  brief's own reasoning, not a shortcut: a live room's causal history
+  (its CRDT ops/frontier) can't be rewound in place without breaking
+  convergence for anyone still connected to it or reconnecting later,
+  so "restore" has to mean "start a new room from this old state,"
+  not "make the old room's state current again." An advanced "restore
+  in place via generated inverse ops" (the brief's own explicitly
+  optional stretch, gated on "if and only if it can be done through
+  the normal op path") was not attempted: there's no general way to
+  invert an arbitrary historical diff back through RGA/LWW's normal op
+  path for every op kind this document supports without inventing a
+  bespoke, unverified merge strategy of its own -- exactly the kind of
+  unverifiable feature this project avoids shipping, so it's documented
+  here rather than half-built.
+- **Read-only share links**: `mint_room_token`/`verify_room_token`
+  (Part 1 Phase 1) gain a `role: "editor" | "viewer"` claim (a token
+  with no `"role"` key -- i.e. every token minted before this phase --
+  defaults to `"editor"`, so nothing pre-existing loses access). A new
+  `POST /api/rooms/{id}/share-link` endpoint mints a token of either
+  role, gated behind **editor** access itself (a viewer can't mint
+  themselves, or anyone else, an escalated link -- confirmed by a
+  dedicated test). The role travels to the client for real: the
+  server's own `snapshot`/`delta` WS replies now carry a `"role"`
+  field, so the client never decides its own permission level.
+  Enforcement is layered:
+  - **Server, the actual boundary**: a viewer-role WS connection still
+    receives every snapshot/delta/ops/frontier message normally (full
+    read access), but `_handle_message` refuses any `"ops"` message
+    *from* it outright, before touching the document -- confirmed via a
+    hand-crafted viewer WS sending ops in `tests/test_workspace.py`,
+    per the brief's explicit "test the enforcement server-side" ask.
+    The same viewer-role check also gates the REST endpoints that
+    mutate a room (import, AI generate, rename, restore, minting
+    further share links) via a new `require_editor_access` dependency,
+    not just the WS ops path -- otherwise a "read-only" link's holder
+    could bypass the WS restriction by calling those endpoints
+    directly.
+  - **Client, the UX**: `applyViewerModeUI` (`common.js`) dims and
+    disables (`pointer-events: none`) the entire left toolbar except
+    Save/downloads, and shows a "view only" badge. The canvas
+    `pointerdown` handler in both demos also checks `viewerMode`
+    directly, so a viewer can still pan/zoom/orbit but can never start
+    an edit gesture regardless of which tool is nominally selected.
+    `RelayConnection.send()`/`sendOps()` carry their own redundant
+    guard on top of that (belt-and-suspenders): every mutating code
+    path in either demo already funnels through `sendOps` before
+    anything is transmitted, so gating it there is what guarantees a
+    viewer's optimistic local edit can never leak out over *either* the
+    WS or the direct WebRTC P2P channel, even if some exotic path ever
+    slipped past the toolbar/pointerdown guards. **Accepted scope
+    reduction**: the toolbar is disabled as one blanket rule rather than
+    an exhaustive per-button allowlist (only Save/downloads are
+    explicitly re-enabled) -- simpler and more robust than hand-
+    maintaining an allowlist across a toolbar that's grown across six
+    phases, at the cost of also disabling a merely-informational click-
+    to-inspect-a-shape for a viewer, not just actual edits.
+  - **Honest limitation**: the home page's room listing itself is
+    ungated (like the pre-existing `/api/rooms`/`/api/mesh-rooms`, a
+    room id/kind/last-modified time isn't scoped to one room the way
+    its *contents* are), so with auth enabled, every room's existence
+    is visible workspace-wide regardless of who's asking -- but a
+    room's thumbnail, rename, and history remain individually token-
+    gated, so a room this browser hasn't joined (no token in
+    `localStorage`) shows a generic placeholder instead of erroring.
+    Documented here rather than silently glossed over.
+
 ## Testing
 
 ```bash
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-328 tests: unit tests per CRDT type and geometry module, serialization
+371 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -1505,7 +1634,35 @@ real named `DASHED`/`DOT` linetype (DXF, confirmed by reading
 that Line/Arc are never filled regardless of the prop, matching the
 Measure tool's own "no enclosed area" judgment call), and z-order
 (layer then creation order) actually reordering emitted elements/
-entities across layers.
+entities across layers. Also 43 new Phase 17 tests: 16 across
+`tests/test_persistence.py` (parametrized over `InMemoryStore`/
+`SQLiteStore`) for `list_rooms_detailed`/`set_display_name` (including
+the missing-room-returns-`False` case) and `save_version`/
+`list_versions`/`load_version` (roundtrip, newest-first ordering,
+pruning beyond `keep`, per-room-and-kind scoping, and that deleting a
+room also clears its version history); 2 more in
+`tests/test_postgres_store.py` mirroring the same display-name/version
+coverage against a real Postgres when one is reachable (skips cleanly
+otherwise, same convention as the rest of that file); and 25 in the new
+`tests/test_workspace.py` covering the REST/WS surface directly: the
+combined-kinds workspace listing sorted newest-first, rename
+(including 404 for a room that doesn't exist), a real SVG thumbnail
+rendered from a live snapshot, an explicit save producing exactly one
+version checkpoint (not one per idle periodic tick, and not one per
+op), a periodic checkpoint firing only when the room is actually dirty,
+pruning to a monkeypatched `max_versions_per_room`, restore forking a
+new room while leaving the original's content untouched, share-link
+minting's 400 when auth is disabled and its 403 when a viewer token
+tries to mint one (of *either* role -- the privilege-escalation guard),
+a viewer token being refused by an editor-only REST endpoint while an
+editor token still works, the WS snapshot's `"role"` field for both a
+viewer and the (default) editor case, a hand-crafted viewer WS's `ops`
+message being rejected and confirmed never applied (a fresh connection
+afterward sees the still-empty document), an editor's ops still being
+accepted and persisted normally, a viewer token still being scoped to
+its own room/kind (doesn't silently grant access elsewhere), and the
+three route assertions (`/` now serves the workspace home page, `/2d`
+serves the 2D demo, `/3d` unchanged).
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -1733,11 +1890,49 @@ diagnostic logging and isolating one layer of the problem at a time
 rather than guessing, then removing that instrumentation once each root
 cause was confirmed.
 
+Phase 17's workspace was verified live end to end, in two separate
+passes since the second needs `CRDT_CAD_SECRET` configured (the first
+doesn't). Pass one: a 2D room with a rect and a 3D room with a box were
+each saved, then the home page confirmed both cards render (correct
+kind badges, a real thumbnail `<img>` for the 2D one, the placeholder
+icon for the 3D one); Rename was applied and the home page re-rendered
+with the new name; History showed one checkpoint and Restore navigated
+to a real forked room whose exported JSON contained the original rect,
+while the source room's own export was confirmed unchanged; and the
+in-editor **✎** rename button updated the status-bar label immediately.
+Pass two (server started with `CRDT_CAD_SECRET` set): an editor drew a
+shape and minted a view-only link via the clipboard; a *second,
+completely fresh* browser context opened it with zero prompts, saw the
+editor's shape, showed the "view only" badge, and confirmed via
+`getComputedStyle` that the Rect tool button is genuinely
+`pointer-events: none` (not just dimmed) -- interestingly, this was
+confirmed *by Playwright's own click() call refusing to click it* on
+the first real attempt (its actionability check kept retrying against
+an element that correctly never becomes clickable, until it timed out)
+-- a case where a test author's assumption ("I can `.click()` a
+disabled button to prove it's disabled") was wrong, not the product;
+fixed by asserting the computed style directly, then separately
+force-clicking past the disabled button and dragging on the canvas
+anyway to confirm the deeper guard (`viewerMode` gating `pointerdown`
+itself) still lets nothing through, checked both client-side (no new
+path row) and server-side (the room's own `/export/json` still shows
+exactly the one shape). The editor tab was then confirmed still fully
+functional (drew a second shape) throughout. **Unlike most previous
+phases, this one did not surface a new product bug during verification**
+-- worth stating plainly rather than manufacturing one just to match
+the pattern of every other phase's writeup. The most plausible reason:
+the 25 server-side tests in `tests/test_workspace.py` already exercised
+exactly the boundary conditions a live pass would have caught first
+(role escalation, WS rejection, restore isolation, pruning), so by the
+time the browser was involved, what remained to check was mostly
+"does the already-tested server behavior actually reach the UI" --
+which it did, on the first real attempt in both passes.
+
 ### Committed e2e suite + CI
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (38 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (44 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1811,7 +2006,25 @@ vertex-to-vertex drag snapping exactly onto the target *and* the
 Vertices panel reflecting the new position afterward (the regression
 test for the stale-panel-after-drag bug above, which is exactly why
 this test reads positions from the panel's own `.vertex-coord` inputs
-rather than the 3D scene); and the four view buttons not throwing.
+rather than the 3D scene); and the four view buttons not throwing; and
+(Phase 17) `test_workspace_home_e2e.py` -- the home page rendering a
+real 2D thumbnail and a 3D placeholder icon with the correct kind
+badges for genuinely-created rooms; rename persisting and the home
+page's card re-rendering with the new name; History listing a
+checkpoint and Restore navigating to a forked room whose export
+contains the original content while the source room's own export is
+unchanged; and the display-name **✎** button updating the actor label
+and syncing to a second tab's presence list; plus
+`test_readonly_share_links_e2e.py` (needs `live_server_factory` with
+`CRDT_CAD_SECRET` set, unlike every other file here) -- a view-only
+link opened by a completely fresh browser context grants read access
+with zero prompts, shows the "view only" badge, and genuinely blocks
+editing (`pointer-events: none` on a tool button, confirmed via
+`getComputedStyle`; a force-clicked tool plus a canvas drag still
+creates nothing, checked both client-side and via the server's own
+export) while the editor tab stays fully functional throughout; and a
+viewer-role token being refused (403) by an editor-only REST endpoint
+(rename), not just the WS ops path.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process
@@ -2041,6 +2254,7 @@ src/crdt_cad/
 tests/                 pytest + Hypothesis, one file per module, conftest.py isolates storage
 demo/static/
   common.js            relay client, P2PManager, actor identity, shared UI helpers
+  home.html/home.js         workspace home page (room list, rename, history/restore)
   index.html/sketch.js      2D sketch demo
   mesh3d.html/mesh3d.js     3D mesh demo (Three.js via CDN, incl. AI Generate panel)
   styles.css                shared dark theme

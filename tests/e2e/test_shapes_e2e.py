@@ -25,7 +25,7 @@ def test_all_five_shape_kinds_can_be_drag_created(live_server, browser):
     room = "e2e-shapes-create"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -60,7 +60,7 @@ def test_select_tool_hit_tests_a_circles_actual_boundary(live_server, browser):
     room = "e2e-shapes-hittest"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -85,7 +85,7 @@ def test_numeric_panel_creates_a_shape_without_any_drag(live_server, browser):
     room = "e2e-shapes-numeric"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         page.click("#toolRect")
@@ -113,8 +113,8 @@ def test_document_units_affect_cursor_readout_and_are_shared_across_tabs(live_se
     page_a = browser.new_page()
     page_b = browser.new_page()
     try:
-        page_a.goto(f"{live_server}/?room={room}")
-        page_b.goto(f"{live_server}/?room={room}")
+        page_a.goto(f"{live_server}/2d?room={room}")
+        page_b.goto(f"{live_server}/2d?room={room}")
         page_a.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         page_b.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 

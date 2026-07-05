@@ -59,15 +59,26 @@ def secret_matches(candidate: str) -> bool:
     return hmac.compare_digest(candidate, secret)
 
 
-def mint_room_token(kind: str, room_id: str) -> str:
+def mint_room_token(kind: str, room_id: str, role: str = "editor") -> str:
     """Signs a token scoped to one specific ``(kind, room_id)`` pair -- a
-    token minted for one room grants no access to any other room."""
-    return _serializer().dumps({"kind": kind, "room_id": room_id})
+    token minted for one room grants no access to any other room.
+
+    ``role`` (Phase 17) is either ``"editor"`` (full read/write, the only
+    role that ever existed before this) or ``"viewer"`` (read-only --
+    receives snapshots/deltas same as an editor, but any ``ops`` message
+    from it is rejected server-side, see ``_handle_message`` in
+    ``app.py``). Omitting it keeps minting an editor token, so every
+    pre-Phase-17 call site (the shared-secret join flow) is unaffected.
+    """
+    return _serializer().dumps({"kind": kind, "room_id": room_id, "role": role})
 
 
 def verify_room_token(token: Optional[str], kind: str, room_id: str) -> bool:
     """Always ``True`` when auth is disabled -- today's zero-config
-    behavior for every caller of this function."""
+    behavior for every caller of this function. Does not distinguish
+    editor from viewer -- both are "a valid token for this room" as far
+    as this function is concerned; see :func:`token_role` for the role
+    itself."""
     if not auth_enabled():
         return True
     if not token:
@@ -77,6 +88,23 @@ def verify_room_token(token: Optional[str], kind: str, room_id: str) -> bool:
     except (BadSignature, SignatureExpired):
         return False
     return payload.get("kind") == kind and payload.get("room_id") == room_id
+
+
+def token_role(token: Optional[str], kind: str, room_id: str) -> Optional[str]:
+    """Returns the role (``"editor"`` or ``"viewer"``) a token grants for
+    this room, or ``None`` if the token doesn't verify at all. When auth
+    is disabled entirely, always ``"editor"`` -- there is no separate
+    permission model to restrict against, matching every other function
+    here's "wide open by default" behavior. A token minted before roles
+    existed has no ``"role"`` key at all and defaults to ``"editor"``, so
+    it keeps exactly the full access it always had.
+    """
+    if not auth_enabled():
+        return "editor"
+    if not verify_room_token(token, kind, room_id):
+        return None
+    payload = _serializer().loads(token, max_age=token_max_age_seconds())
+    return payload.get("role", "editor")
 
 
 def cors_origins() -> list[str]:
@@ -203,6 +231,14 @@ def max_rooms_per_server() -> int:
 
 def max_clients_per_room() -> int:
     return int(os.environ.get("CRDT_CAD_MAX_CLIENTS_PER_ROOM", "50"))
+
+
+def max_versions_per_room() -> int:
+    """Phase 17 (version history): how many checkpoint snapshots
+    `Room.checkpoint_version` keeps per room before pruning the oldest --
+    bounds `room_versions` table growth the same way every other ceiling
+    here bounds some other unbounded resource."""
+    return int(os.environ.get("CRDT_CAD_MAX_VERSIONS_PER_ROOM", "20"))
 
 
 class RoomLimitExceeded(Exception):

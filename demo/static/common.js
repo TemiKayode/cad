@@ -41,6 +41,37 @@ function getOrCreateActorName() {
   return name;
 }
 
+/** Phase 17: persists a user-chosen display name, returning the trimmed
+ * name, or null if `name` was empty/whitespace-only (caller should keep
+ * whatever name was already in use). Feeds the same `crdt_cad_actor_name`
+ * localStorage key getOrCreateActorName() reads, so it's picked up
+ * automatically on the next page load too, not just for the rest of this
+ * session. */
+function setActorName(name) {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return null;
+  localStorage.setItem("crdt_cad_actor_name", trimmed);
+  return trimmed;
+}
+
+/** Phase 17 read-only share links: toggles the shared "viewer mode" UI
+ * treatment -- disables (dims, `pointer-events:none`) every button/input
+ * inside `.panel.left` (the tool/action sidebar in both demos) except
+ * ones explicitly marked `.always-enabled` (Save, downloads), and shows/
+ * hides the `#viewOnlyBadge` pill. This is the UX half of viewer
+ * enforcement; the actual boundary is server-side (see RelayConnection.send
+ * and _handle_message's viewer check in app.py) -- disabling the toolbar
+ * here is what keeps a viewer from ever *starting* an edit gesture whose
+ * rejection reply has no `op` to revert (see the comment in `send()`).
+ * Returns whether viewer mode is now active. */
+function applyViewerModeUI(role) {
+  const isViewer = role === "viewer";
+  document.querySelectorAll(".panel.left").forEach((el) => el.classList.toggle("viewer-mode", isViewer));
+  const badge = document.getElementById("viewOnlyBadge");
+  if (badge) badge.style.display = isViewer ? "" : "none";
+  return isViewer;
+}
+
 function colorForActor(actorId) {
   let hash = 0;
   for (let i = 0; i < actorId.length; i++) hash = (hash * 31 + actorId.charCodeAt(i)) >>> 0;
@@ -299,7 +330,7 @@ class RelayConnection {
     wsPath,
     actorId,
     {
-      onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onValidityWarning, onMergePreview,
+      onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onValidityWarning, onMergePreview, onRole,
       token, kind, room, initialOutbox,
     },
   ) {
@@ -320,6 +351,13 @@ class RelayConnection {
     this.onSaved = onSaved || (() => {});
     this.onValidityWarning = onValidityWarning || (() => {});
     this.onMergePreview = onMergePreview || null;
+    // Phase 17 read-only share links: "editor" (full access, same as
+    // every room before this existed) or "viewer" -- learned from the
+    // server's own snapshot/delta reply (see app.py's WS protocol
+    // docstring), never decided client-side. `onRole` fires whenever it's
+    // (re)confirmed, so the caller can hide editing tools / show a badge.
+    this.onRole = onRole || (() => {});
+    this.role = "editor";
     this.frontier = new FrontierTracker();
     this.ws = null;
     this.outbox = initialOutbox ? initialOutbox.slice() : [];
@@ -373,11 +411,15 @@ class RelayConnection {
 
   _handleMessage(msg) {
     if (msg.type === "snapshot") {
+      this.role = msg.role || "editor";
+      this.onRole(this.role);
       this.frontier.recordAll(msg.frontier);
       this.onSnapshot(msg.doc);
       this.onStatus("online");
       this._flushOutbox();
     } else if (msg.type === "delta") {
+      this.role = msg.role || "editor";
+      this.onRole(this.role);
       this.frontier.recordAll(msg.frontier);
       const offlineOps = this.outbox.slice();
       const proceed = () => {
@@ -433,6 +475,21 @@ class RelayConnection {
   /** Send (or, if offline, queue) one or more ops that were already
    * applied optimistically to local state by the caller. */
   send(ops) {
+    if (this.role === "viewer") {
+      // Belt-and-suspenders: the real enforcement is server-side (a
+      // viewer's "ops" message is refused there regardless), and the UI
+      // is expected to never let a viewer start an edit gesture in the
+      // first place (see applyViewerModeUI / the pointerdown/mousedown
+      // guards in sketch.js/mesh3d.js) -- so this should be unreachable
+      // in practice. It exists as a second layer specifically because
+      // the server's generic viewer-rejection message carries no `op`
+      // (unlike a geometry-validity rejection), so if some edit path
+      // ever did slip past the UI guard, letting it reach the network
+      // would come back as a `rejected` with no op to revert -- silently
+      // corrupting local-only state instead of just not sending at all.
+      console.warn("RelayConnection.send() called while connected as a read-only viewer -- dropped, not sent");
+      return;
+    }
     for (const op of ops) this._recordOpFrontier(op);
     if (this.userWantsOffline || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.outbox.push(...ops);

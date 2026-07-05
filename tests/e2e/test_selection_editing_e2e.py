@@ -37,7 +37,7 @@ def test_dragging_a_selected_shapes_boundary_writes_a_transform(live_server, bro
     room = "e2e-select-move"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -66,7 +66,7 @@ def test_shift_click_and_marquee_both_build_a_multi_selection(live_server, brows
     room = "e2e-select-multi"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -101,7 +101,7 @@ def test_align_left_equalizes_the_selections_left_edges(live_server, browser):
     room = "e2e-select-align"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -137,7 +137,7 @@ def test_duplicate_then_delete_key_round_trips_the_path_count(live_server, brows
     room = "e2e-select-dup-delete"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")
@@ -169,7 +169,7 @@ def test_rotated_rect_export_bakes_to_its_true_rotated_polygon(live_server, brow
     room = "e2e-select-rotate-export"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         canvas = page.locator("#canvas")

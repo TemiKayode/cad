@@ -6,11 +6,17 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 const actorId = getOrCreateActorId();
-const actorName = getOrCreateActorName();
+let actorName = getOrCreateActorName();
 const actorColor = colorForActor(actorId);
 const room = new URLSearchParams(location.search).get("room") || "demo-mesh";
 document.getElementById("roomInput").value = room;
 document.getElementById("actorLabel").textContent = `${actorName} (${actorId})`;
+
+// Phase 17 read-only share links: true once the server's own snapshot/delta
+// reply says this connection is a "viewer" (see RelayConnection's onRole) --
+// gates the canvas pointerdown handler further down so a viewer can orbit/
+// zoom/pan but never start an edit gesture.
+let viewerMode = false;
 
 const clock = new LocalClock(actorId);
 const rid = () => Math.random().toString(36).slice(2, 10);
@@ -307,6 +313,9 @@ let conn, p2p;
     onSaved: () => showToast("Saved", "success"),
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
     onValidityWarning: (faces, problems) => applyValidityWarning(faces, problems),
+    onRole: (role) => {
+      viewerMode = applyViewerModeUI(role);
+    },
     token,
     kind: "mesh",
     room,
@@ -332,6 +341,16 @@ function updateP2pPill() {
 }
 
 function sendOps(ops) {
+  if (viewerMode) {
+    // See the identical guard (and its full rationale) in sketch.js:
+    // this is the one chokepoint every mutating code path here already
+    // funnels through, so gating it here -- rather than at each of
+    // Vertex/Face/Move/the primitive tools' own entry points -- is what
+    // guarantees a viewer's optimistic local edit never leaks out over
+    // either the WS or the direct P2P channel.
+    console.warn("sendOps() called while connected as a read-only viewer -- dropped, not sent");
+    return;
+  }
   ui.opsCount += ops.length;
   conn.send(ops);
   if (!conn.userWantsOffline) p2p.broadcastOps(ops);
@@ -430,6 +449,39 @@ document.getElementById("shareBtn").onclick = async () => {
   } catch (err) {
     showToast(url, "info");
   }
+};
+
+document.getElementById("shareViewOnlyBtn").onclick = async () => {
+  // See the identical handler (and its full rationale) in sketch.js.
+  try {
+    const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/share-link`, "mesh", room), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: "viewer" }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    const { token } = await resp.json();
+    const url = `${location.origin}/3d?room=${encodeURIComponent(room)}&token=${encodeURIComponent(token)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast("Read-only invite link copied to clipboard", "success");
+    } catch {
+      showToast(url, "info");
+    }
+  } catch (err) {
+    showToast(`Could not create a view-only link: ${err.message}`, "error");
+  }
+};
+
+document.getElementById("renameActorBtn").onclick = () => {
+  const next = window.prompt("Your display name (shown to collaborators):", actorName);
+  const updated = setActorName(next);
+  if (!updated) return;
+  actorName = updated;
+  document.getElementById("actorLabel").textContent = `${actorName} (${actorId})`;
 };
 
 // -- AI text-to-3D generation -------------------------------------------------------
@@ -1066,6 +1118,7 @@ function startVertexDrag(vid, vertical) {
 
 renderer.domElement.addEventListener("pointerdown", (e) => {
   updateMouse(e);
+  if (viewerMode) return; // Phase 17: a read-only viewer can still orbit/pan/zoom (OrbitControls, separate listeners) but never start an edit gesture
   if (ui.tool === "face") {
     const vmesh = raycastVertices();
     if (vmesh) {

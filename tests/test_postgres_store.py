@@ -136,3 +136,25 @@ def test_real_document_snapshot_roundtrips_through_store(store):
     store.save("drawing", room, doc.to_bytes())
     restored = DrawingDocument.from_bytes(LamportClock(actor="b"), store.load("drawing", room))
     assert restored.layer_list() == doc.layer_list()
+
+
+# -- Phase 17: workspace metadata + version history, same interface as
+# SQLiteStore/InMemoryStore (see test_persistence.py) -----------------------
+
+
+def test_display_name_roundtrips(store):
+    room = _room_id()
+    store.save("drawing", room, b"x")
+    assert store.set_display_name("drawing", room, "My Floor Plan") is True
+    rows = store.list_rooms_detailed("drawing")
+    assert next(r["display_name"] for r in rows if r["room_id"] == room) == "My Floor Plan"
+    assert store.set_display_name("drawing", _room_id(), "X") is False
+
+
+def test_version_history_roundtrips_and_prunes(store):
+    room = _room_id()
+    ids = [store.save_version("drawing", room, f"snap-{i}".encode(), keep=3) for i in range(5)]
+    versions = store.list_versions("drawing", room)
+    assert len(versions) == 3
+    assert {v["version_id"] for v in versions} == set(ids[-3:])
+    assert store.load_version("drawing", room, ids[-1]) == b"snap-4"

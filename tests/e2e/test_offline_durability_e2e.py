@@ -24,7 +24,7 @@ def _draw_stroke(page, dx=(0, 0)):
 
 def test_offline_edit_survives_hard_refresh(live_server, page):
     room = "e2e-offline-durability"
-    page.goto(f"{live_server}/?room={room}")
+    page.goto(f"{live_server}/2d?room={room}")
     page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
     page.click("#offlineToggle")
@@ -65,7 +65,7 @@ def test_no_persisted_state_is_a_silent_no_op(live_server, page):
     or otherwise behave differently -- IndexedDB persistence is additive,
     not a new default behavior."""
     room = "e2e-offline-durability-clean"
-    page.goto(f"{live_server}/?room={room}")
+    page.goto(f"{live_server}/2d?room={room}")
     page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
     page.wait_for_timeout(500)
     toasts = page.locator("#toastContainer").count()

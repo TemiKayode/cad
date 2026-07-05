@@ -34,7 +34,7 @@ def test_text_tool_creates_and_edits_persist(live_server, browser):
     room = "e2e-text-tool"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -65,7 +65,7 @@ def test_filled_shape_is_selectable_from_its_interior(live_server, browser):
     room = "e2e-fill-hittest"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -106,7 +106,7 @@ def test_dash_style_persists(live_server, browser):
     room = "e2e-dash-style"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -130,7 +130,7 @@ def test_grouping_makes_selecting_one_member_select_all_and_ungroup_reverts_it(l
     room = "e2e-groups"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()
@@ -172,7 +172,7 @@ def test_png_export_downloads_view_and_fit_variants_and_restores_the_view(live_s
     room = "e2e-png-export"
     page = browser.new_page(accept_downloads=True)
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         canvas = page.locator("#canvas")
         box = canvas.bounding_box()

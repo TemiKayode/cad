@@ -19,7 +19,7 @@ def test_default_view_is_backward_compatible_and_zoom_updates_on_wheel(live_serv
     room = "e2e-viewport-zoom"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         assert page.locator("#zoomIndicator").inner_text() == "100%"
@@ -46,8 +46,8 @@ def test_presence_cursor_renders_correctly_through_an_asymmetric_view_transform(
     page_a = browser.new_page()
     page_b = browser.new_page()
     try:
-        page_a.goto(f"{live_server}/?room={room}")
-        page_b.goto(f"{live_server}/?room={room}")
+        page_a.goto(f"{live_server}/2d?room={room}")
+        page_b.goto(f"{live_server}/2d?room={room}")
         page_a.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         page_b.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
@@ -80,7 +80,7 @@ def test_snap_to_grid_produces_grid_aligned_stored_points(live_server, browser):
     room = "e2e-viewport-snap"
     page = browser.new_page()
     try:
-        page.goto(f"{live_server}/?room={room}")
+        page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
         page.click("#snapToggleBtn")

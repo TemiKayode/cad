@@ -32,8 +32,8 @@ def test_two_tabs_drawing_concurrently_converge(live_server, browser):
     page_a = browser.new_page()
     page_b = browser.new_page()
     try:
-        page_a.goto(f"{live_server}/?room={room}")
-        page_b.goto(f"{live_server}/?room={room}")
+        page_a.goto(f"{live_server}/2d?room={room}")
+        page_b.goto(f"{live_server}/2d?room={room}")
         page_a.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         page_b.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
@@ -57,8 +57,8 @@ def test_offline_edit_then_reconnect_shows_time_travel_merge_and_converges(live_
     page_a = browser.new_page()
     page_b = browser.new_page()
     try:
-        page_a.goto(f"{live_server}/?room={room}")
-        page_b.goto(f"{live_server}/?room={room}")
+        page_a.goto(f"{live_server}/2d?room={room}")
+        page_b.goto(f"{live_server}/2d?room={room}")
         page_a.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
         page_b.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
@@ -86,7 +86,7 @@ def test_strict_polygon_rejects_self_intersection_live(live_server, page):
     # The strict Polygon tool is click-to-place (each click adds one
     # vertex; clicking near the first vertex again closes the shape) --
     # not a click-and-drag gesture like the freehand Pen tool.
-    page.goto(f"{live_server}/?room=e2e-strict-polygon")
+    page.goto(f"{live_server}/2d?room=e2e-strict-polygon")
     page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
     page.click("#toolPolygon")
 
