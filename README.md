@@ -32,11 +32,12 @@ over gaps.
 | AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done** -- Claude Fable 5 prompt interpretation (heuristic fallback, no API key required) + deterministic procedural geometry + optional `pymeshlab` print-repair, injected as batched CRDT ops -- see below for exact scope |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
-| Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9) -- coincident/parallel/perpendicular/fixed-distance, live-verified with real point convergence, see below |
+| Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
 | 2D viewport: pan/zoom/adaptive grid/snap-to-grid (Phase 10) | **Done** -- client-local view transform, never synced; live-verified incl. presence cursors through an asymmetric transform, see below |
 | Shape primitives: Line/Rect/Circle/Ellipse/Arc, numeric input, document units (Phase 11) | **Done** -- parametric `path_props` fields, native render/hit-test/SVG/DXF export per shape, see below |
 | Selection editing: move/rotate/scale, multi-select, duplicate, copy/paste, align/distribute, object snap (Phase 12) | **Done** -- `transform` path_prop baked only at export time, canvas's own nested transform for rendering, see below |
 | Measurement (Distance/Angle/Area, read-only) + Dimension annotations (Phase 13) | **Done** -- dimensions reference geometry by (path id, RGA node id), auto-updating live and exporting as real DXF `DIMENSION` entities, see below |
+| Persistent sketch constraints, tangent, re-solve-on-drag (Phase 14) | **Done** -- new `constraints` document component, `movePathPoint` now undoable and remaps both dimensions and constraints onto a moved point's new node id, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -50,7 +51,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 24 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 28 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -65,7 +66,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 303 tests, ~15s
+./.venv/Scripts/python -m pytest tests/ -v   # 309 tests, ~15s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -834,9 +835,11 @@ either frontend has).
 align/distribute, and object snapping (Phase 12 -- see below), a strict
 **Polygon** tool that demonstrates the geometry validity gate,
 **Line/Rect/Circle/Ellipse/Arc** shape tools with numeric dimension
-input (Phase 11 -- see below), a **Constrain** tool (Phase 9 --
-coincident/parallel/perpendicular/fixed-distance via the tested
-Gauss-Newton solver), a **Measure** tool (read-only Distance/Angle/
+input (Phase 11 -- see below), a **Constrain** tool (Phase 9, extended
+Phase 14 -- coincident/parallel/perpendicular/fixed-distance/tangent
+via the tested Gauss-Newton solver, now persistent, undoable, badged,
+and re-solving automatically when a constrained point is dragged), a
+**Measure** tool (read-only Distance/Angle/
 Area-Perimeter) and a **Dimension** tool for persistent, auto-updating
 annotations (Phase 13 -- see below), a real pan/zoom/grid/snap
 **viewport** and a **document units** (px/mm/in) selector (Phase
@@ -1167,13 +1170,77 @@ already follow elsewhere in this file.
   silently skipped by both exporters, never raising or emitting broken
   geometry.
 
+## Interactive constraint UI: persistence, tangent, re-solve-on-drag (Phase 14)
+
+Phase 9 already built the **Constrain** tool (coincident/parallel/
+perpendicular/fixed-distance) against the tested Gauss-Newton solver,
+but applying one was a one-off visual effect -- nothing durable, no
+badge, nothing to select or delete, and moving a point this way was not
+undoable at all (`movePathPoint` never pushed an undo entry). Phase 14
+is what makes the solver "finally earn its keep," per the brief: every
+constraint now persists, and constrained geometry stays constrained.
+
+- **Persistent constraints**: a new `constraints: LWWMap[constraint_id,
+  spec]` document component -- same serialization/merge/backward-compat
+  treatment as `dimensions`. A constraint's `spec` is `{kind, anchors,
+  param}`; each anchor is either `{"type": "point", "path_id",
+  "node_id"}` (an RGA node id, exactly `dimensions`' anchoring rationale
+  from Phase 13) or `{"type": "shape_center", "path_id"}` -- a circle
+  has no RGA point of its own to anchor to, which is exactly why
+  `tangent` needed a second anchor shape at all.
+- **Tangent, the fifth kind**: needed a circle (available since Phase
+  11) and a genuinely different picking mechanism from the other four
+  kinds -- `pickConstraintEntity` tries the existing point pick first,
+  then falls back to a circle-only shape hit-test (boundary-only, same
+  convention as every other shape interaction here). Picking one circle
+  and one point (whose neighbor defines the line, same inference
+  parallel/perpendicular already use) shows a Tangent button with the
+  circle's live radius pre-filled and editable; two circles, or two
+  points, correctly show neither Tangent nor the other four buttons --
+  each combination only offers the constraint kinds that actually apply
+  to it.
+- **Undo/redo fix**: `movePathPoint` is now split into a raw primitive
+  (still undo-free, so `undo()`/`redo()` can call it directly without
+  recursively pushing their own undo entry) and
+  `movePathPointWithUndo`, which every constraint-application and
+  constrain-tool drag call site uses instead. A constraint-driven move
+  is undoable the same way every other edit here is -- one Undo click
+  per point moved, consistent with this codebase's existing "no
+  batch-undo grouping" pattern (duplicate/delete already work this way
+  too).
+- **Badge glyphs**: a small symbol per kind (coincident/parallel/
+  perpendicular/fixed-distance/tangent each get their own glyph) at the
+  centroid of a constraint's live-resolved anchors, silently skipped if
+  any anchor no longer resolves -- same "can't currently render this"
+  contract as Phase 13's dimensions and export baking.
+- **Select + delete**: a **Constraints** panel lists every persisted
+  constraint with a delete button, mirroring the Dimensions list.
+- **Re-solve on drag**: dragging a point while the Constrain tool is
+  active previews locally (substituting the live drag position only
+  for rendering, exactly how Phase 12's selection move-drag already
+  avoids flooding the relay) and, on release, gathers *every* persisted
+  constraint touching that point's path and re-solves them **together**
+  in one `/api/solve` call, not one at a time -- constraints sharing a
+  point need to be solved jointly to stay consistent. The drag emits
+  the solve request on pointer-up, never per-frame, per the brief. A
+  point with no constraints yet is just an ordinary (still undoable)
+  move -- no wasted solve request.
+- **Honest scope note** (the brief asks for this explicitly): this is a
+  *sketch* constraint system -- solve on demand against the current
+  geometry -- not a full parametric feature tree with a dependency
+  graph, rebuild order, or partial/over-constrained diagnostics beyond
+  "did the solver converge." Reapplying the same constraint twice
+  creates two persisted records rather than de-duplicating; both are
+  individually valid and solve correctly, just redundant -- a known,
+  minor limitation, not a correctness bug.
+
 ## Testing
 
 ```bash
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-303 tests: unit tests per CRDT type and geometry module, serialization
+309 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -1270,7 +1337,12 @@ dimension producing a real SVG `<g class="dimension">` group and a real
 DXF `DIMENSION` entity (`get_measurement()` checked directly, not just
 that the tag exists), an unresolved one being silently skipped by both,
 and the dimension's label/measurement scaling correctly with document
-units.
+units. Also 6 new Phase 14 tests in `tests/test_document.py` for the
+new `constraints` component: roundtripping kind/anchors/param, a
+`shape_center` anchor (a circle has no RGA point to anchor to, for
+`tangent`), merging field-wise like every other LWWMap, the
+serialization roundtrip, the same absent-from-an-old-snapshot
+backward-compat default every other component gets, and deletion.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -1423,11 +1495,33 @@ directly rather than guessing, the same "verify the actual solver
 behavior, don't assume" discipline Phase 9's own constraint testing
 already established.
 
+Phase 14's persistent constraints were verified live end to end: a
+Coincident constraint applied between two lines' endpoints, confirmed
+persisted via `/export/json` (not just a visual snap) and listed in the
+Constraints panel; Undo/Redo exercised afterward and confirmed neither
+threw; a circle drawn alongside a line, picking the circle (its
+boundary, not its interior -- same convention as every other shape
+interaction) plus a line point correctly surfacing a Tangent button
+(and only Tangent, not the other four); the Tangent constraint applied
+and persisted; dragging one of the tangent line's points and confirming
+exactly one constraint still existed afterward (a re-solve, not a
+duplicate); and deleting a constraint via its panel row. One real
+timing lesson from this pass, worth recording since it's easy to
+reproduce accidentally: checking `state.constraints.size` client-side
+immediately after clicking Apply proves the *local, optimistic* apply
+happened, not that the server has processed the corresponding WS
+message yet -- an early verification script queried the server's own
+`/export/json` in the same instant and intermittently saw one fewer
+constraint than the client already showed. Fixed by giving the
+WebSocket round-trip a short buffer after the client-side condition is
+met before trusting server-side state, not by lengthening an already-
+timing-based wait blindly.
+
 ### Committed e2e suite + CI
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (24 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (28 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1477,7 +1571,15 @@ regardless of tool); a dimension persisting and syncing to a second
 tab; and -- the regression test for the anchor-orphaning bug described
 above -- a dimension correctly tracking its anchor point's new position
 (not "(geometry deleted)", not the stale old value) after the
-Constrain tool actually moves it.
+Constrain tool actually moves it; and (Phase 14)
+`test_constraint_persistence_e2e.py` -- applying a constraint actually
+persists it as real document state (not just a one-time visual
+effect); Undo genuinely reverting a constraint-driven point move (a
+real, pre-existing gap this phase closed -- `movePathPoint` never
+pushed an undo entry before); Tangent's different picking mechanism
+(a circle shape, not a point) producing a `shape_center` anchor;
+and dragging an already-constrained point re-solving on release
+without minting a duplicate persisted constraint.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

@@ -48,6 +48,7 @@ PathId = str
 LayerId = str
 CommentId = str
 DimId = str
+ConstraintId = str
 Point = tuple[float, float]
 
 # Document units (Phase 11): stored/CRDT geometry is always in raw
@@ -337,6 +338,20 @@ class DrawingDocument:
         # after a concurrent insert/delete elsewhere in the same path.
         # Payload: {"a_path", "a_node", "b_path", "b_node", "offset"}.
         self.dimensions: LWWMap[DimId, dict] = LWWMap(clock)
+        # Persistent sketch constraints (Phase 14): the solver
+        # (geometry.constraints) and /api/solve are built and tested but
+        # were, before this, never durable -- applying one was a one-off
+        # action, not a fact the document remembered. Payload:
+        # {"kind", "anchors": {name: anchor}, "param"}, where each anchor
+        # is either {"type": "point", "path_id", "node_id"} (an RGA node
+        # id, same anchoring rationale as `dimensions` above) or
+        # {"type": "shape_center", "path_id"} (a circle's cx/cy, for the
+        # `tangent` kind -- a circle has no RGA points to anchor to at
+        # all). Anchor *names* per kind: coincident/fixed_distance use
+        # p1/p2; parallel/perpendicular use p1a/p1b/p2a/p2b (a line's two
+        # defining points); tangent uses circle/line_a/line_b -- mirrors
+        # sketch.js's ANCHOR_NAMES_BY_KIND exactly.
+        self.constraints: LWWMap[ConstraintId, dict] = LWWMap(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -502,6 +517,22 @@ class DrawingDocument:
             return None
         return a, b
 
+    # -- sketch constraints (Phase 14) -----------------------------------------
+    def add_constraint(self, kind: str, anchors: dict, param: float = 0.0) -> tuple[ConstraintId, DocOp]:
+        """`anchors` is a name -> anchor dict (see the `constraints`
+        field's docstring in `__init__` for the two anchor shapes and
+        the per-kind anchor names) -- this is a thin CRDT-storage
+        wrapper, not a copy of the solver's own `Constraint` dataclass;
+        `crdt_cad.geometry.constraints.Constraint` stays the solver's
+        own abstraction with its own transient point ids, unrelated to
+        how a constraint durably references real document geometry."""
+        constraint_id = new_id("constraint")
+        op = self.constraints.set(constraint_id, {"kind": kind, "anchors": anchors, "param": param})
+        return constraint_id, DocOp("constraint", op.to_dict())
+
+    def remove_constraint(self, constraint_id: ConstraintId) -> DocOp:
+        return DocOp("constraint", self.constraints.delete(constraint_id).to_dict())
+
     # -- undo / redo: inverted ops, not snapshots --------------------------------
     def undo(self) -> list[DocOp]:
         if not self._undo:
@@ -577,6 +608,8 @@ class DrawingDocument:
             return self.settings.apply(LWWOp.from_dict(op.payload))
         if op.target == "dimension":
             return self.dimensions.apply(LWWOp.from_dict(op.payload))
+        if op.target == "constraint":
+            return self.constraints.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown doc op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -597,6 +630,7 @@ class DrawingDocument:
         changed |= self.presence.merge(other.presence)
         changed |= self.settings.merge(other.settings)
         changed |= self.dimensions.merge(other.dimensions)
+        changed |= self.constraints.merge(other.constraints)
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -657,6 +691,9 @@ class DrawingDocument:
             out.append(entry)
         return out
 
+    def constraint_list(self) -> list[dict]:
+        return [{"id": cid, **payload} for cid, payload in self.constraints.items()]
+
     # -- delta sync ---------------------------------------------------------------
     def frontier(self) -> VectorClock:
         vc = self.layers.frontier()
@@ -671,6 +708,7 @@ class DrawingDocument:
         vc = vc.merge(self.presence.frontier())
         vc = vc.merge(self.settings.frontier())
         vc = vc.merge(self.dimensions.frontier())
+        vc = vc.merge(self.constraints.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[DocOp]:
@@ -686,6 +724,7 @@ class DrawingDocument:
         out += [DocOp("presence", op.to_dict()) for op in self.presence.ops_since(vc)]
         out += [DocOp("setting", op.to_dict()) for op in self.settings.ops_since(vc)]
         out += [DocOp("dimension", op.to_dict()) for op in self.dimensions.ops_since(vc)]
+        out += [DocOp("constraint", op.to_dict()) for op in self.constraints.ops_since(vc)]
         return out
 
     # -- serialization --------------------------------------------------------------
@@ -700,6 +739,7 @@ class DrawingDocument:
             "presence": self.presence.to_dict(),
             "settings": self.settings.to_dict(),
             "dimensions": self.dimensions.to_dict(),
+            "constraints": self.constraints.to_dict(),
         }
 
     @staticmethod
@@ -718,6 +758,8 @@ class DrawingDocument:
         doc.settings = LWWMap.from_dict(clock, d["settings"]) if "settings" in d else LWWMap(clock)
         # Same backward-compat default for "dimensions" (Phase 13).
         doc.dimensions = LWWMap.from_dict(clock, d["dimensions"]) if "dimensions" in d else LWWMap(clock)
+        # Same backward-compat default for "constraints" (Phase 14).
+        doc.constraints = LWWMap.from_dict(clock, d["constraints"]) if "constraints" in d else LWWMap(clock)
         return doc
 
     def to_bytes(self) -> bytes:

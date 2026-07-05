@@ -22,6 +22,7 @@ const state = {
   presence: new Map(),
   settings: new Map(),    // "units" | "grid_spacing" | "snap_step" -> value (Phase 11)
   dimensions: new Map(),  // dim_id -> {a_path, a_node, b_path, b_node, offset} (Phase 13)
+  constraints: new Map(), // constraint_id -> {kind, anchors, param} (Phase 14)
 };
 
 // -- document units (Phase 11) ------------------------------------------------
@@ -89,6 +90,12 @@ let pendingPolygon = [];
 // ops any other point move would use (see movePathPoint), broadcast the
 // normal way so everyone in the room sees it.
 let constraintSelection = [];
+// Phase 14: dragging a point while the Constrain tool is active
+// re-solves any persisted constraints touching its path on release --
+// null, or {pathId, nodeId, startWorld, livePos, moved}. See the
+// pointerdown/move/up wiring and commitConstrainedPointDrag below.
+let constrainDrag = null;
+let justDraggedConstraintPoint = false;
 let lastMousePt = null; // world coordinates -- see the view transform section below
 
 // -- measure tool (Phase 13, read-only, client-local) -----------------------
@@ -192,6 +199,7 @@ function observeSnapshotCounters(doc) {
   scanEntries(doc.presence);
   scanEntries(doc.settings);
   scanEntries(doc.dimensions);
+  scanEntries(doc.constraints);
   clock.observe(maxCounter);
 }
 
@@ -230,6 +238,8 @@ function loadSnapshot(doc) {
   for (const e of doc.settings.entries) if (!e.d) state.settings.set(e.k, e.v);
   state.dimensions.clear();
   for (const e of doc.dimensions.entries) if (!e.d) state.dimensions.set(e.k, e.v);
+  state.constraints.clear();
+  for (const e of doc.constraints.entries) if (!e.d) state.constraints.set(e.k, e.v);
 
   if (!ui.activeLayer || !state.layers.has(ui.activeLayer)) {
     ui.activeLayer = state.layerOrder[0] || null;
@@ -278,6 +288,8 @@ function applyOp(op) {
     syncUnitsSelect();
   } else if (op.target === "dimension") {
     if (!p.d) state.dimensions.set(p.k, p.v); else state.dimensions.delete(p.k);
+  } else if (op.target === "constraint") {
+    if (!p.d) state.constraints.set(p.k, p.v); else state.constraints.delete(p.k);
   }
 }
 
@@ -600,6 +612,21 @@ document.getElementById("unitsSelect").onchange = (e) => setSetting("units", e.t
 function undo() {
   const entry = undoStack.pop();
   if (!entry) return;
+  if (entry.kind === "point_move") {
+    // Point moves (Phase 14: constraint solves, and the constrain
+    // tool's own point-drag) mint a *new* RGA node id every time (RGA
+    // values are immutable once inserted -- see movePathPoint), so
+    // "undo" here means "move it back", not "restore the old id" --
+    // this call itself mints yet another fresh id, same as every
+    // other point move.
+    const currentPos = livePosOf(entry.pathId, entry.nodeId);
+    if (currentPos) {
+      const newNodeId = movePathPoint(entry.pathId, entry.nodeId, entry.prevPos);
+      redoStack.push({ kind: "point_move", pathId: entry.pathId, nodeId: newNodeId, prevPos: currentPos });
+    }
+    renderAll();
+    return;
+  }
   let op;
   if (entry.kind === "path_add") {
     op = { target: "path_index", payload: lwwOp(clock.tick(), entry.pathId, null, true) };
@@ -617,6 +644,15 @@ function undo() {
 function redo() {
   const entry = redoStack.pop();
   if (!entry) return;
+  if (entry.kind === "point_move") {
+    const currentPos = livePosOf(entry.pathId, entry.nodeId);
+    if (currentPos) {
+      const newNodeId = movePathPoint(entry.pathId, entry.nodeId, entry.prevPos);
+      undoStack.push({ kind: "point_move", pathId: entry.pathId, nodeId: newNodeId, prevPos: currentPos });
+    }
+    renderAll();
+    return;
+  }
   let op;
   if (entry.kind === "path_add") {
     op = { target: "path_index", payload: lwwOp(clock.tick(), entry.pathId, true, false) };
@@ -707,6 +743,18 @@ canvas.addEventListener("pointerdown", (e) => {
     beginSelectDrag(e);
     return;
   }
+  if (ui.tool === "constrain") {
+    // Only a real RGA point can be dragged this way (a circle's
+    // shape_center anchor has no point to drag -- it moves only via a
+    // solve result, see setCircleCenter). A plain click (no movement)
+    // still falls through to the click handler's existing pick-for-a-
+    // new-constraint logic below, unaffected by this.
+    const hit = hitTestPoint(canvasPoint(e));
+    if (hit) {
+      constrainDrag = { pathId: hit.pathId, nodeId: hit.nodeId, startWorld: worldPoint(e), livePos: hit.pos, moved: false };
+    }
+    return;
+  }
   if (ui.tool !== "pen") return;
   if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
   const pt = worldPoint(e);
@@ -731,6 +779,14 @@ canvas.addEventListener("pointermove", (e) => {
   updateCursorReadout(pt);
   if (selectDrag) {
     handleSelectDragMove(screenPt, pt);
+    return;
+  }
+  if (constrainDrag) {
+    if (Math.hypot(pt[0] - constrainDrag.startWorld[0], pt[1] - constrainDrag.startWorld[1]) > 1e-6) {
+      constrainDrag.moved = true;
+    }
+    constrainDrag.livePos = pt;
+    render();
     return;
   }
   if (shapeDraft) {
@@ -768,6 +824,15 @@ window.addEventListener("pointerup", () => {
     finishSelectDrag();
     return;
   }
+  if (constrainDrag) {
+    if (constrainDrag.moved) {
+      justDraggedConstraintPoint = true;
+      commitConstrainedPointDrag(constrainDrag.pathId, constrainDrag.nodeId, constrainDrag.livePos);
+      renderAll();
+    }
+    constrainDrag = null;
+    return;
+  }
   if (shapeDraft) {
     // A negligible drag (a plain click) leaves anchor === current --
     // skip committing a zero-size shape nobody meant to draw.
@@ -798,9 +863,14 @@ canvas.addEventListener("click", (e) => {
       renderToolHint();
     }
   } else if (ui.tool === "constrain") {
-    const hit = hitTestPoint(screenPt);
+    // A drag that actually moved a point was already handled (and
+    // re-solved) in pointerup -- the click that still fires on release
+    // must not *also* register as picking this point for a brand new
+    // constraint.
+    if (justDraggedConstraintPoint) { justDraggedConstraintPoint = false; return; }
+    const hit = pickConstraintEntity(screenPt);
     if (!hit) return;
-    const already = constraintSelection.findIndex((s) => s.pathId === hit.pathId && idEq(s.nodeId, hit.nodeId));
+    const already = constraintSelection.findIndex((s) => constraintEntityEq(s, hit));
     if (already !== -1) {
       constraintSelection.splice(already, 1);
     } else if (constraintSelection.length >= 2) {
@@ -1085,15 +1155,20 @@ function findAdjacentPoint(pathId, nodeId) {
  * weight in path_props, but the visual effect is that segment reverts
  * to a straight line) -- an accepted trade-off for the common case this
  * solver targets (straight-line CAD-style sketches), not attempted to
- * be avoided here. A dimension (Phase 13) anchored to the old id is
- * NOT left to orphan the same way, though: "updates automatically when
- * the geometry moves" is the entire point of that feature, so
- * remapDimensionAnchor carries any matching anchor forward onto the
- * new node id as part of this same move. */
+ * be avoided here. A dimension (Phase 13) or persisted constraint
+ * (Phase 14) anchored to the old id is NOT left to orphan the same way,
+ * though: "updates automatically when the geometry moves" is the
+ * entire point of both features, so remapDimensionAnchor/
+ * remapConstraintAnchors carry any matching anchor forward onto the new
+ * node id as part of this same move. This is the RAW move primitive --
+ * no undo bookkeeping (see movePathPointWithUndo for that), so undo()/
+ * redo() themselves can call this directly without it recursively
+ * pushing its own undo entry. Returns the new node id, or null if
+ * `oldNodeId` isn't currently live (e.g. a concurrent delete). */
 function movePathPoint(pathId, oldNodeId, newPos) {
   const entries = liveEntries(state.pathNodes.get(pathId));
   const idx = entries.findIndex((e) => idEq(e.id, oldNodeId));
-  if (idx === -1) return;
+  if (idx === -1) return null;
   const prevId = idx > 0 ? entries[idx - 1].id : null;
   const delOp = { target: "path_geom", scope: pathId, payload: rgaDeleteOp(oldNodeId, clock.tick()) };
   applyOp(delOp);
@@ -1102,6 +1177,25 @@ function movePathPoint(pathId, oldNodeId, newPos) {
   applyOp(insOp);
   sendOps([delOp, insOp]);
   remapDimensionAnchor(pathId, oldNodeId, newNodeId);
+  remapConstraintAnchors(pathId, oldNodeId, newNodeId);
+  return newNodeId;
+}
+
+/** Wraps movePathPoint with an undo-stack push (Phase 14: the brief
+ * explicitly asks for constraint-driven moves to be undoable via "the
+ * existing inverted-op machinery" -- movePathPoint itself stayed
+ * undo-free so undo()/redo() can call it directly without a nested
+ * push). Every constraint-application and constrain-tool point-drag
+ * call site uses this wrapper, not the raw function, so those moves
+ * are undoable the same way any other edit here is. */
+function movePathPointWithUndo(pathId, oldNodeId, newPos) {
+  const oldPos = livePosOf(pathId, oldNodeId);
+  const newNodeId = movePathPoint(pathId, oldNodeId, newPos);
+  if (newNodeId && oldPos) {
+    undoStack.push({ kind: "point_move", pathId, nodeId: newNodeId, prevPos: oldPos });
+    redoStack.length = 0;
+  }
+  return newNodeId;
 }
 
 /** Carries a dimension's anchor forward onto a point's new node id
@@ -1128,20 +1222,107 @@ function remapDimensionAnchor(pathId, oldNodeId, newNodeId) {
   if (ops.length) sendOps(ops);
 }
 
+/** Same idea as remapDimensionAnchor, for persisted constraints (Phase
+ * 14) -- a constraint's "point" anchors reference an RGA node id, same
+ * as a dimension's, so a point move needs the same carry-forward or the
+ * constraint would silently stop applying to the point the user
+ * actually meant. `shape_center` anchors (a circle's own center, for
+ * `tangent`) never need this -- see setCircleCenter, which updates the
+ * circle's cx/cy props directly rather than an RGA node id. */
+function remapConstraintAnchors(pathId, oldNodeId, newNodeId) {
+  const ops = [];
+  for (const [constraintId, spec] of state.constraints) {
+    const updatedAnchors = { ...spec.anchors };
+    let changed = false;
+    for (const [name, anchor] of Object.entries(spec.anchors)) {
+      if (anchor.type === "point" && anchor.path_id === pathId && idEq(anchor.node_id, oldNodeId)) {
+        updatedAnchors[name] = { ...anchor, node_id: newNodeId };
+        changed = true;
+      }
+    }
+    if (changed) {
+      const op = { target: "constraint", payload: lwwOp(clock.tick(), constraintId, { ...spec, anchors: updatedAnchors }, false) };
+      applyOp(op);
+      ops.push(op);
+    }
+  }
+  if (ops.length) sendOps(ops);
+}
+
+/** Reads the live position of a constraint-selection entry (see
+ * pickConstraintEntity) regardless of whether it's a plain RGA point or
+ * a circle's shape_center -- lets every kind's ref-building logic below
+ * stay agnostic to which one it got. */
+function liveConstraintSelectionPos(sel) {
+  return sel.isShapeCenter ? liveShapeCenterOf(sel.pathId) : livePosOf(sel.pathId, sel.nodeId);
+}
+
+/** Applies a solved position back to whatever a ref actually is: a
+ * circle's cx/cy (setCircleCenter) for a shape_center, or an ordinary
+ * undoable point move otherwise. */
+function applySolvedRefPosition(ref, newPos) {
+  if (ref.isShapeCenter) setCircleCenter(ref.pathId, newPos);
+  else movePathPointWithUndo(ref.pathId, ref.nodeId, newPos);
+}
+
+/** Converts a constraint-selection ref into its durable anchor shape
+ * (see the `constraints` component's docstring in document.py) for
+ * persisting via addConstraint. */
+function refToAnchor(ref) {
+  return ref.isShapeCenter
+    ? { type: "shape_center", path_id: ref.pathId }
+    : { type: "point", path_id: ref.pathId, node_id: ref.nodeId };
+}
+
+function addConstraint(kind, refs, param) {
+  const anchors = {};
+  for (const [name, ref] of Object.entries(refs)) anchors[name] = refToAnchor(ref);
+  const id = "constraint_" + rid();
+  const op = { target: "constraint", payload: lwwOp(clock.tick(), id, { kind, anchors, param: param || 0 }, false) };
+  applyOp(op);
+  sendOps([op]);
+}
+
+function removeConstraint(id) {
+  const op = { target: "constraint", payload: lwwOp(clock.tick(), id, null, true) };
+  applyOp(op);
+  sendOps([op]);
+}
+
 /** Solves the chosen constraint against the two currently-selected
- * points (see the "constrain" tool's click handler) via the existing,
- * already-tested `/api/solve` endpoint, then moves whichever points it
- * returned a changed position for. Parallel/perpendicular need two
- * *lines*, inferred from each selected point's neighbor (see
- * findAdjacentPoint) -- coincident/fixed_distance work directly on the
- * two selected points. */
+ * entities (see the "constrain" tool's click handler) via the existing,
+ * already-tested `/api/solve` endpoint, moves whichever points it
+ * returned a changed position for, and -- Phase 14 -- persists the
+ * constraint so it renders as a badge, can be selected + deleted, and
+ * is automatically re-solved the next time one of its points is
+ * dragged (see resolveAndApplyConstraints). Parallel/perpendicular need
+ * two *lines*, inferred from each selected point's neighbor (see
+ * findAdjacentPoint); tangent needs one circle (a shape_center, no RGA
+ * point of its own) and one line, same neighbor-inference for the line
+ * half; coincident/fixed_distance work directly on the two selected
+ * points. */
 async function applyConstraint(kind, param) {
   if (constraintSelection.length !== 2) return;
   const [sel1, sel2] = constraintSelection;
   const points = {};
   const refs = {};
   let pointIds;
-  if (kind === "parallel" || kind === "perpendicular") {
+  if (kind === "tangent") {
+    const circleSel = sel1.isShapeCenter ? sel1 : sel2.isShapeCenter ? sel2 : null;
+    const lineSel = sel1.isShapeCenter ? sel2 : sel2.isShapeCenter ? sel1 : null;
+    if (!circleSel || lineSel.isShapeCenter) {
+      showToast("Tangent needs exactly one circle and one point on a line", "error");
+      return;
+    }
+    const adj = findAdjacentPoint(lineSel.pathId, lineSel.nodeId);
+    if (!adj) {
+      showToast("The selected point needs a neighboring point to define a line", "error");
+      return;
+    }
+    refs.circle = circleSel; refs.line_a = lineSel; refs.line_b = adj;
+    for (const [key, ref] of Object.entries(refs)) points[key] = liveConstraintSelectionPos(ref);
+    pointIds = ["circle", null, "line_a", "line_b"];
+  } else if (kind === "parallel" || kind === "perpendicular") {
     const adj1 = findAdjacentPoint(sel1.pathId, sel1.nodeId);
     const adj2 = findAdjacentPoint(sel2.pathId, sel2.nodeId);
     if (!adj1 || !adj2) {
@@ -1149,15 +1330,15 @@ async function applyConstraint(kind, param) {
       return;
     }
     refs.p1a = sel1; refs.p1b = adj1; refs.p2a = sel2; refs.p2b = adj2;
-    for (const [key, ref] of Object.entries(refs)) points[key] = livePosOf(ref.pathId, ref.nodeId);
+    for (const [key, ref] of Object.entries(refs)) points[key] = liveConstraintSelectionPos(ref);
     pointIds = ["p1a", "p1b", "p2a", "p2b"];
   } else {
     refs.p1 = sel1; refs.p2 = sel2;
-    for (const [key, ref] of Object.entries(refs)) points[key] = livePosOf(ref.pathId, ref.nodeId);
+    for (const [key, ref] of Object.entries(refs)) points[key] = liveConstraintSelectionPos(ref);
     pointIds = ["p1", "p2"];
   }
   if (Object.values(points).some((p) => !p)) {
-    showToast("A selected point no longer exists (concurrent edit) -- try again", "error");
+    showToast("A selected entity no longer exists (concurrent edit) -- try again", "error");
     constraintSelection = [];
     renderAll();
     return;
@@ -1181,15 +1362,42 @@ async function applyConstraint(kind, param) {
     return;
   }
   for (const [key, ref] of Object.entries(refs)) {
-    const [nx, ny] = result.positions[key];
-    const [ox, oy] = points[key];
-    if (Math.abs(nx - ox) > 1e-6 || Math.abs(ny - oy) > 1e-6) {
-      movePathPoint(ref.pathId, ref.nodeId, [nx, ny]);
+    const newPos = result.positions[key];
+    const oldPos = points[key];
+    if (Math.abs(newPos[0] - oldPos[0]) > 1e-6 || Math.abs(newPos[1] - oldPos[1]) > 1e-6) {
+      applySolvedRefPosition(ref, newPos);
     }
   }
+  addConstraint(kind, refs, param);
   constraintSelection = [];
   renderAll();
   showToast("Constraint applied", "success");
+}
+
+/** Picks an entity for the Constrain tool: an ordinary RGA point via
+ * the existing hitTestPoint, or -- Phase 14, for tangent -- a circle
+ * shape's own center, tried only if no point was hit. A circle has no
+ * RGA points of its own, so it needs this separate shape-only pick;
+ * boundary-only hit-testing matches every other shape interaction in
+ * this file (shapes are unfilled outlines). */
+function pickConstraintEntity(screenPt) {
+  const pointHit = hitTestPoint(screenPt);
+  if (pointHit) return { pathId: pointHit.pathId, nodeId: pointHit.nodeId, pos: pointHit.pos, isShapeCenter: false };
+  for (const pathId of state.pathIndex) {
+    const props = state.pathProps.get(pathId) || {};
+    if (props.shape !== "circle" || ui.hiddenLayers.has(props.layer_id)) continue;
+    if (hitTestShape(transformedShapeProps(pathId, props), screenPt)) {
+      return { pathId, nodeId: null, pos: liveShapeCenterOf(pathId), isShapeCenter: true };
+    }
+  }
+  return null;
+}
+
+/** Whether two constraint-selection entries refer to the same pick --
+ * idEq alone isn't enough since a shape_center entry has no nodeId. */
+function constraintEntityEq(a, b) {
+  if (a.pathId !== b.pathId || a.isShapeCenter !== b.isShapeCenter) return false;
+  return a.isShapeCenter || idEq(a.nodeId, b.nodeId);
 }
 
 function renderConstraintPanel() {
@@ -1197,10 +1405,27 @@ function renderConstraintPanel() {
   if (!panel) return;
   if (constraintSelection.length < 2) {
     const remaining = 2 - constraintSelection.length;
-    panel.innerHTML = `<div class="empty-hint">Constrain tool: click ${remaining} more point(s) to relate them.</div>`;
+    panel.innerHTML = `<div class="empty-hint">Constrain tool: click ${remaining} more point(s) or circle(s) to relate them. Dragging an already-constrained point re-solves automatically on release.</div>`;
     return;
   }
   const [a, b] = constraintSelection;
+  const shapeCenterCount = (a.isShapeCenter ? 1 : 0) + (b.isShapeCenter ? 1 : 0);
+  if (shapeCenterCount === 2) {
+    panel.innerHTML = '<div class="empty-hint">Pick one circle and one point on a line for Tangent -- two circles aren\'t a supported combination.</div>';
+    return;
+  }
+  if (shapeCenterCount === 1) {
+    const circleSel = a.isShapeCenter ? a : b;
+    const props = state.pathProps.get(circleSel.pathId) || {};
+    const radius = (getTransform(props).scale || 1) * (props.r || 0);
+    panel.innerHTML = `
+      <div class="field-row"><label>Radius</label><input id="constraintRadius" type="number" step="0.1" value="${radius.toFixed(2)}" style="width:70px"/></div>
+      <button id="constrainTangent" style="width:100%">Tangent</button>
+    `;
+    document.getElementById("constrainTangent").onclick = () =>
+      applyConstraint("tangent", parseFloat(document.getElementById("constraintRadius").value) || radius);
+    return;
+  }
   const dist = Math.hypot(a.pos[0] - b.pos[0], a.pos[1] - b.pos[1]);
   panel.innerHTML = `
     <div class="field-row"><label>Distance</label><input id="constraintDistance" type="number" step="0.1" value="${dist.toFixed(2)}" style="width:70px"/></div>
@@ -1214,6 +1439,131 @@ function renderConstraintPanel() {
   document.getElementById("constrainPerpendicular").onclick = () => applyConstraint("perpendicular");
   document.getElementById("constrainFixedDistance").onclick = () =>
     applyConstraint("fixed_distance", parseFloat(document.getElementById("constraintDistance").value) || 0);
+}
+
+// -- re-solve on drag + persisted constraint badges/list (Phase 14) -------------
+
+const CONSTRAINT_POINT_ORDER = {
+  coincident: ["p1", "p2"],
+  fixed_distance: ["p1", "p2"],
+  parallel: ["p1a", "p1b", "p2a", "p2b"],
+  perpendicular: ["p1a", "p1b", "p2a", "p2b"],
+  tangent: ["circle", null, "line_a", "line_b"],
+};
+
+const CONSTRAINT_GLYPHS = {
+  coincident: "≡", parallel: "∥", perpendicular: "⊥", fixed_distance: "↔", tangent: "⊙",
+};
+
+function resolveConstraintAnchorPos(anchor) {
+  return anchor.type === "shape_center" ? liveShapeCenterOf(anchor.path_id) : livePosOf(anchor.path_id, anchor.node_id);
+}
+
+/** Batch-resolves and re-applies every given persisted constraint in
+ * one /api/solve call (constraints can share points, so solving them
+ * together -- not one at a time -- is what actually keeps a sketch
+ * consistent). Called after a constrain-tool point drag commits (see
+ * commitConstrainedPointDrag) against every constraint touching the
+ * dragged path -- "re-solve automatically when a constrained point is
+ * dragged" per the brief, on release, not per-frame. */
+async function resolveAndApplyConstraints(constraintEntries) {
+  const points = {};
+  const keyToAnchor = {};
+  const solverConstraints = [];
+  for (const [, spec] of constraintEntries) {
+    const order = CONSTRAINT_POINT_ORDER[spec.kind];
+    if (!order) continue;
+    const pointIds = [];
+    let anyUnresolved = false;
+    for (const name of order) {
+      if (name === null) { pointIds.push(null); continue; }
+      const anchor = spec.anchors[name];
+      const key = `${anchor.path_id}:${anchor.type}:${anchor.type === "point" ? opIdKey(anchor.node_id) : "c"}`;
+      const pos = resolveConstraintAnchorPos(anchor);
+      if (!pos) { anyUnresolved = true; break; }
+      points[key] = pos;
+      keyToAnchor[key] = anchor;
+      pointIds.push(key);
+    }
+    if (anyUnresolved) continue; // a concurrent delete -- skip this one constraint, not the whole batch
+    solverConstraints.push({ kind: spec.kind, point_ids: pointIds, param: spec.param || 0 });
+  }
+  if (!solverConstraints.length) return;
+
+  let resp;
+  try {
+    resp = await fetch("/api/solve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ points, constraints: solverConstraints }),
+    });
+  } catch {
+    showToast("Could not reach the solver", "error");
+    return;
+  }
+  if (!resp.ok) { showToast("Solve request failed", "error"); return; }
+  const result = await resp.json();
+  if (!result.converged) { showToast("Solver did not converge -- constraints left as-is", "error"); return; }
+  for (const [key, anchor] of Object.entries(keyToAnchor)) {
+    const newPos = result.positions && result.positions[key];
+    const oldPos = points[key];
+    if (!newPos || !oldPos) continue;
+    if (Math.abs(newPos[0] - oldPos[0]) > 1e-6 || Math.abs(newPos[1] - oldPos[1]) > 1e-6) {
+      if (anchor.type === "shape_center") setCircleCenter(anchor.path_id, newPos);
+      else movePathPointWithUndo(anchor.path_id, anchor.node_id, newPos);
+    }
+  }
+}
+
+/** Commits a constrain-tool point drag (a real, undoable move, exactly
+ * like any other point move here) and then re-solves every persisted
+ * constraint touching that path in one batch. A point with no
+ * constraints yet is just an ordinary move -- no wasted solve request. */
+function commitConstrainedPointDrag(pathId, oldNodeId, newPos) {
+  movePathPointWithUndo(pathId, oldNodeId, newPos);
+  const relevant = [...state.constraints.entries()].filter(([, spec]) =>
+    Object.values(spec.anchors).some((a) => a.type === "point" && a.path_id === pathId)
+  );
+  if (relevant.length) resolveAndApplyConstraints(relevant);
+}
+
+function renderConstraintsListPanel() {
+  const list = document.getElementById("constraintsList");
+  if (!list) return;
+  if (state.constraints.size === 0) {
+    list.innerHTML = '<div class="empty-hint">No persisted constraints yet.</div>';
+    return;
+  }
+  list.innerHTML = "";
+  for (const [cId, spec] of state.constraints) {
+    const row = document.createElement("div");
+    row.className = "path-row";
+    const label = `${CONSTRAINT_GLYPHS[spec.kind] || "?"} ${spec.kind}`;
+    row.innerHTML = `<span class="name">${escapeHtml(label)}</span><button class="ghost-btn" data-act="del">✕</button>`;
+    row.querySelector('[data-act="del"]').onclick = () => { removeConstraint(cId); renderAll(); };
+    list.appendChild(row);
+  }
+}
+
+/** Small glyph near a persisted constraint's (live-resolved) anchors,
+ * at their centroid -- square=endpoint-style badges felt right for
+ * object-snap (Phase 12) but a constraint relates *entities*, not
+ * points, so a symbol per kind (≡ coincident, ∥ parallel, ⊥
+ * perpendicular, ↔ fixed-distance, ⊙ tangent) reads better at a
+ * glance. Silently skipped if any anchor no longer resolves. */
+function renderConstraintBadge(spec) {
+  const positions = Object.values(spec.anchors).map(resolveConstraintAnchorPos).filter(Boolean);
+  if (positions.length < 2) return;
+  const cx = positions.reduce((s, p) => s + p[0], 0) / positions.length;
+  const cy = positions.reduce((s, p) => s + p[1], 0) / positions.length;
+  const [sx, sy] = worldToScreen(cx, cy);
+  ctx.save();
+  ctx.fillStyle = "#ffd43b";
+  ctx.font = "13px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(CONSTRAINT_GLYPHS[spec.kind] || "?", sx, sy);
+  ctx.restore();
 }
 
 // -- measure tool (Phase 13) -----------------------------------------------------
@@ -1627,6 +1977,42 @@ function applyPathTransform(pathId, props, [x, y]) {
   return [pivot[0] + dx * cos - dy * sin + t.tx, pivot[1] + dx * sin + dy * cos + t.ty];
 }
 
+/** Inverse of applyPathTransform -- one *world*-space point back into
+ * the path's own base space. Needed by setCircleCenter (Phase 14: a
+ * tangent-constraint solve returns a circle's new *world* center, but
+ * `cx`/`cy` are stored in base space -- applying the raw world result
+ * directly would double-apply the transform on the next render if the
+ * circle has one). */
+function inversePathTransform(pathId, props, [x, y]) {
+  const t = getTransform(props);
+  if (isIdentityTransform(t)) return [x, y];
+  const pivot = pathBaseCenter(pathId, props);
+  const u = x - t.tx - pivot[0], v = y - t.ty - pivot[1];
+  const rad = (t.rotation * Math.PI) / 180;
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  return [pivot[0] + (u * cos + v * sin) / t.scale, pivot[1] + (-u * sin + v * cos) / t.scale];
+}
+
+/** A circle shape's own live (transformed) center -- the "point" a
+ * tangent constraint's `circle` anchor refers to, even though a circle
+ * has no RGA point of its own to anchor to (see the `constraints`
+ * component's docstring in document.py for the shape_center anchor
+ * type this exists for). */
+function liveShapeCenterOf(pathId) {
+  const props = state.pathProps.get(pathId) || {};
+  if (props.cx === undefined || props.cy === undefined) return null;
+  return applyPathTransform(pathId, props, [props.cx, props.cy]);
+}
+
+/** Writes a solved world-space center back onto a circle shape's own
+ * cx/cy props (inverse-transformed first -- see inversePathTransform). */
+function setCircleCenter(pathId, worldPos) {
+  const props = state.pathProps.get(pathId) || {};
+  const [bx, by] = inversePathTransform(pathId, props, worldPos);
+  setPathProp(pathId, "cx", bx);
+  setPathProp(pathId, "cy", by);
+}
+
 /** Same shape-prop dict, with every coordinate field forward-transformed
  * -- lets hit-testing reuse hitTestShape's existing per-kind math
  * unchanged against the *transformed* shape, rather than needing a
@@ -2032,7 +2418,7 @@ const TOOL_BUTTON_IDS = {
 };
 function setTool(tool) {
   if (ui.tool === "polygon" && tool !== "polygon") cancelPolygon();
-  if (ui.tool === "constrain" && tool !== "constrain") { constraintSelection = []; renderConstraintPanel(); }
+  if (ui.tool === "constrain" && tool !== "constrain") { constraintSelection = []; constrainDrag = null; renderConstraintPanel(); }
   if (isShapeTool(ui.tool) && tool !== ui.tool) { shapeDraft = null; }
   if (ui.tool === "select" && tool !== "select") selectDrag = null;
   if (ui.tool === "measure" && tool !== "measure") { measureSelection = []; measureResult = null; }
@@ -2243,7 +2629,12 @@ function render() {
       continue;
     }
     const entries = liveEntries(state.pathNodes.get(pathId));
-    const pts = entries.map((n) => n.v);
+    // Phase 14: a constrain-tool point drag is previewed live here (not
+    // written to state until pointerup) by substituting its in-progress
+    // world position for whichever node id is currently being dragged.
+    const pts = entries.map((n) =>
+      constrainDrag && constrainDrag.pathId === pathId && idEq(n.id, constrainDrag.nodeId) ? constrainDrag.livePos : n.v
+    );
     if (pts.length === 0) {
       if (wrapped) ctx.restore();
       continue;
@@ -2334,15 +2725,19 @@ function render() {
     ctx.strokeStyle = "#ffd43b";
     ctx.lineWidth = 2;
     for (const sel of constraintSelection) {
-      const pos = livePosOf(sel.pathId, sel.nodeId);
+      // A shape_center pick (Phase 14, for tangent) has no nodeId to
+      // resolve via livePosOf -- liveConstraintSelectionPos handles both.
+      const pos = liveConstraintSelectionPos(sel);
       if (!pos) continue;
       const [sx, sy] = worldToScreen(pos[0], pos[1]);
       ctx.beginPath();
-      ctx.arc(sx, sy, 7, 0, Math.PI * 2);
+      ctx.arc(sx, sy, sel.isShapeCenter ? 10 : 7, 0, Math.PI * 2);
       ctx.stroke();
     }
     ctx.restore();
   }
+
+  for (const spec of state.constraints.values()) renderConstraintBadge(spec);
 
   if (ui.tool === "measure" && measureMode !== "area" && measureSelection.length) {
     ctx.save();
@@ -2589,6 +2984,7 @@ function renderAll() {
   renderPathList();
   renderSelectionPanel();
   renderConstraintPanel();
+  renderConstraintsListPanel();
   renderShapeInputPanel();
   renderMeasurePanel();
   renderDimensionPanel();

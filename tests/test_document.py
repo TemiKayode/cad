@@ -639,3 +639,103 @@ def test_remove_dimension_deletes_it():
     doc.apply(op)
     doc.apply(doc.remove_dimension(dim_id))
     assert dim_id not in dict(doc.dimensions.items())
+
+
+# -- sketch constraints (Phase 14) -------------------------------------------------
+
+
+def _point_anchor(path_id, node_id):
+    return {"type": "point", "path_id": path_id, "node_id": list(node_id)}
+
+
+def test_add_constraint_roundtrips_kind_anchors_and_param():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    cid, op = doc.add_constraint(
+        "fixed_distance",
+        {"p1": _point_anchor(path_id, a_node), "p2": _point_anchor(path_id, b_node)},
+        param=42.0,
+    )
+    doc.apply(op)
+    entry = doc.constraint_list()[0]
+    assert entry["id"] == cid
+    assert entry["kind"] == "fixed_distance"
+    assert entry["param"] == 42.0
+    assert entry["anchors"]["p1"]["path_id"] == path_id
+
+
+def test_constraint_supports_a_shape_center_anchor_for_tangent():
+    """A circle has no RGA points at all -- tangent's `circle` anchor
+    must be representable without one (see the `constraints` field's
+    docstring for the two anchor shapes)."""
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    anchors = {
+        "circle": {"type": "shape_center", "path_id": "circle_path"},
+        "line_a": _point_anchor(path_id, a_node),
+        "line_b": _point_anchor(path_id, b_node),
+    }
+    cid, op = doc.add_constraint("tangent", anchors, param=25.0)
+    doc.apply(op)
+    entry = doc.constraint_list()[0]
+    assert entry["anchors"]["circle"]["type"] == "shape_center"
+    assert entry["id"] == cid
+
+
+def test_constraints_merge_field_wise_like_every_other_lww_component():
+    doc_a = DrawingDocument(LamportClock(actor="a"))
+    layer_id, layer_ops = doc_a.add_layer("L")
+    path_id, path_ops = doc_a.add_path(layer_id, [(0.0, 0.0), (100.0, 0.0)])
+    entries = doc_a._path_geom(path_id).entries()
+    a_node, b_node = entries[0][0], entries[1][0]
+
+    doc_b = DrawingDocument(LamportClock(actor="b"))
+    for op in layer_ops + path_ops:
+        doc_b.apply(op)
+
+    cid, op = doc_a.add_constraint("coincident", {"p1": _point_anchor(path_id, a_node), "p2": _point_anchor(path_id, b_node)})
+    doc_a.apply(op)
+    doc_b.merge(doc_a)
+    assert cid in dict(doc_b.constraints.items())
+
+
+def test_constraints_survive_serialization_roundtrip():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    cid, op = doc.add_constraint(
+        "parallel",
+        {
+            "p1a": _point_anchor(path_id, a_node), "p1b": _point_anchor(path_id, b_node),
+            "p2a": _point_anchor(path_id, a_node), "p2b": _point_anchor(path_id, b_node),
+        },
+    )
+    doc.apply(op)
+    restored = DrawingDocument.from_bytes(LamportClock(actor="b"), doc.to_bytes())
+    assert dict(restored.constraints.items())[cid]["kind"] == "parallel"
+
+
+def test_constraints_default_to_empty_when_absent_from_an_old_snapshot():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    d = doc.to_dict()
+    del d["constraints"]
+    restored = DrawingDocument.from_dict(LamportClock(actor="b"), d)
+    assert dict(restored.constraints.items()) == {}
+    # and it's still a real, usable LWWMap afterward, not a stub
+    layer_id, _ = restored.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(restored, layer_id)
+    cid, op = restored.add_constraint("coincident", {"p1": _point_anchor(path_id, a_node), "p2": _point_anchor(path_id, b_node)})
+    restored.apply(op)
+    assert cid in dict(restored.constraints.items())
+
+
+def test_remove_constraint_deletes_it():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_id, a_node, b_node = _two_point_path(doc, layer_id)
+    cid, op = doc.add_constraint("coincident", {"p1": _point_anchor(path_id, a_node), "p2": _point_anchor(path_id, b_node)})
+    doc.apply(op)
+    doc.apply(doc.remove_constraint(cid))
+    assert cid not in dict(doc.constraints.items())
