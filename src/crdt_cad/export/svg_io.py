@@ -36,7 +36,8 @@ _SVG_UNIT_SUFFIX = {"px": "", "mm": "mm", "in": "in"}
 
 def _shape_bounds(shape: dict) -> tuple[float, float, float, float] | None:
     """Returns (min_x, min_y, max_x, max_y) for a shape primitive
-    (Phase 11), or None if `shape` isn't a recognized kind."""
+    (Phase 11) or a text object (Phase 15), or None if `shape` isn't a
+    recognized kind."""
     kind = shape.get("shape")
     if kind == "line":
         xs = [shape["x1"], shape["x2"]]
@@ -56,22 +57,65 @@ def _shape_bounds(shape: dict) -> tuple[float, float, float, float] | None:
         # trig for a viewBox padding calculation.
         xs = [shape["cx"] - shape["r"], shape["cx"] + shape["r"]]
         ys = [shape["cy"] - shape["r"], shape["cy"] + shape["r"]]
+    elif kind == "text":
+        # (x, y) is the top-left corner (canvas textBaseline="top" /
+        # SVG dominant-baseline="hanging", kept consistent between the
+        # two renderers -- see _shape_svg_element). No real font metrics
+        # available here, so width is a rough per-character estimate --
+        # good enough for a viewBox padding calculation, not meant to be
+        # exact.
+        font_size = shape.get("font_size", 16)
+        content = shape.get("content", "")
+        xs = [shape["x"], shape["x"] + len(content) * font_size * 0.6]
+        ys = [shape["y"], shape["y"] + font_size * 1.2]
     else:
         return None
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def _fill_attrs(props: dict) -> str:
+    """Shared by shapes and freehand/polygon paths (Phase 15): `fill` +
+    `fill_opacity` are ordinary path_props fields, so both kinds of
+    geometry support them identically. Absent/`"none"` renders exactly
+    as every pre-Phase-15 export already did -- an unfilled outline."""
+    fill = props.get("fill")
+    if not fill or fill == "none":
+        return 'fill="none"'
+    opacity = props.get("fill_opacity", 1.0)
+    return f'fill="{fill}" fill-opacity="{opacity}"'
+
+
+def _dash_attr(props: dict, scale: float) -> str:
+    """`dash` (Phase 15: "solid" | "dashed" | "dotted") as an SVG
+    `stroke-dasharray`, sized off the path's own stroke width so it
+    looks proportionate at any thickness. "dotted" relies on a round
+    linecap to actually render as circular dots (a dash length near
+    zero with a round cap) rather than nothing -- both call sites below
+    already set `stroke-linecap="round"` unconditionally, so this
+    doesn't need to repeat it."""
+    dash = props.get("dash", "solid")
+    sw = props.get("stroke_width", 2.5) * scale
+    if dash == "dashed":
+        return f'stroke-dasharray="{sw * 4:.3f},{sw * 3:.3f}"'
+    if dash == "dotted":
+        return f'stroke-dasharray="0.01,{sw * 2.5:.3f}"'
+    return ""
 
 
 def _shape_svg_element(shape: dict, scale: float) -> str | None:
     """One native SVG element per shape kind (Phase 11) -- `<line>`,
     `<rect>`, `<circle>`, `<ellipse>`, or an elliptical-arc `<path>` --
     rather than always flattening to a polyline, so the exported file is
-    a faithful, editable shape in any real vector tool. Returns None if
+    a faithful, editable shape in any real vector tool. Also handles a
+    text object (Phase 15) as a native `<text>` element. Returns None if
     `shape` isn't a recognized kind (the caller falls back to the
     point-list `<path>` every freehand/polygon path already uses)."""
     kind = shape.get("shape")
     color = shape.get("color", "#111111")
     stroke_width = shape.get("stroke_width", 2.5) * scale
-    common = f'stroke="{color}" stroke-width="{stroke_width:.3f}" fill="none" stroke-linecap="round" stroke-linejoin="round"'
+    fill = _fill_attrs(shape)
+    dash = _dash_attr(shape, scale)
+    common = f'stroke="{color}" stroke-width="{stroke_width:.3f}" {fill} {dash} stroke-linecap="round" stroke-linejoin="round"'
     if kind == "line":
         x1, y1, x2, y2 = (shape["x1"] * scale, shape["y1"] * scale, shape["x2"] * scale, shape["y2"] * scale)
         return f'<line x1="{x1:.3f}" y1="{y1:.3f}" x2="{x2:.3f}" y2="{y2:.3f}" {common} />'
@@ -94,6 +138,20 @@ def _shape_svg_element(shape: dict, scale: float) -> str | None:
         r_scaled = r * scale
         d = f"M {x1:.3f},{y1:.3f} A {r_scaled:.3f},{r_scaled:.3f} 0 {large_arc} 1 {x2:.3f},{y2:.3f}"
         return f'<path d="{d}" {common} />'
+    if kind == "text":
+        x, y = shape["x"] * scale, shape["y"] * scale
+        font_size = shape.get("font_size", 16) * scale
+        text_color = shape.get("color", "#e7e9ee")
+        content = (
+            shape.get("content", "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        return (
+            f'<text x="{x:.3f}" y="{y:.3f}" font-size="{font_size:.3f}" '
+            f'fill="{text_color}" dominant-baseline="hanging">{content}</text>'
+        )
     return None
 
 
@@ -153,11 +211,38 @@ def _dimension_svg_element(dim: dict, scale: float, units: str) -> str | None:
     )
 
 
+def _z_ordered(paths: list[dict], layer_order: list[str] | None) -> list[dict]:
+    """Sorts paths by layer order, then creation order (Phase 15: fills
+    need this to composite correctly -- an unfilled outline mostly
+    doesn't reveal z-order bugs, an overlapping filled shape does).
+    `paths` already arrives in creation order (see
+    DrawingDocument.path_list's docstring on why `.to_set()` was wrong
+    for this); `sorted()` is stable, so this only reorders across
+    layers, never within one. Paths with no recognized/known layer sort
+    last, defensively, rather than raising."""
+    if not layer_order:
+        return paths
+    unknown = len(layer_order)
+
+    def layer_index(p: dict) -> int:
+        try:
+            return layer_order.index(p.get("layer_id"))
+        except ValueError:
+            return unknown
+
+    return sorted(paths, key=layer_index)
+
+
 def drawing_to_svg_string(
-    paths: list[dict], padding: float = 20.0, units: str = "px", dimensions: list[dict] | None = None
+    paths: list[dict],
+    padding: float = 20.0,
+    units: str = "px",
+    dimensions: list[dict] | None = None,
+    layer_order: list[str] | None = None,
 ) -> str:
     scale = 1.0 / px_per_unit(units)
     dimensions = dimensions or []
+    paths = _z_ordered(paths, layer_order)
     all_points = [pt for p in paths for pt in p.get("points", [])]
     bounds = [_shape_bounds(p) for p in paths if p.get("shape")]
     bounds += [_dimension_bounds(d) for d in dimensions]
@@ -197,8 +282,10 @@ def drawing_to_svg_string(
         d = _path_d_string(scaled_pts, p.get("point_ids"), p, scale)
         color = p.get("color", "#111111")
         stroke_width = p.get("stroke_width", 2.5) * scale
+        fill = _fill_attrs(p)
+        dash = _dash_attr(p, scale)
         lines.append(
-            f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{stroke_width:.3f}" '
+            f'<path d="{d}" {fill} stroke="{color}" stroke-width="{stroke_width:.3f}" {dash} '
             'stroke-linecap="round" stroke-linejoin="round" />'
         )
     for dim in dimensions:

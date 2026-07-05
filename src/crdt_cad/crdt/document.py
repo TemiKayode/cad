@@ -49,6 +49,7 @@ LayerId = str
 CommentId = str
 DimId = str
 ConstraintId = str
+GroupId = str
 Point = tuple[float, float]
 
 # Document units (Phase 11): stored/CRDT geometry is always in raw
@@ -352,6 +353,12 @@ class DrawingDocument:
         # defining points); tangent uses circle/line_a/line_b -- mirrors
         # sketch.js's ANCHOR_NAMES_BY_KIND exactly.
         self.constraints: LWWMap[ConstraintId, dict] = LWWMap(clock)
+        # Groups (Phase 15): a `group_id` field on path_props (an
+        # ordinary LWW field, so it merges the same way color/width
+        # already do) names which group a path belongs to; `groups`
+        # itself just tracks which group ids currently exist, mirroring
+        # `layers` -- existence only, no per-group properties needed.
+        self.groups: LWWElementSet[GroupId] = LWWElementSet(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -384,6 +391,14 @@ class DrawingDocument:
         self._undo.append({"kind": "layer_remove", "layer_id": layer_id})
         self._redo.clear()
         return op
+
+    # -- groups (Phase 15) --------------------------------------------------------
+    def add_group(self, group_id: GroupId | None = None) -> tuple[GroupId, DocOp]:
+        group_id = group_id or new_id("group")
+        return group_id, DocOp("group", self.groups.add(group_id).to_dict())
+
+    def remove_group(self, group_id: GroupId) -> DocOp:
+        return DocOp("group", self.groups.remove(group_id).to_dict())
 
     # -- paths ------------------------------------------------------------------
     def add_path(
@@ -610,6 +625,8 @@ class DrawingDocument:
             return self.dimensions.apply(LWWOp.from_dict(op.payload))
         if op.target == "constraint":
             return self.constraints.apply(LWWOp.from_dict(op.payload))
+        if op.target == "group":
+            return self.groups.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown doc op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -631,18 +648,26 @@ class DrawingDocument:
         changed |= self.settings.merge(other.settings)
         changed |= self.dimensions.merge(other.dimensions)
         changed |= self.constraints.merge(other.constraints)
+        changed |= self.groups.merge(other.groups)
         return changed
 
     # -- reads ------------------------------------------------------------------
     def layer_list(self) -> list[dict]:
+        # Iterates `self.layers` directly (not `.to_set()`, which
+        # discards order by converting to a real `set`) -- LWWElementSet
+        # is backed by an LWWMap whose dict preserves each element's
+        # *first-added* position, so this is genuine creation order, not
+        # an accident of hashing. Phase 15 (fills) needs "layer order,
+        # then creation order" for correct z-order; this is what
+        # supplies the "layer order" half.
         return [
             {"id": lid, **dict(self._layer_props(lid).items())}
-            for lid in self.layers.to_set()
+            for lid in self.layers
         ]
 
     def path_list(self) -> list[dict]:
         out = []
-        for pid in self.path_index.to_set():
+        for pid in self.path_index:
             props = dict(self._path_props(pid).items())
             entries = self._path_geom(pid).entries()
             out.append(
@@ -694,6 +719,9 @@ class DrawingDocument:
     def constraint_list(self) -> list[dict]:
         return [{"id": cid, **payload} for cid, payload in self.constraints.items()]
 
+    def group_list(self) -> list[GroupId]:
+        return list(self.groups)
+
     # -- delta sync ---------------------------------------------------------------
     def frontier(self) -> VectorClock:
         vc = self.layers.frontier()
@@ -709,6 +737,7 @@ class DrawingDocument:
         vc = vc.merge(self.settings.frontier())
         vc = vc.merge(self.dimensions.frontier())
         vc = vc.merge(self.constraints.frontier())
+        vc = vc.merge(self.groups.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[DocOp]:
@@ -725,6 +754,7 @@ class DrawingDocument:
         out += [DocOp("setting", op.to_dict()) for op in self.settings.ops_since(vc)]
         out += [DocOp("dimension", op.to_dict()) for op in self.dimensions.ops_since(vc)]
         out += [DocOp("constraint", op.to_dict()) for op in self.constraints.ops_since(vc)]
+        out += [DocOp("group", op.to_dict()) for op in self.groups.ops_since(vc)]
         return out
 
     # -- serialization --------------------------------------------------------------
@@ -740,6 +770,7 @@ class DrawingDocument:
             "settings": self.settings.to_dict(),
             "dimensions": self.dimensions.to_dict(),
             "constraints": self.constraints.to_dict(),
+            "groups": self.groups.to_dict(),
         }
 
     @staticmethod
@@ -760,6 +791,8 @@ class DrawingDocument:
         doc.dimensions = LWWMap.from_dict(clock, d["dimensions"]) if "dimensions" in d else LWWMap(clock)
         # Same backward-compat default for "constraints" (Phase 14).
         doc.constraints = LWWMap.from_dict(clock, d["constraints"]) if "constraints" in d else LWWMap(clock)
+        # Same backward-compat default for "groups" (Phase 15).
+        doc.groups = LWWElementSet.from_dict(clock, d["groups"]) if "groups" in d else LWWElementSet(clock)
         return doc
 
     def to_bytes(self) -> bytes:

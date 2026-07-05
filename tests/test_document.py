@@ -739,3 +739,79 @@ def test_remove_constraint_deletes_it():
     doc.apply(op)
     doc.apply(doc.remove_constraint(cid))
     assert cid not in dict(doc.constraints.items())
+
+
+# -- groups (Phase 15) -------------------------------------------------------------
+
+
+def test_add_group_then_tagging_paths_with_its_group_id():
+    """Grouping itself is just an ordinary group_id path_prop field (an
+    LWW field, merges like color/width already do) -- `groups` only
+    tracks which group ids currently exist, mirroring `layers`."""
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, _ = doc.add_layer("L")
+    path_a, _ = doc.add_path(layer_id, [(0.0, 0.0), (1.0, 1.0)])
+    path_b, _ = doc.add_path(layer_id, [(2.0, 2.0), (3.0, 3.0)])
+    gid, op = doc.add_group()
+    doc.apply(op)
+    doc.apply(doc.set_path_prop(path_a, "group_id", gid))
+    doc.apply(doc.set_path_prop(path_b, "group_id", gid))
+    assert doc.group_list() == [gid]
+    assert doc.path_props_dict(path_a)["group_id"] == gid
+    assert doc.path_props_dict(path_b)["group_id"] == gid
+
+
+def test_groups_merge_like_every_other_lww_element_set():
+    doc_a = DrawingDocument(LamportClock(actor="a"))
+    doc_b = DrawingDocument(LamportClock(actor="b"))
+    gid, op = doc_a.add_group()
+    doc_a.apply(op)
+    doc_b.merge(doc_a)
+    assert doc_b.group_list() == [gid]
+
+
+def test_groups_survive_serialization_roundtrip():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    gid, op = doc.add_group()
+    doc.apply(op)
+    restored = DrawingDocument.from_bytes(LamportClock(actor="b"), doc.to_bytes())
+    assert restored.group_list() == [gid]
+
+
+def test_groups_default_to_empty_when_absent_from_an_old_snapshot():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    d = doc.to_dict()
+    del d["groups"]
+    restored = DrawingDocument.from_dict(LamportClock(actor="b"), d)
+    assert restored.group_list() == []
+    # and it's still a real, usable LWWElementSet afterward, not a stub
+    gid, op = restored.add_group()
+    restored.apply(op)
+    assert restored.group_list() == [gid]
+
+
+def test_remove_group_deletes_it():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    gid, op = doc.add_group()
+    doc.apply(op)
+    doc.apply(doc.remove_group(gid))
+    assert doc.group_list() == []
+
+
+def test_layer_list_and_path_list_preserve_creation_order():
+    """Regression test: layer_list/path_list used to iterate
+    LWWElementSet.to_set() (a real Python `set`, which does not
+    preserve insertion order), so their output order was an accident of
+    hashing, not genuine creation order. Phase 15's fills need "layer
+    order, then creation order" for correct z-order -- this is only
+    true because LWWElementSet is backed by an LWWMap whose dict
+    preserves each element's first-added position, and layer_list/
+    path_list now iterate it directly instead of going through
+    to_set()."""
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_ids = [doc.add_layer(f"L{i}")[0] for i in range(8)]
+    assert [layer["id"] for layer in doc.layer_list()] == layer_ids
+
+    layer_id = layer_ids[0]
+    path_ids = [doc.add_path(layer_id, [(0.0, 0.0), (float(i), float(i))])[0] for i in range(8)]
+    assert [path["id"] for path in doc.path_list()] == path_ids

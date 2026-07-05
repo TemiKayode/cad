@@ -23,6 +23,7 @@ const state = {
   settings: new Map(),    // "units" | "grid_spacing" | "snap_step" -> value (Phase 11)
   dimensions: new Map(),  // dim_id -> {a_path, a_node, b_path, b_node, offset} (Phase 13)
   constraints: new Map(), // constraint_id -> {kind, anchors, param} (Phase 14)
+  groups: new Set(),      // group_id -> just existence, like layers (Phase 15)
 };
 
 // -- document units (Phase 11) ------------------------------------------------
@@ -200,6 +201,7 @@ function observeSnapshotCounters(doc) {
   scanEntries(doc.settings);
   scanEntries(doc.dimensions);
   scanEntries(doc.constraints);
+  scanEntries(doc.groups);
   clock.observe(maxCounter);
 }
 
@@ -240,6 +242,7 @@ function loadSnapshot(doc) {
   for (const e of doc.dimensions.entries) if (!e.d) state.dimensions.set(e.k, e.v);
   state.constraints.clear();
   for (const e of doc.constraints.entries) if (!e.d) state.constraints.set(e.k, e.v);
+  state.groups = new Set(doc.groups.entries.filter((e) => !e.d).map((e) => e.k));
 
   if (!ui.activeLayer || !state.layers.has(ui.activeLayer)) {
     ui.activeLayer = state.layerOrder[0] || null;
@@ -290,6 +293,8 @@ function applyOp(op) {
     if (!p.d) state.dimensions.set(p.k, p.v); else state.dimensions.delete(p.k);
   } else if (op.target === "constraint") {
     if (!p.d) state.constraints.set(p.k, p.v); else state.constraints.delete(p.k);
+  } else if (op.target === "group") {
+    if (!p.d) state.groups.add(p.k); else state.groups.delete(p.k);
   }
 }
 
@@ -452,6 +457,50 @@ document.getElementById("downloadSvgBtn").onclick = () =>
   triggerDownload(withToken(`/api/rooms/${encodeURIComponent(room)}/export/svg`, "drawing", room));
 document.getElementById("downloadDxfBtn").onclick = () =>
   triggerDownload(withToken(`/api/rooms/${encodeURIComponent(room)}/export/dxf`, "drawing", room));
+
+// -- PNG export (Phase 15) -------------------------------------------------------
+// Purely client-side (canvas.toBlob()) -- no server work needed, per the
+// brief. Unlike JSON/SVG/DXF's server-served attachments (which carry
+// their own filename via Content-Disposition, so triggerDownload's
+// download="" defers to it), a blob: URL has no filename of its own, so
+// this sets one explicitly instead of reusing triggerDownload.
+function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function downloadCanvasAsPng(filename) {
+  canvas.toBlob((blob) => {
+    if (!blob) { showToast("PNG export failed", "error"); return; }
+    triggerBlobDownload(blob, filename);
+  }, "image/png");
+}
+
+document.getElementById("downloadPngBtn").onclick = () => downloadCanvasAsPng(`${room}.png`);
+document.getElementById("downloadPngFitBtn").onclick = () => {
+  // Fit-to-content variant: temporarily re-frame the view, capture, then
+  // restore the user's actual pan/zoom -- canvas.toBlob() is async, so
+  // the restore must happen *inside* its callback, after the capture has
+  // actually read the canvas, not right after the (synchronous)
+  // fitToContent() call returns.
+  const savedView = { ...view };
+  fitToContent();
+  canvas.toBlob((blob) => {
+    if (blob) triggerBlobDownload(blob, `${room}-fit.png`);
+    else showToast("PNG export failed", "error");
+    view.panX = savedView.panX;
+    view.panY = savedView.panY;
+    view.zoom = savedView.zoom;
+    render();
+    updateZoomIndicator();
+  }, "image/png");
+};
 
 document.getElementById("importBtn").onclick = () => document.getElementById("importFileInput").click();
 document.getElementById("importFileInput").addEventListener("change", async (e) => {
@@ -917,6 +966,8 @@ canvas.addEventListener("click", (e) => {
       dimensionSelection = [];
     }
     render();
+  } else if (ui.tool === "text") {
+    commitText(pt);
   }
 });
 
@@ -938,15 +989,24 @@ function beginSelectDrag(e) {
   const screenPt = canvasPoint(e);
   const hit = hitTestPath(screenPt);
   if (hit) {
+    // Phase 15: "selecting any member selects the group" -- an
+    // ungrouped path's own "group" is just itself, so this subsumes the
+    // pre-Phase-15 single-path behavior unchanged.
+    const members = groupMembersOf(hit);
     if (e.shiftKey) {
       // Shift-click only ever adjusts the selection -- it never starts
       // a move, so users can freely build up a multi-selection without
-      // accidentally dragging the last-clicked path.
-      toggleSelection(hit);
+      // accidentally dragging the last-clicked path. Toggles the whole
+      // group together, not just the clicked member.
+      const allSelected = members.every((m) => ui.selectedPaths.has(m));
+      for (const m of members) {
+        if (allSelected) ui.selectedPaths.delete(m);
+        else ui.selectedPaths.add(m);
+      }
       renderAll();
       return;
     }
-    if (!ui.selectedPaths.has(hit)) selectOnly(hit);
+    if (!members.every((m) => ui.selectedPaths.has(m))) ui.selectedPaths = new Set(members);
     const primaryProps = state.pathProps.get(hit) || {};
     selectDrag = {
       mode: "move",
@@ -1287,6 +1347,55 @@ function removeConstraint(id) {
   const op = { target: "constraint", payload: lwwOp(clock.tick(), id, null, true) };
   applyOp(op);
   sendOps([op]);
+}
+
+// -- groups (Phase 15) ------------------------------------------------------------
+// `group_id` is an ordinary path_prop field -- grouping itself needs no
+// new CRDT machinery, it merges field-wise exactly like color/width
+// already do. `groups` only tracks which group ids currently exist,
+// mirroring `layers`.
+
+function addGroup() {
+  const id = "group_" + rid();
+  const op = { target: "group", payload: lwwOp(clock.tick(), id, true, false) };
+  applyOp(op);
+  sendOps([op]);
+  return id;
+}
+
+/** Tags every path in `pathIds` with a fresh group id -- selecting any
+ * one of them afterward selects the whole group (see beginSelectDrag's
+ * hit-handling). */
+function groupPaths(pathIds) {
+  if (pathIds.length < 2) return;
+  const gid = addGroup();
+  for (const pathId of pathIds) setPathProp(pathId, "group_id", gid);
+  renderAll();
+}
+
+/** Clears `group_id` from every current member of the given path's
+ * group (not just the clicked path) -- ungrouping is a whole-group
+ * action, matching "selecting any member selects the group." The group
+ * id's own existence record is removed too, once nothing references it. */
+function ungroupPath(pathId) {
+  const gid = (state.pathProps.get(pathId) || {}).group_id;
+  if (!gid) return;
+  for (const [pid, props] of state.pathProps) {
+    if (props.group_id === gid) setPathProp(pid, "group_id", null);
+  }
+  const op = { target: "group", payload: lwwOp(clock.tick(), gid, null, true) };
+  applyOp(op);
+  sendOps([op]);
+  renderAll();
+}
+
+/** Every path currently tagged with the same group_id as `pathId` --
+ * used so clicking any one member selects the whole group. Returns
+ * just `[pathId]` if it isn't grouped. */
+function groupMembersOf(pathId) {
+  const gid = (state.pathProps.get(pathId) || {}).group_id;
+  if (!gid) return [pathId];
+  return [...state.pathIndex].filter((pid) => (state.pathProps.get(pid) || {}).group_id === gid);
 }
 
 /** Solves the chosen constraint against the two currently-selected
@@ -1847,6 +1956,23 @@ function commitShape(props) {
   return id;
 }
 
+/** Text tool (Phase 15): a single click places a text object with
+ * sensible defaults at that point -- like every other shape here, its
+ * whole definition lives in path_props (no RGA points), so concurrent
+ * edits to *different* fields (content vs. font_size vs. color) merge
+ * field-wise for free. Editing the placed text (content, font size) is
+ * done afterward via the single-selection panel, the same "create with
+ * defaults, edit via panel" pattern the shape tools already use --
+ * there's no inline inline text-entry UI at the click point. */
+function commitText(pt) {
+  if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
+  const props = { shape: "text", x: pt[0], y: pt[1], content: "Text", font_size: 16 };
+  const { id } = addPath(ui.activeLayer, [], actorColor, 2.5, props);
+  selectOnly(id);
+  renderAll();
+  return id;
+}
+
 /** While dragging, shows the live-computed dimensions read-only (the
  * drag itself is what's sizing the shape); otherwise, the fields are
  * freely editable and Enter/"Create" commits a new shape at the current
@@ -1897,11 +2023,28 @@ function renderShapeInputPanel() {
  * returns true if within a small threshold of the shape's boundary. */
 function hitTestShape(shape, screenPt) {
   const threshold = 8;
+  // Phase 15: once a shape has a real fill, clicking anywhere in its
+  // filled interior should select it -- boundary-only hit-testing was
+  // correct for an unfilled outline (Phase 11), but would feel broken
+  // for something that now visibly looks like solid content. Line/Arc
+  // are never fillable (see applyFillIfSet), so they keep the original
+  // boundary-only behavior unconditionally.
+  const filled = shape.fill && shape.fill !== "none";
+  if (shape.shape === "text") {
+    const b = textBounds(shape);
+    const [sx0, sy0] = worldToScreen(b.x, b.y);
+    const [sx1, sy1] = worldToScreen(b.x + b.w, b.y + b.h);
+    return screenPt[0] >= sx0 && screenPt[0] <= sx1 && screenPt[1] >= sy0 && screenPt[1] <= sy1;
+  }
   if (shape.shape === "line") {
     const [a, b] = [worldToScreen(shape.x1, shape.y1), worldToScreen(shape.x2, shape.y2)];
     return distToSegment(screenPt, a, b) < threshold;
   }
   if (shape.shape === "rect") {
+    if (filled) {
+      const [wx, wy] = screenToWorld(screenPt[0], screenPt[1]);
+      if (wx >= shape.x && wx <= shape.x + shape.w && wy >= shape.y && wy <= shape.y + shape.h) return true;
+    }
     const corners = [
       [shape.x, shape.y], [shape.x + shape.w, shape.y],
       [shape.x + shape.w, shape.y + shape.h], [shape.x, shape.y + shape.h],
@@ -1920,6 +2063,7 @@ function hitTestShape(shape, screenPt) {
     // and compare the boundary distance in that normalized space, scaled
     // back by the smaller radius for a reasonable screen-pixel threshold.
     const normDist = Math.hypot(dx / rx, dy / ry);
+    if (filled && shape.shape !== "arc" && normDist <= 1) return true;
     if (Math.abs(normDist - 1) * Math.min(rx, ry) > threshold) return false;
     if (shape.shape !== "arc") return true;
     let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
@@ -2409,12 +2553,13 @@ document.getElementById("toolRect").onclick = () => setTool("rect");
 document.getElementById("toolCircle").onclick = () => setTool("circle");
 document.getElementById("toolEllipse").onclick = () => setTool("ellipse");
 document.getElementById("toolArc").onclick = () => setTool("arc");
+document.getElementById("toolText").onclick = () => setTool("text");
 document.getElementById("toolMeasure").onclick = () => setTool("measure");
 document.getElementById("toolDimension").onclick = () => setTool("dimension");
 const TOOL_BUTTON_IDS = {
   pen: "toolPen", select: "toolSelect", polygon: "toolPolygon", constrain: "toolConstrain",
   line: "toolLine", rect: "toolRect", circle: "toolCircle", ellipse: "toolEllipse", arc: "toolArc",
-  measure: "toolMeasure", dimension: "toolDimension",
+  text: "toolText", measure: "toolMeasure", dimension: "toolDimension",
 };
 function setTool(tool) {
   if (ui.tool === "polygon" && tool !== "polygon") cancelPolygon();
@@ -2450,6 +2595,8 @@ function renderToolHint() {
     hint.textContent = "Read-only measurement -- pick a mode below, then click points (or a shape, for Area/Perim.). Nothing is sent to collaborators.";
   } else if (ui.tool === "dimension") {
     hint.textContent = "Click two points to add a persistent dimension that stays accurate as the geometry moves.";
+  } else if (ui.tool === "text") {
+    hint.textContent = "Click to place a text object -- edit its content and font size afterward in the Selection panel.";
   } else if (isShapeTool(ui.tool)) {
     hint.textContent = "Drag to size and place, or type exact dimensions below.";
   } else if (ui.tool === "select") {
@@ -2569,7 +2716,66 @@ function drawGrid(rect) {
  * shape's own color/width (the caller has already set a dashed preview
  * style) and skips the selection glow -- used for the live in-progress
  * drag preview, which isn't a committed, selectable path yet. */
+/** Bounding box for a text object (Phase 15) -- (x, y) is its top-left
+ * corner (canvas textBaseline="top", matching svg_io's
+ * dominant-baseline="hanging" so both renderers agree on what the
+ * anchor point means). No real font metrics available for width, so
+ * it's the same rough per-character estimate `_shape_bounds` uses
+ * server-side -- good enough for hit-testing/selection outline, not
+ * meant to be exact. */
+function textBounds(props) {
+  const fontSize = props.font_size || 16;
+  const width = (props.content || "").length * fontSize * 0.6;
+  return { x: props.x, y: props.y, w: width, h: fontSize * 1.2 };
+}
+
+/** `dash` (Phase 15: "solid"|"dashed"|"dotted") as a canvas line dash
+ * pattern -- mirrors svg_io._dash_attr's sizing exactly (proportional
+ * to stroke_width) so the two renderers agree. "dotted" relies on the
+ * round linecap already set by every stroke call here to actually
+ * render as dots, not a hand-drawn dot loop. */
+function applyDashStyle(props) {
+  const dash = props.dash || "solid";
+  const sw = props.stroke_width || 2.5;
+  if (dash === "dashed") ctx.setLineDash([sw * 4, sw * 3]);
+  else if (dash === "dotted") ctx.setLineDash([0.01, sw * 2.5]);
+  else ctx.setLineDash([]);
+}
+
+/** Fills the *current* path (Phase 15: `fill`/`fill_opacity` props) if
+ * set -- shared by shapes (drawShapePath) and freehand/polygon paths
+ * (render()'s main loop), called after ctx.beginPath()/the shape
+ * outline but before ctx.stroke(), so the fill sits under the stroke
+ * the way every vector tool already draws it. */
+function applyFillIfSet(props) {
+  if (!props.fill || props.fill === "none") return;
+  ctx.save();
+  ctx.fillStyle = props.fill;
+  ctx.globalAlpha = props.fill_opacity ?? 1;
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawShapePath(props, isSelected, isDraftPreview = false) {
+  if (props.shape === "text") {
+    ctx.save();
+    ctx.font = `${props.font_size || 16}px sans-serif`;
+    ctx.textBaseline = "top";
+    ctx.fillStyle = props.color || "#e7e9ee";
+    ctx.globalAlpha = isDraftPreview ? 0.6 : 1;
+    ctx.fillText(props.content || "", props.x, props.y);
+    ctx.restore();
+    if (isSelected) {
+      const b = textBounds(props);
+      ctx.save();
+      ctx.strokeStyle = "#4dabf7";
+      ctx.lineWidth = 1 / view.zoom;
+      ctx.setLineDash([4 / view.zoom, 3 / view.zoom]);
+      ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.restore();
+    }
+    return;
+  }
   ctx.beginPath();
   if (props.shape === "line") {
     ctx.moveTo(props.x1, props.y1);
@@ -2587,11 +2793,17 @@ function drawShapePath(props, isSelected, isDraftPreview = false) {
     ctx.stroke();
     return;
   }
+  // Line/Arc have no meaningful enclosed area (same judgment call the
+  // Measure tool's Area/Perimeter mode and both server-side exporters
+  // already make) -- fill is a no-op for them regardless of the prop.
+  if (props.shape !== "line" && props.shape !== "arc") applyFillIfSet(props);
   ctx.strokeStyle = props.color || "#e7e9ee";
   ctx.lineWidth = props.stroke_width || 2.5;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
+  applyDashStyle(props);
   ctx.stroke();
+  ctx.setLineDash([]);
   if (isSelected) {
     ctx.save();
     ctx.strokeStyle = "#4dabf7";
@@ -2600,6 +2812,22 @@ function drawShapePath(props, isSelected, isDraftPreview = false) {
     ctx.stroke();
     ctx.restore();
   }
+}
+
+/** Paths sorted by layer order, then creation order (Phase 15: fills
+ * need correct z-order to composite right -- an unfilled outline
+ * mostly doesn't reveal z-order bugs, an overlapping filled shape
+ * does). `state.pathIndex` iterates in true creation order already
+ * (mirrors the server-side fix in DrawingDocument.path_list); Array.sort
+ * is stable, so sorting by layer index alone only reorders *across*
+ * layers, never within one -- exactly "layer order, then creation
+ * order," matching svg_io._z_ordered/dxf_io._z_ordered server-side. */
+function zOrderedPathIds() {
+  return [...state.pathIndex].sort((a, b) => {
+    const layerA = state.layerOrder.indexOf((state.pathProps.get(a) || {}).layer_id);
+    const layerB = state.layerOrder.indexOf((state.pathProps.get(b) || {}).layer_id);
+    return layerA - layerB;
+  });
 }
 
 function render() {
@@ -2615,7 +2843,7 @@ function render() {
   ctx.translate(view.panX, view.panY);
   ctx.scale(view.zoom, view.zoom);
 
-  for (const pathId of state.pathIndex) {
+  for (const pathId of zOrderedPathIds()) {
     const props = state.pathProps.get(pathId) || {};
     if (ui.hiddenLayers.has(props.layer_id)) continue;
     // Phase 12: wraps this path's own drawing in canvas's nested transform
@@ -2656,11 +2884,19 @@ function render() {
         ctx.lineTo(pts[i][0], pts[i][1]);
       }
     }
+    // A freehand/polygon path is only meaningfully fillable when it's
+    // actually closed (first point == last point, e.g. the strict
+    // Polygon tool) -- an open stroke has no well-defined interior,
+    // matching both server-side exporters' identical judgment call.
+    const isClosed = pts.length > 2 && Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1e-6;
+    if (isClosed) applyFillIfSet(props);
     ctx.strokeStyle = props.color || "#e7e9ee";
     ctx.lineWidth = props.stroke_width || 2.5;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    applyDashStyle(props);
     ctx.stroke();
+    ctx.setLineDash([]);
     if (ui.selectedPaths.has(pathId)) {
       ctx.save();
       ctx.strokeStyle = "#4dabf7";
@@ -2862,9 +3098,19 @@ function renderPathList() {
  * delete, align, and (3+ paths) distribute. */
 function renderBulkSelectionPanel(panel) {
   const count = ui.selectedPaths.size;
+  const selectedIds = [...ui.selectedPaths];
+  const groupIds = new Set(selectedIds.map((id) => (state.pathProps.get(id) || {}).group_id).filter(Boolean));
+  // "Group" only makes sense for paths not already sharing one single
+  // group; "Ungroup" only makes sense when the whole selection already
+  // is exactly one existing group (selecting any member selects all of
+  // it, so this is really just "is the selection currently a group").
+  const isExactlyOneGroup = groupIds.size === 1 && [...groupIds][0] && groupMembersOf(selectedIds[0]).length === count;
   panel.innerHTML = `
     <div class="empty-hint">${count} paths selected.</div>
     <button style="width:100%;margin-top:6px" id="bulkDuplicate">Duplicate (Ctrl/Cmd+D)</button>
+    ${isExactlyOneGroup
+      ? '<button style="width:100%;margin-top:6px" id="bulkUngroup">Ungroup</button>'
+      : '<button style="width:100%;margin-top:6px" id="bulkGroup">Group</button>'}
     <div class="field-row" style="margin-top:6px"><label>Align</label></div>
     <div class="tool-row">
       <button id="alignLeft" title="Align left">⟸</button>
@@ -2885,6 +3131,11 @@ function renderBulkSelectionPanel(panel) {
   `;
   document.getElementById("bulkDuplicate").onclick = duplicateSelection;
   document.getElementById("bulkDelete").onclick = deleteSelection;
+  if (isExactlyOneGroup) {
+    document.getElementById("bulkUngroup").onclick = () => { ungroupPath(selectedIds[0]); renderAll(); };
+  } else {
+    document.getElementById("bulkGroup").onclick = () => { groupPaths(selectedIds); renderAll(); };
+  }
   document.getElementById("alignLeft").onclick = () => alignSelection("left");
   document.getElementById("alignHCenter").onclick = () => alignSelection("hcenter");
   document.getElementById("alignRight").onclick = () => alignSelection("right");
@@ -2916,21 +3167,50 @@ function renderSelectionPanel() {
   }
   const props = state.pathProps.get(pathId) || {};
   const t = getTransform(props);
-  panel.innerHTML = `
-    <div class="field-row"><label>Color</label><input id="selColor" type="text" value="${props.color || "#ffffff"}" style="width:90px"/></div>
+  const isText = props.shape === "text";
+  const typeSpecificFields = isText
+    ? `
+    <div class="field-row"><label>Content</label><input id="selContent" type="text" value="${escapeHtml(props.content || "")}" style="width:120px"/></div>
+    <div class="field-row"><label>Font size</label><input id="selFontSize" type="number" min="4" step="1" value="${props.font_size || 16}" style="width:70px"/></div>`
+    : `
     <div class="field-row"><label>Width</label><input id="selWidth" type="number" min="1" max="20" step="0.5" value="${props.stroke_width || 2.5}" style="width:70px"/></div>
+    <div class="field-row"><label>Dash</label>
+      <select id="selDash" style="width:90px">
+        <option value="solid" ${!props.dash || props.dash === "solid" ? "selected" : ""}>Solid</option>
+        <option value="dashed" ${props.dash === "dashed" ? "selected" : ""}>Dashed</option>
+        <option value="dotted" ${props.dash === "dotted" ? "selected" : ""}>Dotted</option>
+      </select>
+    </div>
+    <div class="field-row"><label>Fill</label><input id="selFill" type="text" placeholder="none" value="${escapeHtml(props.fill || "")}" style="width:90px"/></div>
+    <div class="field-row"><label>Fill opacity</label><input id="selFillOpacity" type="number" min="0" max="1" step="0.05" value="${props.fill_opacity ?? 1}" style="width:70px"/></div>`;
+  const ungroupButton = props.group_id
+    ? '<button style="width:100%;margin-top:4px" id="selUngroup">Ungroup</button>'
+    : "";
+  panel.innerHTML = `
+    <div class="field-row"><label>Color</label><input id="selColor" type="text" value="${escapeHtml(props.color || "#ffffff")}" style="width:90px"/></div>
+    ${typeSpecificFields}
     <div class="field-row"><label>Rotation (°)</label><input id="selRotation" type="number" step="1" value="${t.rotation}" style="width:70px"/></div>
     <div class="field-row"><label>Scale</label><input id="selScale" type="number" min="0.01" step="0.1" value="${t.scale}" style="width:70px"/></div>
     <button style="width:100%;margin-top:4px" id="selDuplicate">Duplicate (Ctrl/Cmd+D)</button>
+    ${ungroupButton}
     <button class="danger" id="selDelete" style="width:100%;margin-top:6px">Delete path</button>
   `;
   document.getElementById("selColor").onchange = (e) => setPathProp(pathId, "color", e.target.value);
-  document.getElementById("selWidth").onchange = (e) => setPathProp(pathId, "stroke_width", parseFloat(e.target.value));
+  if (isText) {
+    document.getElementById("selContent").onchange = (e) => setPathProp(pathId, "content", e.target.value);
+    document.getElementById("selFontSize").onchange = (e) => setPathProp(pathId, "font_size", parseFloat(e.target.value) || 16);
+  } else {
+    document.getElementById("selWidth").onchange = (e) => setPathProp(pathId, "stroke_width", parseFloat(e.target.value));
+    document.getElementById("selDash").onchange = (e) => setPathProp(pathId, "dash", e.target.value);
+    document.getElementById("selFill").onchange = (e) => setPathProp(pathId, "fill", e.target.value.trim() || null);
+    document.getElementById("selFillOpacity").onchange = (e) => setPathProp(pathId, "fill_opacity", parseFloat(e.target.value));
+  }
   document.getElementById("selRotation").onchange = (e) =>
     setPathProp(pathId, "transform", { ...getTransform(state.pathProps.get(pathId) || {}), rotation: parseFloat(e.target.value) || 0 });
   document.getElementById("selScale").onchange = (e) =>
     setPathProp(pathId, "transform", { ...getTransform(state.pathProps.get(pathId) || {}), scale: parseFloat(e.target.value) || 1 });
   document.getElementById("selDuplicate").onclick = duplicateSelection;
+  if (props.group_id) document.getElementById("selUngroup").onclick = () => { ungroupPath(pathId); renderAll(); };
   document.getElementById("selDelete").onclick = () => { removePath(pathId); renderAll(); };
 
   commentPanel.innerHTML = "";

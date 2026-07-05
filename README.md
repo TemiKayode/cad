@@ -38,6 +38,7 @@ over gaps.
 | Selection editing: move/rotate/scale, multi-select, duplicate, copy/paste, align/distribute, object snap (Phase 12) | **Done** -- `transform` path_prop baked only at export time, canvas's own nested transform for rendering, see below |
 | Measurement (Distance/Angle/Area, read-only) + Dimension annotations (Phase 13) | **Done** -- dimensions reference geometry by (path id, RGA node id), auto-updating live and exporting as real DXF `DIMENSION` entities, see below |
 | Persistent sketch constraints, tangent, re-solve-on-drag (Phase 14) | **Done** -- new `constraints` document component, `movePathPoint` now undoable and remaps both dimensions and constraints onto a moved point's new node id, see below |
+| Designer features: text, fills, stroke styles, groups, PNG export (Phase 15) | **Done** -- new `groups` component, filled shapes now hit-test their interior (not just the boundary), real z-order (layer then creation order) fixed both client- and server-side, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -51,7 +52,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 28 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 33 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -66,7 +67,7 @@ over gaps.
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 309 tests, ~15s
+./.venv/Scripts/python -m pytest tests/ -v   # 328 tests, ~15s
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -843,11 +844,14 @@ and re-solving automatically when a constrained point is dragged), a
 Area-Perimeter) and a **Dimension** tool for persistent, auto-updating
 annotations (Phase 13 -- see below), a real pan/zoom/grid/snap
 **viewport** and a **document units** (px/mm/in) selector (Phase
-10/11 -- see below), per-layer visibility, undo/redo, live multi-user
-cursors, comments, **Save**/**.json/.svg/.dxf download**/**Import SVG
-or DXF**/**Share** (copies an invite link), a keyboard shortcut
-overlay (`?`), and an offline toggle that closes both the WebSocket
-and any P2P connection.
+10/11 -- see below), a **Text** tool, per-shape **fill**/**fill
+opacity**/**stroke style** (solid/dashed/dotted), and **Group**/
+**Ungroup** for multi-selections (Phase 15 -- see below), per-layer
+visibility, undo/redo, live multi-user cursors, comments,
+**Save**/**.json/.svg/.dxf/.png download**/**Import SVG or DXF**/
+**Share** (copies an invite link), a keyboard shortcut overlay (`?`),
+and an offline toggle that closes both the WebSocket and any P2P
+connection.
 
 **3D mesh (`/3d`)**: click the ground grid to place vertices, click 3+
 vertices in order (then the first one again, or "Finish") to build a
@@ -1234,13 +1238,78 @@ constraint now persists, and constrained geometry stays constrained.
   individually valid and solve correctly, just redundant -- a known,
   minor limitation, not a correctness bug.
 
+## Designer features: text, fills, strokes, groups, PNG export (Phase 15)
+
+- **Text tool**: a text object is a path whose whole definition lives in
+  `path_props` (`{"shape": "text", "x", "y", "content", "font_size",
+  "color"}`) -- the exact same "no new CRDT primitive" representation
+  Phase 11's shape primitives already established, so concurrent edits
+  to *different* fields (content vs. font size vs. color) merge
+  field-wise for free. A click places one with sensible defaults;
+  content/font size are edited afterward via the selection panel, the
+  same "create with defaults, edit via panel" pattern every shape tool
+  already uses. Concurrent edits to the *content string itself* are
+  plain last-writer-wins (an ordinary LWW field) -- **not** collaborative
+  rich text, and deliberately not built as one, per the brief.
+- **Fills** (`fill`/`fill_opacity` path_props) apply to Rect/Circle/
+  Ellipse always, and a freehand/polygon path only when it's actually
+  closed (first point equals last, e.g. the strict Polygon tool) --
+  Line/Arc have no meaningful enclosed area (the same judgment call the
+  Measure tool's Area/Perimeter mode already makes, Phase 13) and are
+  never filled regardless of the prop. **Real hit-testing change**: a
+  filled shape's *interior* is now clickable, not just its boundary
+  stroke -- an unfilled outline correctly stays boundary-only (Phase
+  11's original behavior, unchanged), but once something visibly looks
+  like solid content, requiring a boundary click would feel broken.
+  Confirmed live: clicking well inside an unfilled rect does nothing;
+  filling it, then clicking the exact same interior point, selects it.
+- **Stroke styles** (`dash`: `solid`/`dashed`/`dotted`) render as a
+  canvas line-dash pattern sized off the path's own stroke width (client)
+  and a real DXF linetype (`DASHED`/`DOT`, from `ezdxf`'s own standard
+  linetype library) or SVG `stroke-dasharray` (export) -- three
+  independent renderers, one shared sizing convention.
+- **Groups**: a `group_id` path_prop plus a new `groups: LWWElementSet`
+  component (existence only, mirroring `layers` -- the actual grouping
+  data lives entirely in each member's own `group_id` field). Clicking
+  any member of a group selects every member; the Select tool's
+  multi-selection panel gains **Group**/**Ungroup** buttons, and
+  transforms (Phase 12: move/rotate/scale, align, distribute) already
+  apply group-wide for free, since they operate over whatever
+  `ui.selectedPaths` currently holds regardless of how it got built.
+- **PNG export**: two buttons, both pure client-side `canvas.toBlob()`
+  -- the current view as-is, and a fit-to-content variant that
+  temporarily re-frames the view, captures, and restores the user's
+  actual pan/zoom afterward. `canvas.toBlob()` is asynchronous, which
+  caught a real bug in the first draft: restoring the view *immediately
+  after* calling `fitToContent()` (rather than inside `toBlob`'s own
+  callback) re-rendered the canvas back to the original view **before**
+  the capture actually read it, silently exporting the wrong framing --
+  fixed by moving the restore into the callback, confirmed live by
+  checking the zoom indicator is back to its original value only
+  *after* the download fires, not immediately after the button click.
+- **Z-order, fixed for real** (needed for fills to composite correctly
+  -- an unfilled outline mostly doesn't reveal z-order bugs, an
+  overlapping filled shape does): a genuine pre-existing bug surfaced
+  while implementing this -- `DrawingDocument.layer_list()`/`path_list()`
+  iterated `LWWElementSet.to_set()`, which converts to a real Python
+  `set` and **does not preserve insertion order**, so their output order
+  was an accident of string hashing, not creation order, even before
+  this phase. Fixed by iterating the `LWWElementSet` directly instead
+  (it's backed by an `LWWMap` whose dict preserves each element's
+  first-added position, so this *is* genuine creation order) -- a
+  regression test now pins exactly this
+  (`test_layer_list_and_path_list_preserve_creation_order`). Both
+  exporters and the canvas renderer now sort paths by layer order, then
+  creation order (a stable sort, so it only reorders *across* layers,
+  never within one).
+
 ## Testing
 
 ```bash
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-309 tests: unit tests per CRDT type and geometry module, serialization
+328 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -1342,7 +1411,23 @@ new `constraints` component: roundtripping kind/anchors/param, a
 `shape_center` anchor (a circle has no RGA point to anchor to, for
 `tangent`), merging field-wise like every other LWWMap, the
 serialization roundtrip, the same absent-from-an-old-snapshot
-backward-compat default every other component gets, and deletion.
+backward-compat default every other component gets, and deletion. Also
+19 new Phase 15 tests: 6 in `tests/test_document.py` for the new
+`groups` component (existence tracking mirroring `layers`, merge,
+serialization, backward-compat default, deletion) plus a dedicated
+regression test for the `layer_list`/`path_list` creation-order bug
+described below; 13 across `tests/test_export_import.py` covering both
+exporters' text/fill/dash/z-order support -- a native `<text>` element
+with its content HTML-escaped, `fill`/`fill-opacity` on both shapes and
+freehand paths (and that an unfilled shape still renders exactly as
+before), dashed/dotted producing a real `stroke-dasharray` (SVG) or a
+real named `DASHED`/`DOT` linetype (DXF, confirmed by reading
+`doc.linetypes` back, not just the entity's own attribute), a real
+`HATCH` entity with the correct `true_color` for a filled shape (and
+that Line/Arc are never filled regardless of the prop, matching the
+Measure tool's own "no enclosed area" judgment call), and z-order
+(layer then creation order) actually reordering emitted elements/
+entities across layers.
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -1517,11 +1602,36 @@ WebSocket round-trip a short buffer after the client-side condition is
 met before trusting server-side state, not by lengthening an already-
 timing-based wait blindly.
 
+Phase 15's designer features were verified live end to end: the Text
+tool placing "Hello CRDT" and editing its font size to 24 via the
+selection panel, confirmed via `/export/json`; a rect filled orange at
+0.4 opacity, confirmed both persisted *and* now clickable from its
+exact interior point that did nothing before the fill was applied (the
+hit-testing change, not just the visual one); a dashed line persisting
+its `dash` prop; grouping a rect and a circle, confirming clicking only
+the rect selects both, then Ungroup reverting it; and both PNG export
+buttons triggering a real download with a `.png` filename, with the
+fit-to-content variant's zoom indicator confirmed back to its original
+value only *after* the download actually fired (see the async
+`toBlob()` bug below) -- a full screenshot afterward visually confirms
+the text, filled rect, and dashed line all render correctly together
+in one document. This pass is what caught the `canvas.toBlob()` timing
+bug in the fit-to-content PNG export described above: the first draft
+restored the view immediately after calling `fitToContent()`, which is
+synchronous, but `toBlob()` isn't -- by the time its callback actually
+ran, `render()` had already redrawn the canvas back to the original
+(unfit) view, so the "fit" variant would have silently captured the
+wrong framing. Caught by reasoning through the actual async ordering
+before writing the verification, not by the verification itself
+failing first -- worth recording as a case where careful code reading
+(not just live-testing) found the bug, the reverse of most other
+entries in this log.
+
 ### Committed e2e suite + CI
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (28 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (33 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1579,7 +1689,14 @@ real, pre-existing gap this phase closed -- `movePathPoint` never
 pushed an undo entry before); Tangent's different picking mechanism
 (a circle shape, not a point) producing a `shape_center` anchor;
 and dragging an already-constrained point re-solving on release
-without minting a duplicate persisted constraint.
+without minting a duplicate persisted constraint; and (Phase 15)
+`test_designer_features_e2e.py` -- the Text tool's placed content/font
+size actually persisting; the fill hit-testing change (a click that
+selects nothing before filling a shape does select it afterward, same
+point, same test); a dash style persisting; grouping making one
+member's click select the whole group and Ungroup reverting it; and
+both PNG export buttons producing a real `.png` download, with the
+fit-to-content variant's view confirmed restored afterward.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

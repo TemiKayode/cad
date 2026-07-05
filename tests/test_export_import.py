@@ -356,6 +356,120 @@ def test_dxf_export_dimension_scales_with_units():
     assert dim_entities[0].get_measurement() == pytest.approx(1.0)
 
 
+# -- Designer features: text, fills, dash, groups/z-order (Phase 15) -------------
+
+
+def test_svg_export_text_shape_emits_a_native_text_element():
+    paths = [{"shape": "text", "x": 10.0, "y": 20.0, "content": "Hello", "font_size": 16.0, "color": "#e7e9ee"}]
+    svg = drawing_to_svg_string(paths)
+    assert '<text x="10.000" y="20.000" font-size="16.000"' in svg
+    assert ">Hello<" in svg
+
+
+def test_svg_export_text_content_is_html_escaped():
+    paths = [{"shape": "text", "x": 0.0, "y": 0.0, "content": "<b>x</b> & y"}]
+    svg = drawing_to_svg_string(paths)
+    assert "&lt;b&gt;x&lt;/b&gt; &amp; y" in svg
+    assert "<b>" not in svg
+
+
+def test_svg_export_fill_and_fill_opacity_on_a_shape():
+    paths = [{"shape": "rect", "x": 0.0, "y": 0.0, "w": 10.0, "h": 10.0, "fill": "#ff0000", "fill_opacity": 0.5}]
+    svg = drawing_to_svg_string(paths)
+    assert 'fill="#ff0000"' in svg
+    assert 'fill-opacity="0.5"' in svg
+
+
+def test_svg_export_no_fill_prop_still_renders_unfilled_outline():
+    paths = [{"shape": "circle", "cx": 0.0, "cy": 0.0, "r": 5.0}]
+    svg = drawing_to_svg_string(paths)
+    assert 'fill="none"' in svg
+
+
+def test_svg_export_fill_on_a_freehand_path():
+    paths = [{"points": [(0.0, 0.0), (10.0, 0.0), (5.0, 10.0), (0.0, 0.0)], "fill": "#00ff00"}]
+    svg = drawing_to_svg_string(paths)
+    assert 'fill="#00ff00"' in svg
+
+
+def test_svg_export_dashed_and_dotted_stroke_styles():
+    dashed = drawing_to_svg_string([{"shape": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "dash": "dashed"}])
+    assert "stroke-dasharray=" in dashed
+    dotted = drawing_to_svg_string([{"shape": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "dash": "dotted"}])
+    assert "stroke-dasharray=" in dotted
+    solid = drawing_to_svg_string([{"shape": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0}])
+    assert "stroke-dasharray=" not in solid
+
+
+def test_svg_export_z_orders_by_layer_then_creation_order():
+    paths = [
+        {"id": "a", "shape": "circle", "cx": 0.0, "cy": 0.0, "r": 1.0, "layer_id": "top"},
+        {"id": "b", "shape": "rect", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "layer_id": "bottom"},
+    ]
+    svg = drawing_to_svg_string(paths, layer_order=["bottom", "top"])
+    # "bottom"'s rect must be emitted (and thus painted) before "top"'s circle.
+    assert svg.index("<rect") < svg.index("<circle")
+
+
+def test_dxf_export_text_shape_produces_a_real_text_entity():
+    paths = [{"shape": "text", "x": 1.0, "y": 2.0, "content": "Hi", "font_size": 12.0}]
+    data = drawing_to_dxf_bytes(paths)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    texts = [e for e in doc.modelspace() if e.dxftype() == "TEXT"]
+    assert len(texts) == 1
+    assert texts[0].dxf.text == "Hi"
+    assert texts[0].dxf.height == pytest.approx(12.0)
+
+
+def test_dxf_export_fill_produces_a_hatch_with_true_color():
+    paths = [{"shape": "rect", "x": 0.0, "y": 0.0, "w": 10.0, "h": 10.0, "fill": "#ff0000"}]
+    data = drawing_to_dxf_bytes(paths)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    hatches = [e for e in doc.modelspace() if e.dxftype() == "HATCH"]
+    assert len(hatches) == 1
+    assert hatches[0].dxf.true_color == 0xFF0000
+
+
+def test_dxf_export_unfilled_shape_produces_no_hatch():
+    paths = [{"shape": "rect", "x": 0.0, "y": 0.0, "w": 10.0, "h": 10.0}]
+    data = drawing_to_dxf_bytes(paths)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    assert not [e for e in doc.modelspace() if e.dxftype() == "HATCH"]
+
+
+def test_dxf_export_line_and_arc_are_never_filled_even_if_fill_is_set():
+    """Line/Arc have no meaningful enclosed area -- the same judgment
+    call the Measure tool's Area/Perimeter mode already makes (Phase
+    13) -- so a stray `fill` prop on one must not produce a HATCH."""
+    paths = [
+        {"shape": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "fill": "#ff0000"},
+        {"shape": "arc", "cx": 0.0, "cy": 0.0, "r": 5.0, "start_angle": 0.0, "end_angle": 90.0, "fill": "#ff0000"},
+    ]
+    data = drawing_to_dxf_bytes(paths)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    assert not [e for e in doc.modelspace() if e.dxftype() == "HATCH"]
+
+
+def test_dxf_export_dash_maps_to_a_real_named_linetype():
+    paths = [{"shape": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "dash": "dashed"}]
+    data = drawing_to_dxf_bytes(paths)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    line = next(e for e in doc.modelspace() if e.dxftype() == "LINE")
+    assert line.dxf.linetype == "DASHED"
+    assert "DASHED" in {lt.dxf.name for lt in doc.linetypes}
+
+
+def test_dxf_export_z_orders_by_layer_then_creation_order():
+    paths = [
+        {"id": "a", "shape": "circle", "cx": 0.0, "cy": 0.0, "r": 1.0, "layer_id": "top"},
+        {"id": "b", "shape": "rect", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "layer_id": "bottom"},
+    ]
+    data = drawing_to_dxf_bytes(paths, layer_order=["bottom", "top"])
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    kinds = [e.dxftype() for e in doc.modelspace()]
+    assert kinds.index("LWPOLYLINE") < kinds.index("CIRCLE")
+
+
 # -- STL --------------------------------------------------------------------------
 
 
