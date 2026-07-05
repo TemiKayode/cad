@@ -48,7 +48,8 @@ offline to see the **Time-Travel Merge** panel.
 | 3D usability: parametric primitives, snapping, axis-aligned views (Phase 16) | **Done** -- Box/Cylinder/Pyramid/Plane built from the same batched-op/composite-undo idiom as `extrudeFace`, no new CRDT machinery; view buttons reposition the existing perspective camera (not a true orthographic swap, see below) |
 | Workspace: home page, version history, read-only share links, display names (Phase 17) | **Done** -- rooms are no longer bare URLs to remember: a home page lists/renames them with a real thumbnail, restore forks a version into a new room (never rewrites live history), and viewer-role tokens are enforced server-side at both the WS and REST layer, see below |
 | Design system: color/type/space/motion tokens, dark+light theme, icon sprite (Part 3 Phase D1) | **Done** -- every emoji glyph replaced with a hand-authored SVG icon, `docs/design-system.md`, see below |
-| Layout: icon tool rail, collapsible panels, document name, avatar stack (Part 3 Phase D2) | **Done** -- canvas gets most of the width back; responsive down to 375px; D3-D8 (input feel, keyboard-first, state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
+| Layout: icon tool rail, collapsible panels, document name, avatar stack (Part 3 Phase D2) | **Done** -- canvas gets most of the width back; responsive down to 375px, see below |
+| Input feel: per-tool cursors, hover halo, token-correct snap/marquee colors (Part 3 Phase D3) | **Done** -- no drag-to-resize handles (a pre-existing, deliberate numeric-input-only scope decision, not reopened here); D4-D8 (keyboard-first, state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -62,7 +63,7 @@ offline to see the **Time-Travel Merge** panel.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 52 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 55 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -996,6 +997,78 @@ stay usable.
   tests already passed, not just the new ones -- worth doing after any
   change that moves markup existing selectors depend on, not only after
   one that adds new markup.
+
+## Input feel: cursors, hover, snap/selection color (Part 3, Phase D3)
+
+- **Per-tool cursors**: crosshair for tools that place brand-new
+  geometry (2D: Pen/Polygon/Line/Rect/Circle/Ellipse/Arc/Text/Measure/
+  Dimension; 3D: Vertex/Box/Cylinder/Pyramid/Plane), a default arrow for
+  tools that only interact with what already exists (2D Select; 3D
+  Face/Move), and `grab`/`grabbing` for panning -- this last one, and
+  the drawing-tool crosshair, already existed before this phase; what
+  D3 actually added is the Select tool's *idle-vs-hovering* distinction
+  (see below) and setting the correct initial cursor on page load
+  (previously the canvas just showed the browser's default arrow until
+  the first tool switch, even though Pen/Vertex -- both crosshair tools
+  -- are each demo's own starting default). Never the text I-beam --
+  there was never a code path that could produce one over a `<canvas>`.
+- **Hover halo**: hovering unselected geometry with the Select tool now
+  shows a subtle accent-colored halo (thinner, lower-opacity than the
+  existing selection glow) and switches the cursor to `move` -- "this is
+  what a click would select," distinct from "this is already selected."
+  Genuinely new tracking (`hoveredPathId`, updated on every idle
+  `pointermove`, cleared on tool switch and on `pointerleave`) -- there
+  was no hover-state concept in the codebase before this phase.
+- **Snap glyphs and marquee selection now use `--accent`/
+  `--accent-muted`, not hardcoded colors**: the endpoint (square) /
+  midpoint (triangle) / center (circle) snap-glyph system from Phase 12
+  already existed and already matched the brief's glyph shapes -- it
+  was just hardcoded to a green (`#51cf66`) never tied to any token, and
+  the marquee-select rectangle was a hardcoded rgba matching the
+  dark-theme accent's own value, so neither ever actually responded to
+  a theme switch. Both now read the live token via `canvasColor(...)`.
+  **Deliberately not added**: a fourth "grid dot" glyph for plain
+  grid-snap (only object-snap -- endpoint/midpoint/center -- has a
+  glyph). Grid-snap happens transparently inside `worldPoint()`, before
+  any glyph-aware code runs, and every caller already receives an
+  already-grid-snapped point by the time it could decide whether to
+  show a glyph -- restructuring that composition order for a fourth
+  glyph kind wasn't judged worth the risk this phase, so it's
+  documented here rather than silently skipped.
+- **No drag-to-resize/rotate handles**: the brief describes "8 square
+  handles" on a selection bounding box. This project deliberately
+  doesn't have those -- Phase 12 chose numeric Rotation/Scale fields
+  over interactive gizmos, a documented, tested, already-shipped
+  architectural decision (see the Selection Editing section below), not
+  something D3 reopened. The existing accent-colored selection glow
+  already satisfies the *spirit* of "accent-colored selection
+  indication" without a literal bounding box + handles.
+- **Buttons and inputs**: D1 already added hover/active(scale
+  0.97)/focus-visible(2px accent ring)/disabled(50% opacity) to
+  buttons; D3 filled the remaining gap -- `<select>` now gets the same
+  background/border/radius treatment as text inputs (previously just
+  bare browser-default styling), and both text inputs and `<select>`
+  get a visible hover state (border lightens), matching what buttons
+  already had.
+- **`user-select: none`** on `.canvas-wrap` and `.tool-rail` -- dragging
+  a vertex, marquee-selecting, or panning must never trigger a stray
+  text selection on whatever's nearby.
+- **A test-authoring lesson worth recording, not a product bug**: the
+  first draft of this phase's own verification moved the mouse to a
+  coordinate exceeding the canvas element's actual rendered *height*
+  (e.g. testing "cursor reverts when hovering empty space" by moving
+  to a point 700px down inside a canvas only ~650px tall) -- the
+  pointer left the canvas element entirely, landing on whatever's
+  rendered below it, so the canvas's own `pointermove` listener
+  correctly never fired again, and its cursor style stayed at whatever
+  it was last set to. Traced by checking every piece of local drag
+  state (`selectDrag`/`constrainDrag`/`shapeDraft`/`drawing`) individually
+  before finding the actual cause was geometric, not a stale-state bug
+  -- fixed by using an in-bounds coordinate instead. Also prompted one
+  genuine, if minor, correctness fix either way: `pointerleave` now
+  also resets the cursor to `default` (it previously only cleared the
+  hover halo), so the canvas's internal cursor state can't drift stale
+  while the pointer is elsewhere.
 
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
@@ -2040,7 +2113,7 @@ which it did, on the first real attempt in both passes.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (52 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (55 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -2147,7 +2220,16 @@ would have missed it) and the `\` shortcut restores both at once; a
 tooltip appears with the correct label; the document-name rename
 persists through the "room doesn't exist yet" 404-then-retry path and
 survives a reload; and the top-bar avatar stack shows both actors once
-each has sent at least one presence update.
+each has sent at least one presence update; and (Phase D3)
+`test_input_feel_e2e.py` -- the 2D canvas cursor follows the active
+tool (crosshair for Pen, default arrow for idle Select) and switches to
+"move" while hovering a hit-testable shape's own drawn boundary, then
+correctly reverts once the pointer leaves that shape while still
+staying within the canvas's own bounding box; a hovered shape's
+`hoveredPathId` is distinct from and does not disturb an existing
+selection; holding Space shows the "grab" pan cursor regardless of
+tool; and the 3D demo's cursor likewise follows Vertex (crosshair) vs.
+Move (default arrow).
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

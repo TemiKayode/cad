@@ -841,6 +841,7 @@ function sendPresence(pos) {
 const canvasWrap = document.querySelector(".canvas-wrap");
 const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("canvas3d"), antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio || 1);
+renderer.domElement.style.cursor = "crosshair"; // matches ui.tool's "vertex" default -- see setTool()
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(canvasColor("--bg-canvas"));
@@ -1281,6 +1282,12 @@ function setTool(tool) {
   document.getElementById("toolHint").textContent = hints[tool];
   if (tool !== "face" && pendingFaceLoop.length) cancelFace();
   if (isPrimitiveTool(tool)) primitiveFields = { ...PRIMITIVE_DEFAULTS[tool] };
+  // Phase D3: crosshair for tools that place brand-new geometry (a
+  // vertex or a primitive), default arrow for tools that only interact
+  // with what's already there (Face's click-existing-vertices loop,
+  // Move's drag). Orbiting/panning the camera is OrbitControls' own
+  // concern, not this canvas's cursor.
+  renderer.domElement.style.cursor = tool === "face" || tool === "move" ? "default" : "crosshair";
   renderPrimitivePanel();
   renderPanels();
 }

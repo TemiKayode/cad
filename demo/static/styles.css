@@ -72,7 +72,7 @@ button.danger:hover { border-color: var(--danger); }
 button .icon { margin-right: 4px; }
 button .icon:only-child { margin-right: 0; }
 
-input[type="text"], input[type="number"] {
+input[type="text"], input[type="number"], select {
   background: var(--bg-raised);
   border: 1px solid var(--border);
   color: var(--text-primary);
@@ -80,13 +80,18 @@ input[type="text"], input[type="number"] {
   padding: 5px 8px;
   transition: border-color var(--t-fast) var(--ease-standard);
 }
+input[type="text"]:hover:not(:disabled), input[type="number"]:hover:not(:disabled), select:hover:not(:disabled) {
+  border-color: var(--text-secondary);
+}
 
 input[type="color"] {
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   cursor: pointer;
+  transition: border-color var(--t-fast) var(--ease-standard);
 }
+input[type="color"]:hover:not(:disabled) { border-color: var(--accent); }
 
 input:disabled, select:disabled, textarea:disabled {
   opacity: 0.5;
@@ -198,6 +203,7 @@ input:disabled, select:disabled, textarea:disabled {
   overflow-y: auto;
   overflow-x: hidden;
   z-index: var(--z-panel);
+  user-select: none;
 }
 .tool-rail button {
   width: 36px; height: 36px; flex-shrink: 0;
@@ -341,7 +347,9 @@ input:disabled, select:disabled, textarea:disabled {
 
 canvas { display: block; background: var(--bg-canvas); }
 
-.canvas-wrap { position: relative; min-height: 0; z-index: var(--z-canvas); }
+/* Phase D3: dragging inside the canvas (vertex drag, marquee, pan) must
+   never trigger a stray text selection on whatever's behind/around it. */
+.canvas-wrap { position: relative; min-height: 0; z-index: var(--z-canvas); user-select: none; }
 
 .cursor-label {
   position: absolute; pointer-events: none; font-size: 11px;

@@ -141,6 +141,10 @@ let selectDrag = null;
 // snapped to nearby geometry (object snapping, Phase 12), else null.
 let activeSnapGlyph = null;
 let shortcutOverlayEl = null;
+// Phase D3: the path a plain (non-dragging) pointermove is currently
+// hovering under the Select tool, or null -- drives both the subtle
+// hover halo (render()) and the cursor (canvas.style.cursor).
+let hoveredPathId = null;
 
 // -- view transform (Phase 10) ------------------------------------------------
 // Pan (panX/panY, screen pixels the world origin is offset by) + zoom are
@@ -826,6 +830,7 @@ function sendPresence(x, y) {
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const canvasWrap = document.querySelector(".canvas-wrap");
+canvas.style.cursor = "crosshair"; // matches ui.tool's "pen" default -- see setTool()
 
 function resizeCanvas() {
   const rect = canvasWrap.getBoundingClientRect();
@@ -948,6 +953,23 @@ canvas.addEventListener("pointermove", (e) => {
       render();
     }
   } else if (ui.tool === "polygon" && pendingPolygon.length) {
+    render();
+  } else if (ui.tool === "select") {
+    // Phase D3: hover feedback -- only when idle (every other branch
+    // above already `return`ed for an active drag/draft/draw gesture).
+    const hit = hitTestPath(screenPt);
+    canvas.style.cursor = hit ? "move" : "default";
+    if (hit !== hoveredPathId) {
+      hoveredPathId = hit;
+      render();
+    }
+  }
+});
+
+canvas.addEventListener("pointerleave", () => {
+  if (ui.tool === "select") canvas.style.cursor = "default";
+  if (hoveredPathId !== null) {
+    hoveredPathId = null;
     render();
   }
 });
@@ -2376,7 +2398,9 @@ function drawSnapGlyph(glyph) {
   const [sx, sy] = worldToScreen(glyph.pt[0], glyph.pt[1]);
   const s = 6;
   ctx.save();
-  ctx.strokeStyle = "#51cf66";
+  // Phase D3: "snap glyphs use --accent, never new colors" -- was a
+  // hardcoded green, unrelated to any token.
+  ctx.strokeStyle = canvasColor("--accent");
   ctx.lineWidth = 1.5;
   if (glyph.kind === "endpoint") {
     ctx.strokeRect(sx - s, sy - s, s * 2, s * 2);
@@ -2654,7 +2678,7 @@ function setTool(tool) {
   if (ui.tool === "polygon" && tool !== "polygon") cancelPolygon();
   if (ui.tool === "constrain" && tool !== "constrain") { constraintSelection = []; constrainDrag = null; renderConstraintPanel(); }
   if (isShapeTool(ui.tool) && tool !== ui.tool) { shapeDraft = null; }
-  if (ui.tool === "select" && tool !== "select") selectDrag = null;
+  if (ui.tool === "select" && tool !== "select") { selectDrag = null; hoveredPathId = null; }
   if (ui.tool === "measure" && tool !== "measure") { measureSelection = []; measureResult = null; }
   if (ui.tool === "dimension" && tool !== "dimension") { dimensionSelection = []; }
   activeSnapGlyph = null;
@@ -2851,7 +2875,7 @@ function applyFillIfSet(props) {
   ctx.restore();
 }
 
-function drawShapePath(props, isSelected, isDraftPreview = false) {
+function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = false) {
   if (props.shape === "text") {
     ctx.save();
     ctx.font = `${props.font_size || 16}px sans-serif`;
@@ -2863,7 +2887,16 @@ function drawShapePath(props, isSelected, isDraftPreview = false) {
     if (isSelected) {
       const b = textBounds(props);
       ctx.save();
-      ctx.strokeStyle = "#4dabf7";
+      ctx.strokeStyle = canvasColor("--accent");
+      ctx.lineWidth = 1 / view.zoom;
+      ctx.setLineDash([4 / view.zoom, 3 / view.zoom]);
+      ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.restore();
+    } else if (isHovered) {
+      const b = textBounds(props);
+      ctx.save();
+      ctx.strokeStyle = canvasColor("--accent");
+      ctx.globalAlpha = 0.5;
       ctx.lineWidth = 1 / view.zoom;
       ctx.setLineDash([4 / view.zoom, 3 / view.zoom]);
       ctx.strokeRect(b.x, b.y, b.w, b.h);
@@ -2901,9 +2934,18 @@ function drawShapePath(props, isSelected, isDraftPreview = false) {
   ctx.setLineDash([]);
   if (isSelected) {
     ctx.save();
-    ctx.strokeStyle = "#4dabf7";
+    ctx.strokeStyle = canvasColor("--accent");
     ctx.lineWidth = (props.stroke_width || 2.5) + 4;
     ctx.globalAlpha = 0.25;
+    ctx.stroke();
+    ctx.restore();
+  } else if (isHovered) {
+    // A subtler halo than the selection glow above -- "this is what a
+    // click would select" (Phase D3), not "this is already selected".
+    ctx.save();
+    ctx.strokeStyle = canvasColor("--accent");
+    ctx.lineWidth = (props.stroke_width || 2.5) + 3;
+    ctx.globalAlpha = 0.15;
     ctx.stroke();
     ctx.restore();
   }
@@ -2947,7 +2989,7 @@ function render() {
     // untransformed coordinates either way.
     const wrapped = beginPathTransform(pathId, props);
     if (props.shape) {
-      drawShapePath(props, ui.selectedPaths.has(pathId));
+      drawShapePath(props, ui.selectedPaths.has(pathId), false, pathId === hoveredPathId);
       if (wrapped) ctx.restore();
       continue;
     }
@@ -2994,9 +3036,18 @@ function render() {
     ctx.setLineDash([]);
     if (ui.selectedPaths.has(pathId)) {
       ctx.save();
-      ctx.strokeStyle = "#4dabf7";
+      ctx.strokeStyle = canvasColor("--accent");
       ctx.lineWidth = (props.stroke_width || 2.5) + 4;
       ctx.globalAlpha = 0.25;
+      ctx.stroke();
+      ctx.restore();
+    } else if (pathId === hoveredPathId) {
+      // Subtler than the selection glow -- "this is what a click would
+      // select" (Phase D3), not "this is already selected".
+      ctx.save();
+      ctx.strokeStyle = canvasColor("--accent");
+      ctx.lineWidth = (props.stroke_width || 2.5) + 3;
+      ctx.globalAlpha = 0.15;
       ctx.stroke();
       ctx.restore();
     }
@@ -3104,8 +3155,11 @@ function render() {
     const [sx0, sy0] = selectDrag.startScreen;
     const [sx1, sy1] = selectDrag.currentScreen;
     ctx.save();
-    ctx.strokeStyle = "#4dabf7";
-    ctx.fillStyle = "rgba(77,171,247,0.12)";
+    // Phase D3: "marquee as --accent-muted fill + accent hairline" --
+    // was a hardcoded rgba matching --accent's dark-theme value only,
+    // so it never actually followed a theme switch.
+    ctx.strokeStyle = canvasColor("--accent");
+    ctx.fillStyle = canvasColor("--accent-muted");
     ctx.lineWidth = 1;
     const x = Math.min(sx0, sx1), y = Math.min(sy0, sy1);
     const w = Math.abs(sx1 - sx0), h = Math.abs(sy1 - sy0);
