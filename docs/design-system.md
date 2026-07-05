@@ -177,8 +177,9 @@ CSS custom property can't reach -- `mesh3d.js` passes it to re-apply
 
 ## What's still open (later Part 3 phases, not gaps in D1)
 
-- The left toolbar is still a labeled button row, not the icon-only
-  rail with tooltips the brief describes -- that's D2 (layout).
+- Layout (icon-only tool rail, collapsible panels, document name,
+  avatar stack) is done -- Phase D2, documented in the README's own
+  "Layout: the canvas is the hero" section, not repeated here.
 - Per-tool cursors, snap-glyph/selection-handle theming, and button
   hover/active/focus polish beyond the baseline states already in
   `styles.css` are D3.

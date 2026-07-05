@@ -5,6 +5,9 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
+initTooltips();
+initPanelCollapse();
+
 const actorId = getOrCreateActorId();
 let actorName = getOrCreateActorName();
 const actorColor = colorForActor(actorId);
@@ -482,6 +485,35 @@ document.getElementById("renameActorBtn").onclick = () => {
   if (!updated) return;
   actorName = updated;
   document.getElementById("actorLabel").textContent = `${actorName} (${actorId})`;
+};
+
+// -- document name (Phase D2 top bar; reuses Phase 17's rename endpoint) -------
+
+const docNameBtn = document.getElementById("docNameBtn");
+
+async function refreshDocName() {
+  try {
+    const resp = await fetch("/api/workspace/rooms");
+    const rows = await resp.json();
+    const row = rows.find((r) => r.kind === "mesh" && r.room_id === room);
+    docNameBtn.textContent = (row && row.display_name) || room;
+  } catch {
+    docNameBtn.textContent = room;
+  }
+}
+refreshDocName();
+
+docNameBtn.onclick = async () => {
+  const current = docNameBtn.textContent;
+  const next = window.prompt("Rename this room:", current);
+  if (next === null || !next.trim() || next.trim() === current) return;
+  try {
+    await renameRoom("mesh", room, next.trim(), conn);
+    docNameBtn.textContent = next.trim();
+    showToast("Renamed", "success");
+  } catch (err) {
+    showToast(`Rename failed: ${err.message}`, "error");
+  }
 };
 
 // -- AI text-to-3D generation -------------------------------------------------------
@@ -1440,6 +1472,7 @@ function renderPresenceList() {
     row.innerHTML = `<span class="path-swatch" style="background:${p.color || "#4dabf7"}"></span><span class="name">${escapeHtml(p.name || "?")}</span>`;
     list.appendChild(row);
   }
+  renderAvatarStack(actorName, actorColor, others);
 }
 
 function renderPresenceOverlay() {

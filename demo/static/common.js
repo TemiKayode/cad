@@ -88,6 +88,35 @@ function iconHtml(name, extraClass) {
   return `<svg class="icon${extraClass ? " " + extraClass : ""}" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
 }
 
+/** Renames a room via Phase 17's `/rename` endpoint (Phase D2's document
+ * name button in the top bar). A brand-new room that's never had a
+ * single op committed doesn't exist in the store's `documents` table
+ * yet (that only happens on the first persist), so renaming it 404s --
+ * a real gap for the very reasonable "name it before you start drawing"
+ * case, not just a test artifact. Fixed here, not by working around it
+ * per-call site: on a 404, force an explicit save via `conn` (the same
+ * request the Save button makes) and retry once before giving up. */
+async function renameRoom(kind, room, name, conn) {
+  const path = kind === "mesh" ? `/api/mesh/${encodeURIComponent(room)}/rename` : `/api/rooms/${encodeURIComponent(room)}/rename`;
+  const attempt = () =>
+    fetch(withToken(path, kind, room), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: name }),
+    });
+
+  let resp = await attempt();
+  if (resp.status === 404 && conn) {
+    conn.save();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    resp = await attempt();
+  }
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${resp.status}`);
+  }
+}
+
 async function loadIconSprite() {
   try {
     const resp = await fetch("/static/icons.svg");
@@ -124,10 +153,168 @@ function canvasColor(varName) {
   return _canvasColorCache[varName];
 }
 
+// -- shared tooltips (Phase D2) ------------------------------------------------
+//
+// A single shared tooltip element, shown against any element carrying a
+// `data-tooltip="label"` attribute. 500ms delay before first appearing,
+// but instant (0ms) if another tooltip was dismissed within the last
+// 300ms -- lets a user sweep across the tool rail and see each label
+// immediately after the first one appears, matching how every desktop
+// app's toolbar tooltips behave, rather than re-waiting 500ms per icon.
+
+function initTooltips() {
+  let tooltipEl = document.getElementById("__tooltip");
+  if (!tooltipEl) {
+    tooltipEl = document.createElement("div");
+    tooltipEl.id = "__tooltip";
+    tooltipEl.className = "tooltip";
+    document.body.appendChild(tooltipEl);
+  }
+  let showTimer = null;
+  let lastHideAt = 0;
+  const INSTANT_WINDOW_MS = 300;
+
+  function show(target) {
+    const text = target.getAttribute("data-tooltip");
+    if (!text) return;
+    tooltipEl.textContent = text;
+    const rect = target.getBoundingClientRect();
+    tooltipEl.style.left = `${rect.right + 8}px`;
+    tooltipEl.style.top = `${rect.top + rect.height / 2}px`;
+    tooltipEl.classList.add("visible");
+  }
+  function hide() {
+    tooltipEl.classList.remove("visible");
+    lastHideAt = Date.now();
+  }
+
+  document.addEventListener("mouseover", (e) => {
+    const target = e.target.closest("[data-tooltip]");
+    if (!target) return;
+    clearTimeout(showTimer);
+    const delay = Date.now() - lastHideAt < INSTANT_WINDOW_MS ? 0 : 500;
+    showTimer = setTimeout(() => show(target), delay);
+  });
+  document.addEventListener("mouseout", (e) => {
+    const target = e.target.closest("[data-tooltip]");
+    if (!target) return;
+    clearTimeout(showTimer);
+    hide();
+  });
+  document.addEventListener("focusin", (e) => {
+    const target = e.target.closest("[data-tooltip]");
+    if (target) show(target);
+  });
+  document.addEventListener("focusout", (e) => {
+    if (e.target.closest("[data-tooltip]")) hide();
+  });
+}
+
+// -- collapsible secondary/right panels (Phase D2) -----------------------------
+//
+// Shared by both demos: a `.panel-collapse-btn` inside `.panel.left` and
+// `.panel.right` toggles a `secondary-collapsed`/`right-collapsed` class
+// on `.body` (pure CSS grid-template-columns transition, see styles.css).
+// `\` (backslash) collapses *both* at once for a quick near-full-bleed
+// canvas view -- restores whatever the two panels' individual state was
+// before, rather than a blind toggle, so it's never surprising.
+
+const MOBILE_PANEL_BREAKPOINT = 900;
+
+function initPanelCollapse() {
+  const body = document.querySelector(".body");
+  if (!body) return;
+  const leftPanel = document.querySelector(".panel.left");
+  const rightPanel = document.querySelector(".panel.right");
+  const leftBtn = document.getElementById("toggleSecondaryPanelBtn");
+  const rightBtn = document.getElementById("toggleRightPanelBtn");
+
+  // Below MOBILE_PANEL_BREAKPOINT, panels overlay the canvas (a
+  // `.mobile-open` class slides them in) rather than squeezing it via
+  // grid-template-columns -- same two top-bar buttons drive both
+  // mechanisms, so there's no separate mobile-only control to keep in
+  // sync with the desktop one.
+  // `.panel.collapsed` (padding:0, in addition to the grid column
+  // already going to 0 width) is applied/removed alongside the body
+  // class -- belt-and-suspenders with the overflow-x:hidden/min-width:0
+  // fix on .panel itself (a genuine bug caught live: without either,
+  // CSS Grid's automatic-minimum-size rule keeps a collapsed column at
+  // its content's min-content width instead of truly 0, so the panel's
+  // own text visibly bled out over the canvas at the column boundary).
+  function setCollapsed(panel, collapsedClass, btn, collapsed) {
+    body.classList.toggle(collapsedClass, collapsed);
+    panel?.classList.toggle("collapsed", collapsed);
+    btn?.classList.toggle("active", !collapsed);
+  }
+
+  function toggle(panel, collapsedClass, btn) {
+    if (window.innerWidth < MOBILE_PANEL_BREAKPOINT) {
+      panel?.classList.toggle("mobile-open");
+    } else {
+      setCollapsed(panel, collapsedClass, btn, !body.classList.contains(collapsedClass));
+    }
+  }
+
+  if (leftBtn) leftBtn.onclick = () => toggle(leftPanel, "secondary-collapsed", leftBtn);
+  if (rightBtn) rightBtn.onclick = () => toggle(rightPanel, "right-collapsed", rightBtn);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "\\") return;
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    e.preventDefault();
+    if (window.innerWidth < MOBILE_PANEL_BREAKPOINT) {
+      const bothOpen = leftPanel?.classList.contains("mobile-open") && rightPanel?.classList.contains("mobile-open");
+      leftPanel?.classList.toggle("mobile-open", !bothOpen);
+      rightPanel?.classList.toggle("mobile-open", !bothOpen);
+    } else {
+      const bothCollapsed = body.classList.contains("secondary-collapsed") && body.classList.contains("right-collapsed");
+      setCollapsed(leftPanel, "secondary-collapsed", leftBtn, !bothCollapsed);
+      setCollapsed(rightPanel, "right-collapsed", rightBtn, !bothCollapsed);
+    }
+  });
+}
+
 const ACTOR_COLORS = [
   "#ff6b6b", "#4dabf7", "#69db7c", "#ffd43b", "#da77f2",
   "#ff922b", "#38d9a9", "#f783ac", "#748ffc", "#94d82d",
 ];
+
+function initialsOf(name) {
+  if (!name) return "?";
+  const parts = name.trim().split(/\s+/);
+  return parts.length === 1 ? parts[0].slice(0, 2).toUpperCase() : (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
+/** Renders the top bar's compact presence avatar stack (Phase D2) --
+ * shares the exact same presence data `renderPresenceList()` already
+ * builds a full name list from in both demos, just as overlapping
+ * initial-circles capped to MAX_VISIBLE with a "+N" overflow chip.
+ * `othersEntries` is `[...state.presence.entries()]` already filtered
+ * to exclude the local actor. */
+function renderAvatarStack(meName, meColor, othersEntries) {
+  const stack = document.getElementById("avatarStack");
+  if (!stack) return;
+  const MAX_VISIBLE = 4;
+  const people = [{ name: meName, color: meColor }, ...othersEntries.map(([, p]) => p).filter(Boolean)];
+  stack.innerHTML = "";
+  for (const p of people.slice(0, MAX_VISIBLE)) {
+    const el = document.createElement("div");
+    el.className = "avatar";
+    el.style.background = p.color || "#4dabf7";
+    el.textContent = initialsOf(p.name);
+    el.title = p.name || "?";
+    stack.appendChild(el);
+  }
+  const overflow = people.length - MAX_VISIBLE;
+  if (overflow > 0) {
+    const el = document.createElement("div");
+    el.className = "avatar avatar-overflow";
+    el.textContent = `+${overflow}`;
+    el.title = `${overflow} more`;
+    stack.appendChild(el);
+  }
+}
 
 function getOrCreateActorId() {
   let id = sessionStorage.getItem("crdt_cad_actor_id");
@@ -162,17 +349,21 @@ function setActorName(name) {
 
 /** Phase 17 read-only share links: toggles the shared "viewer mode" UI
  * treatment -- disables (dims, `pointer-events:none`) every button/input
- * inside `.panel.left` (the tool/action sidebar in both demos) except
- * ones explicitly marked `.always-enabled` (Save, downloads), and shows/
- * hides the `#viewOnlyBadge` pill. This is the UX half of viewer
- * enforcement; the actual boundary is server-side (see RelayConnection.send
- * and _handle_message's viewer check in app.py) -- disabling the toolbar
+ * inside `.panel.left` and `.tool-rail` (Phase D2 moved the actual tool
+ * buttons out of `.panel.left` into their own icon rail, so both need
+ * the same treatment -- a real regression D2's e2e run caught: the
+ * rail's tool buttons were silently exempt from viewer-mode disabling,
+ * since the CSS/JS here still only targeted `.panel.left`) except ones
+ * explicitly marked `.always-enabled` (Save, downloads), and shows/hides
+ * the `#viewOnlyBadge` pill. This is the UX half of viewer enforcement;
+ * the actual boundary is server-side (see RelayConnection.send and
+ * _handle_message's viewer check in app.py) -- disabling the toolbar
  * here is what keeps a viewer from ever *starting* an edit gesture whose
  * rejection reply has no `op` to revert (see the comment in `send()`).
  * Returns whether viewer mode is now active. */
 function applyViewerModeUI(role) {
   const isViewer = role === "viewer";
-  document.querySelectorAll(".panel.left").forEach((el) => el.classList.toggle("viewer-mode", isViewer));
+  document.querySelectorAll(".panel.left, .tool-rail").forEach((el) => el.classList.toggle("viewer-mode", isViewer));
   const badge = document.getElementById("viewOnlyBadge");
   if (badge) badge.style.display = isViewer ? "" : "none";
   return isViewer;

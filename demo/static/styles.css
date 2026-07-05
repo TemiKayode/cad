@@ -146,21 +146,178 @@ input:disabled, select:disabled, textarea:disabled {
 .status-pill.offline .status-dot { background: var(--danger); }
 .status-pill.unauthorized .status-dot { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
 
+/* Phase D2: canvas is the hero -- a slim 48px icon-only tool rail (not
+   a labeled button column) plus two collapsible panels, so most of the
+   width goes to the drawing, not chrome. */
 .body {
   display: grid;
-  grid-template-columns: 220px 1fr 260px;
+  grid-template-columns: 48px 220px 1fr 260px;
   min-height: 0;
+  transition: grid-template-columns var(--t-med) var(--ease-standard);
 }
+.body.secondary-collapsed { grid-template-columns: 48px 0px 1fr 260px; }
+.body.right-collapsed { grid-template-columns: 48px 220px 1fr 0px; }
+.body.secondary-collapsed.right-collapsed { grid-template-columns: 48px 0px 1fr 0px; }
 
 .panel {
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
   padding: 10px;
   overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
   min-height: 0;
   z-index: var(--z-panel);
+  position: relative;
 }
 .panel.right { border-right: none; border-left: 1px solid var(--border); }
+/* border-width: 0, not just border-color: transparent -- a transparent
+   border still occupies its width in the box model, leaving a 1px
+   sliver of the (still fully laid-out, just invisible) column instead
+   of a genuine 0. */
+.panel.collapsed { padding: 0; overflow: hidden; border-width: 0; }
+
+/* Deliberately *not* inside .panel.left/.panel.right: a button that
+   lives inside the panel it collapses becomes unreachable the instant
+   the panel collapses to zero width, with no way to click it back open
+   again (only the `\` shortcut would still work). Both live in the top
+   bar instead, which never collapses. */
+.panel-collapse-btn { padding: 5px; }
+.panel-collapse-btn.active { color: var(--accent); }
+
+/* -- tool rail --------------------------------------------------------- */
+
+.tool-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 0;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  overflow-x: hidden;
+  z-index: var(--z-panel);
+}
+.tool-rail button {
+  width: 36px; height: 36px; flex-shrink: 0;
+  padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent;
+  color: var(--text-secondary);
+}
+.tool-rail button:hover { background: var(--bg-raised); color: var(--text-primary); }
+.tool-rail button.active {
+  background: var(--accent-muted); color: var(--accent);
+  border-left: 3px solid var(--accent);
+}
+.tool-rail button .icon { margin: 0; width: 18px; height: 18px; }
+.tool-rail .rail-divider { width: 28px; height: 1px; background: var(--border); margin: 4px 0; flex-shrink: 0; }
+
+/* Shared tooltip (Phase D2): a single element, shown/positioned by
+   initTooltips() in common.js against any [data-tooltip] target -- the
+   500ms-delay / instant-when-switching-targets behavior needs JS state
+   (whether another tooltip was visible a moment ago), which plain CSS
+   :hover + transition-delay can't express. */
+.tooltip {
+  position: fixed;
+  transform: translateY(-50%);
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: var(--z-popover);
+  opacity: 0;
+  transition: opacity var(--t-fast) var(--ease-standard);
+  box-shadow: var(--shadow-panel);
+}
+.tooltip.visible { opacity: 1; }
+
+/* -- document name (top bar) -------------------------------------------- */
+
+.doc-name-btn {
+  background: none; border: 1px solid transparent; color: var(--text-primary);
+  font-weight: 600; font-size: 13px; padding: 4px 8px; border-radius: var(--r-sm);
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.doc-name-btn:hover { border-color: var(--border); background: var(--bg-raised); }
+
+/* -- presence avatar stack (top bar) -------------------------------------- */
+
+.avatar-stack { display: flex; align-items: center; }
+.avatar {
+  width: 26px; height: 26px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; color: #06121a;
+  border: 2px solid var(--bg-panel);
+  margin-left: -8px;
+  transition: transform var(--t-fast) var(--ease-standard);
+}
+.avatar:first-child { margin-left: 0; }
+.avatar:hover { transform: translateY(-2px); z-index: 1; }
+.avatar-overflow { background: var(--bg-raised); color: var(--text-secondary); }
+
+/* -- bottom status strip -------------------------------------------------- */
+
+.status-strip-btn {
+  background: none; border: none; color: inherit; font: inherit; padding: 2px 4px;
+  border-radius: var(--r-sm);
+}
+.status-strip-btn:hover { background: var(--bg-raised); color: var(--text-primary); }
+
+.zoom-menu {
+  position: fixed; background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--r-md); box-shadow: var(--shadow-floating); padding: 4px;
+  z-index: var(--z-popover); display: flex; flex-direction: column; min-width: 140px;
+}
+.zoom-menu button { justify-content: flex-start; background: none; border: none; text-align: left; }
+.zoom-menu button:hover { background: var(--bg-raised); }
+
+/* -- responsive (Phase D2) ------------------------------------------------- */
+
+@media (max-width: 900px) {
+  /* Below 900px, panels overlay the canvas (slide in/out) instead of
+     squeezing it -- the same #toggleSecondaryPanelBtn/#toggleRightPanelBtn
+     buttons in the top bar drive this too (initPanelCollapse checks the
+     viewport width to decide which mechanism to toggle), so there's no
+     separate mobile-only button to keep in sync. */
+  .body { grid-template-columns: 48px 1fr; }
+  .panel.left, .panel.right {
+    position: fixed; top: 48px; bottom: 26px; width: 280px;
+    box-shadow: var(--shadow-floating);
+    transition: transform var(--t-med) var(--ease-standard);
+  }
+  .panel.left { left: 48px; transform: translateX(-120%); }
+  .panel.right { right: 0; transform: translateX(120%); }
+  .panel.left.mobile-open, .panel.right.mobile-open { transform: translateX(0); }
+}
+
+@media (max-width: 480px) {
+  .app { grid-template-rows: 48px 1fr 56px; }
+  .tool-rail {
+    position: fixed; left: 0; right: 0; bottom: 0; top: auto;
+    flex-direction: row; width: 100%; height: 56px;
+    overflow-x: auto; overflow-y: hidden;
+    border-right: none; border-top: 1px solid var(--border);
+    z-index: var(--z-toolbar);
+  }
+  .tool-rail .rail-divider { width: 1px; height: 28px; margin: 0 4px; }
+  .tool-rail button { width: 44px; height: 44px; }
+  .body { grid-template-columns: 1fr; }
+  .panel.left, .panel.right { top: 48px; bottom: 56px; }
+
+  /* The top bar itself was still visibly cramped at this width (room
+     label/input, full nav link text, and the doc name all fighting for
+     space in one 48px row) -- drop the least essential pieces rather
+     than let everything shrink to illegible. */
+  .topbar { padding: 0 8px; gap: 6px; }
+  .topbar label, .topbar #roomInput, .topbar .brand a:last-child { display: none; }
+  .doc-name-btn { max-width: 90px; }
+}
 
 .section-title {
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
@@ -213,10 +370,14 @@ a.pill-link { color: var(--text-secondary); text-decoration: none; }
 
 /* Phase 17: read-only viewer connections -- disables every editing
    affordance in the left toolbar except ones explicitly opted back in
-   (Save, downloads) via `.always-enabled`. */
+   (Save, downloads) via `.always-enabled`. Also covers `.tool-rail`
+   (Phase D2 moved the actual tool buttons there, out of `.panel.left`
+   -- a real regression D2's own e2e run caught: the rail was silently
+   exempt from this rule until both selectors were updated together). */
 .panel.left.viewer-mode button:not(.always-enabled),
 .panel.left.viewer-mode input:not(.always-enabled),
-.panel.left.viewer-mode select:not(.always-enabled) {
+.panel.left.viewer-mode select:not(.always-enabled),
+.tool-rail.viewer-mode button:not(.always-enabled) {
   pointer-events: none;
   opacity: 0.35;
 }

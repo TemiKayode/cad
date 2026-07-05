@@ -35,12 +35,16 @@
         <a href="/"><svg class="icon"><use href="#icon-home"></use></svg>Home</a>
         <a href="/2d">2D sketch demo<svg class="icon"><use href="#icon-chevron-right"></use></svg></a>
       </div>
+      <button id="docNameBtn" class="doc-name-btn" title="Rename this room"></button>
       <div class="spacer"></div>
+      <div id="avatarStack" class="avatar-stack"></div>
       <label style="font-size:12px;color:var(--text-secondary)">room</label>
       <input id="roomInput" type="text" style="width:120px" />
       <button id="shareBtn" title="Copy a full-access invite link to this room"><svg class="icon"><use href="#icon-link"></use></svg>Share</button>
       <button id="shareViewOnlyBtn" title="Copy a read-only invite link to this room"><svg class="icon"><use href="#icon-eye"></use></svg>View-only link</button>
       <span id="viewOnlyBadge" class="status-pill" style="display:none;border-color:var(--success);color:var(--success)">view only</span>
+      <button id="toggleSecondaryPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle tools & files panel" aria-label="Toggle tools & files panel"><svg class="icon"><use href="#icon-chevron-left"></use></svg></button>
+      <button id="toggleRightPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle inspector panel" aria-label="Toggle inspector panel"><svg class="icon"><use href="#icon-chevron-right"></use></svg></button>
       <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
       <span id="statusPill" class="status-pill connecting"><span class="status-dot"></span><span id="statusText">connecting</span></span>
       <span id="p2pPill" class="status-pill" style="display:none"><span class="status-dot"></span><span id="p2pText">P2P</span></span>
@@ -48,25 +52,22 @@
     </div>
 
     <div class="body">
+      <div class="tool-rail">
+        <button id="toolVertex" class="active" data-tooltip="Vertex" aria-label="Vertex"><svg class="icon"><use href="#icon-vertex"></use></svg></button>
+        <button id="toolFace" data-tooltip="Face" aria-label="Face"><svg class="icon"><use href="#icon-triangle"></use></svg></button>
+        <button id="toolMove" data-tooltip="Move" aria-label="Move"><svg class="icon"><use href="#icon-cursor"></use></svg></button>
+        <div class="rail-divider"></div>
+        <button id="toolBox" data-tooltip="Box" aria-label="Box"><svg class="icon"><use href="#icon-box"></use></svg></button>
+        <button id="toolCylinder" data-tooltip="Cylinder" aria-label="Cylinder"><svg class="icon"><use href="#icon-cylinder"></use></svg></button>
+        <button id="toolPyramid" data-tooltip="Pyramid" aria-label="Pyramid"><svg class="icon"><use href="#icon-pyramid"></use></svg></button>
+        <button id="toolPlane" data-tooltip="Plane" aria-label="Plane"><svg class="icon"><use href="#icon-plane"></use></svg></button>
+        <div class="rail-divider"></div>
+        <button id="undoBtn" data-tooltip="Undo" aria-label="Undo"><svg class="icon"><use href="#icon-undo"></use></svg></button>
+        <button id="redoBtn" data-tooltip="Redo" aria-label="Redo"><svg class="icon"><use href="#icon-redo"></use></svg></button>
+      </div>
       <div class="panel left">
-        <div class="section-title">Tool</div>
-        <div class="tool-row">
-          <button id="toolVertex" class="active"><svg class="icon"><use href="#icon-vertex"></use></svg>Vertex</button>
-          <button id="toolFace"><svg class="icon"><use href="#icon-triangle"></use></svg>Face</button>
-          <button id="toolMove"><svg class="icon"><use href="#icon-cursor"></use></svg>Move</button>
-        </div>
-        <div class="tool-row" style="margin-top:6px">
-          <button id="toolBox"><svg class="icon"><use href="#icon-box"></use></svg>Box</button>
-          <button id="toolCylinder"><svg class="icon"><use href="#icon-cylinder"></use></svg>Cylinder</button>
-          <button id="toolPyramid"><svg class="icon"><use href="#icon-pyramid"></use></svg>Pyramid</button>
-          <button id="toolPlane"><svg class="icon"><use href="#icon-plane"></use></svg>Plane</button>
-        </div>
         <div class="empty-hint" id="toolHint">Click the ground grid to place a vertex.</div>
         <div id="primitivePanel"></div>
-        <div class="tool-row" style="margin-top:6px">
-          <button id="undoBtn"><svg class="icon"><use href="#icon-undo"></use></svg>Undo</button>
-          <button id="redoBtn"><svg class="icon"><use href="#icon-redo"></use></svg>Redo</button>
-        </div>
 
         <div class="section-title">View</div>
         <div class="tool-row">

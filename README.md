@@ -47,7 +47,8 @@ offline to see the **Time-Travel Merge** panel.
 | Designer features: text, fills, stroke styles, groups, PNG export (Phase 15) | **Done** -- new `groups` component, filled shapes now hit-test their interior (not just the boundary), real z-order (layer then creation order) fixed both client- and server-side, see below |
 | 3D usability: parametric primitives, snapping, axis-aligned views (Phase 16) | **Done** -- Box/Cylinder/Pyramid/Plane built from the same batched-op/composite-undo idiom as `extrudeFace`, no new CRDT machinery; view buttons reposition the existing perspective camera (not a true orthographic swap, see below) |
 | Workspace: home page, version history, read-only share links, display names (Phase 17) | **Done** -- rooms are no longer bare URLs to remember: a home page lists/renames them with a real thumbnail, restore forks a version into a new room (never rewrites live history), and viewer-role tokens are enforced server-side at both the WS and REST layer, see below |
-| Design system: color/type/space/motion tokens, dark+light theme, icon sprite (Part 3 Phase D1) | **Done** -- every emoji glyph replaced with a hand-authored SVG icon, `docs/design-system.md`; D2-D8 (layout, input feel, keyboard-first, state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
+| Design system: color/type/space/motion tokens, dark+light theme, icon sprite (Part 3 Phase D1) | **Done** -- every emoji glyph replaced with a hand-authored SVG icon, `docs/design-system.md`, see below |
+| Layout: icon tool rail, collapsible panels, document name, avatar stack (Part 3 Phase D2) | **Done** -- canvas gets most of the width back; responsive down to 375px; D3-D8 (input feel, keyboard-first, state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -61,7 +62,7 @@ offline to see the **Time-Travel Merge** panel.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 44 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 52 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -919,6 +920,82 @@ raw markup once and inject it into the page, so every icon instead
 references a same-document fragment (`href="#icon-name"`) -- see the
 design-system doc's "Icon sprite" section for the full isolation test
 that found this.
+
+## Layout: the canvas is the hero (Part 3, Phase D2)
+
+Both demos share the same restructured shell: a slim 48px icon-only
+**tool rail** (was a 220px column of labeled buttons) with hover
+tooltips, a **document name** in the top bar that's click-to-rename
+(reuses Phase 17's `/rename` endpoint -- see below for a real gap this
+surfaced), a compact **presence avatar stack** next to it, and two
+independently **collapsible panels** either side of the canvas.
+Collapsing both (via their top-bar toggle buttons, or the `\` shortcut
+for both at once) gives a near-full-bleed canvas. Below 900px
+the panels overlay the canvas instead of squeezing it; below 480px the
+tool rail becomes a bottom bar and the top bar sheds its least-essential
+controls (the raw room switcher, the cross-demo nav link's label) to
+stay usable.
+
+- **A real, reasonably serious bug this phase's verification caught**:
+  collapsing a panel worked in the sense that the CSS grid column
+  shrank, but the panel's *own content* stayed visible -- clipped
+  mid-character, bleeding out over the canvas at the column boundary.
+  Cause: CSS Grid's automatic-minimum-size rule only lets a track
+  collapse below its content's min-content size if the grid item's
+  `overflow` is non-`visible` on *both* axes; `.panel` only ever set
+  `overflow-y: auto`, leaving `overflow-x` at its default `visible`.
+  Fixed with `overflow-x: hidden` + an explicit `min-width: 0` on
+  `.panel`. A related, smaller version of the same class of bug: even
+  after that fix, the collapsed panel measured 1px wide instead of a
+  true 0, because `.panel.collapsed` cleared the border to `transparent`
+  instead of `border-width: 0` -- a transparent border still occupies
+  its width in the box model. `tests/e2e/test_layout_e2e.py` asserts the
+  collapsed panel's actual `getBoundingClientRect().width` is exactly 0,
+  specifically because a weaker assertion (just checking the CSS class
+  got toggled) would have missed both of these.
+- **A real gap the document-name button surfaced**: renaming reuses
+  Phase 17's REST endpoint, which 404s for a room that's never had a
+  single op committed yet (it doesn't exist in the store's `documents`
+  table until the first persist) -- meaning the very reasonable "name a
+  brand-new room before you start drawing" case would have silently
+  failed. Fixed in `common.js`'s shared `renameRoom()`: on a 404, force
+  an explicit save (the same request the Save button makes) and retry
+  once before giving up.
+- **Collapse buttons live in the top bar, not inside the panels they
+  collapse** -- a button inside a panel that shrinks to zero width
+  becomes unreachable the instant it collapses, with no way to click it
+  back open (only the `\` shortcut would still work). Keeping them in
+  the (never-collapsing) top bar avoids that trap entirely.
+- **Tooltips** are a small shared component (`initTooltips()` in
+  `common.js`, not a per-button native `title`): 500ms delay before
+  first appearing, but instant if another tooltip was dismissed within
+  the last 300ms, so sweeping across the tool rail shows each label
+  immediately after the first -- matching how desktop app toolbars
+  actually behave. Tool-rail tooltips currently show only the tool name,
+  not a keyboard shortcut chip, honestly -- there are no single-key tool
+  shortcuts yet (that's Phase D4); the tooltip copy will grow the chip
+  once those exist, rather than showing one that doesn't work yet.
+- **Deliberately deferred to later phases**: the avatar stack here is
+  the plain, functional version (overlapping color circles with
+  initials, capped at 4 + a "+N" overflow) -- join/leave animation,
+  hover previews, and follow mode are Phase D6. The connection/save
+  status pill is visually unchanged from before D2; redesigning it is
+  Phase D5.
+- **A real regression the full e2e suite caught, not just the
+  phase's own new tests**: Phase 17's read-only viewer mode disables
+  every editing control in `.panel.left` via a CSS rule and a matching
+  `applyViewerModeUI()` selector -- moving the actual tool buttons out
+  of `.panel.left` into the new `.tool-rail` silently exempted every one
+  of them from that rule, so a viewer connection could see and click
+  tool-rail buttons again (the deeper `pointerdown`/`sendOps` guards
+  still blocked any actual edit from reaching the network, so this was
+  a UX regression, not a security one -- but a real one). Fixed by
+  extending both the JS (`applyViewerModeUI` toggles `.viewer-mode` on
+  `.tool-rail` too) and the CSS selector to cover both containers.
+  Caught by running the *entire* e2e suite after the phase's own new
+  tests already passed, not just the new ones -- worth doing after any
+  change that moves markup existing selectors depend on, not only after
+  one that adds new markup.
 
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
@@ -1963,7 +2040,7 @@ which it did, on the first real attempt in both passes.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (44 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (52 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -2055,7 +2132,22 @@ editing (`pointer-events: none` on a tool button, confirmed via
 creates nothing, checked both client-side and via the server's own
 export) while the editor tab stays fully functional throughout; and a
 viewer-role token being refused (403) by an editor-only REST endpoint
-(rename), not just the WS ops path.
+(rename), not just the WS ops path; and (Part 3 Phase D1)
+`test_theme_toggle_e2e.py` -- the theme toggle persists across a reload
+*and* across navigation to all three pages (not just the one it was
+clicked on), an icon actually renders non-zero geometry rather than
+just existing as correct-but-invisible DOM markup (the regression test
+for the external-sprite bug described above), and toolbar button text
+no longer starts with an emoji glyph; and (Phase D2)
+`test_layout_e2e.py` -- the tool rail's active-tool indicator follows
+tool switches; a collapsed panel's own `getBoundingClientRect().width`
+is actually 0 (the regression test for the content-bleed bug in the
+Layout section above -- checking only that a CSS class got toggled
+would have missed it) and the `\` shortcut restores both at once; a
+tooltip appears with the correct label; the document-name rename
+persists through the "room doesn't exist yet" 404-then-retry path and
+survives a reload; and the top-bar avatar stack shows both actors once
+each has sent at least one presence update.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

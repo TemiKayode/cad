@@ -91,16 +91,23 @@ def test_no_emoji_glyphs_remain_in_toolbar_button_text(live_server, browser):
         page.goto(f"{live_server}/2d?room={room}")
         page.wait_for_function("document.getElementById('statusText').textContent === 'online'", timeout=10000)
 
-        # every one of these buttons used to start with an emoji glyph
-        # (e.g. "✏ Pen") -- confirm the visible text is now just the
-        # plain label (the icon itself is a non-text <svg>, invisible to
-        # .textContent). Checked individually since querySelectorAll
-        # returns document order, not the order they're listed here.
-        expected = {
+        # These buttons used to start with an emoji glyph (e.g. "✏ Pen")
+        # -- Phase D2 later moved the tool-rail buttons (#toolPen,
+        # #toolSelect, #toolRect, #undoBtn, #redoBtn) to icon-only with
+        # an aria-label instead of visible text, so those are checked via
+        # aria-label here; #saveBtn/#shareBtn kept visible text labels
+        # (they live in the secondary panel/top bar, not the icon rail)
+        # and are still checked via textContent.
+        expected_aria = {
             "#toolPen": "Pen", "#toolSelect": "Select", "#toolRect": "Rect",
-            "#undoBtn": "Undo", "#redoBtn": "Redo", "#saveBtn": "Save", "#shareBtn": "Share",
+            "#undoBtn": "Undo", "#redoBtn": "Redo",
         }
-        for selector, label in expected.items():
+        for selector, label in expected_aria.items():
+            aria = page.eval_on_selector(selector, "e => e.getAttribute('aria-label')")
+            assert aria == label, f"{selector}: expected aria-label {label!r}, got {aria!r}"
+
+        expected_text = {"#saveBtn": "Save", "#shareBtn": "Share"}
+        for selector, label in expected_text.items():
             text = page.eval_on_selector(selector, "e => e.textContent")
             assert text == label, f"{selector}: expected {label!r}, got {text!r}"
     finally:
