@@ -1,3 +1,8 @@
+import io
+
+import ezdxf
+import pytest
+
 from crdt_cad.export.dxf_io import drawing_from_dxf_bytes, drawing_to_dxf_bytes
 from crdt_cad.export.stl_export import mesh_to_stl
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
@@ -152,6 +157,70 @@ def test_svg_export_without_point_ids_still_emits_plain_lines():
     assert "M 0.00,0.00 L 10.00,10.00" in svg
 
 
+# -- Shape primitives (Phase 11) -----------------------------------------------
+
+
+def test_svg_export_line_shape_emits_a_native_line_element():
+    paths = [{"shape": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 20.0, "color": "#4dabf7"}]
+    svg = drawing_to_svg_string(paths)
+    assert '<line x1="0.000" y1="0.000" x2="10.000" y2="20.000"' in svg
+    assert 'stroke="#4dabf7"' in svg
+
+
+def test_svg_export_rect_shape_emits_a_native_rect_element():
+    paths = [{"shape": "rect", "x": 5.0, "y": 5.0, "w": 40.0, "h": 20.0}]
+    svg = drawing_to_svg_string(paths)
+    assert '<rect x="5.000" y="5.000" width="40.000" height="20.000"' in svg
+
+
+def test_svg_export_circle_shape_emits_a_native_circle_element():
+    paths = [{"shape": "circle", "cx": 50.0, "cy": 50.0, "r": 25.0}]
+    svg = drawing_to_svg_string(paths)
+    assert '<circle cx="50.000" cy="50.000" r="25.000"' in svg
+
+
+def test_svg_export_ellipse_shape_emits_a_native_ellipse_element():
+    paths = [{"shape": "ellipse", "cx": 10.0, "cy": 20.0, "rx": 30.0, "ry": 15.0}]
+    svg = drawing_to_svg_string(paths)
+    assert '<ellipse cx="10.000" cy="20.000" rx="30.000" ry="15.000"' in svg
+
+
+def test_svg_export_arc_shape_emits_an_elliptical_arc_path_command():
+    paths = [{"shape": "arc", "cx": 0.0, "cy": 0.0, "r": 10.0, "start_angle": 0.0, "end_angle": 90.0}]
+    svg = drawing_to_svg_string(paths)
+    assert " A 10.000,10.000 0 0 1 " in svg
+
+
+def test_svg_export_arc_shape_uses_large_arc_flag_for_sweeps_over_180_degrees():
+    paths = [{"shape": "arc", "cx": 0.0, "cy": 0.0, "r": 10.0, "start_angle": 0.0, "end_angle": 270.0}]
+    svg = drawing_to_svg_string(paths)
+    assert " A 10.000,10.000 0 1 1 " in svg
+
+
+# -- Document units (Phase 11) --------------------------------------------------
+
+
+def test_svg_export_scales_coordinates_and_labels_units_for_mm():
+    paths = [{"points": [(0.0, 0.0), (96.0, 96.0)], "color": "#fff", "stroke_width": 1.0}]
+    svg = drawing_to_svg_string(paths, units="mm")
+    # 96px == 1in == 25.4mm at the assumed 96px/in convention -- the path
+    # data itself (unaffected by the viewBox's own padding) shows this
+    # directly.
+    assert "M 0.00,0.00 L 25.40,25.40" in svg
+    assert 'width="' in svg and 'mm"' in svg
+
+
+def test_svg_export_scales_shape_primitives_for_units_too():
+    paths = [{"shape": "circle", "cx": 0.0, "cy": 0.0, "r": 96.0}]
+    svg = drawing_to_svg_string(paths, units="in")
+    assert '<circle cx="0.000" cy="0.000" r="1.000"' in svg
+
+
+def test_svg_export_default_units_is_px_and_unchanged_scale():
+    paths = [{"points": [(0.0, 0.0), (10.0, 10.0)], "color": "#ff0000", "stroke_width": 2.0}]
+    assert drawing_to_svg_string(paths) == drawing_to_svg_string(paths, units="px")
+
+
 # -- DXF ------------------------------------------------------------------------
 
 
@@ -202,6 +271,37 @@ def test_dxf_export_flattens_curve_segments_into_a_denser_polyline():
     # just a pass-through of the two anchors.
     mid = imported[0][6]
     assert mid[1] > 3.0
+
+
+def test_dxf_export_shape_primitives_as_native_entities():
+    """Each shape kind (Phase 11) becomes its own native DXF entity type,
+    not a flattened LWPOLYLINE -- confirmed by reading dxftype() back
+    directly via ezdxf, not just checking the file parses."""
+    paths = [
+        {"shape": "line", "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 10.0},
+        {"shape": "rect", "x": 0.0, "y": 0.0, "w": 5.0, "h": 5.0},
+        {"shape": "circle", "cx": 0.0, "cy": 0.0, "r": 3.0},
+        {"shape": "ellipse", "cx": 0.0, "cy": 0.0, "rx": 4.0, "ry": 2.0},
+        {"shape": "arc", "cx": 0.0, "cy": 0.0, "r": 3.0, "start_angle": 0.0, "end_angle": 90.0},
+    ]
+    data = drawing_to_dxf_bytes(paths)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    kinds = [e.dxftype() for e in doc.modelspace()]
+    assert kinds == ["LINE", "LWPOLYLINE", "CIRCLE", "ELLIPSE", "ARC"]
+
+
+def test_dxf_export_sets_insunits_header_for_the_chosen_unit():
+    for units, expected_code in (("px", 0), ("mm", 4), ("in", 1)):
+        data = drawing_to_dxf_bytes([{"points": [(0.0, 0.0), (1.0, 1.0)]}], units=units)
+        doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+        assert doc.header["$INSUNITS"] == expected_code
+
+
+def test_dxf_export_scales_coordinates_for_units():
+    data = drawing_to_dxf_bytes([{"shape": "circle", "cx": 0.0, "cy": 0.0, "r": 96.0}], units="in")
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    circle = next(iter(doc.modelspace()))
+    assert circle.dxf.radius == pytest.approx(1.0)
 
 
 # -- STL --------------------------------------------------------------------------

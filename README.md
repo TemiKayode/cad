@@ -34,6 +34,7 @@ over gaps.
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9) -- coincident/parallel/perpendicular/fixed-distance, live-verified with real point convergence, see below |
 | 2D viewport: pan/zoom/adaptive grid/snap-to-grid (Phase 10) | **Done** -- client-local view transform, never synced; live-verified incl. presence cursors through an asymmetric transform, see below |
+| Shape primitives: Line/Rect/Circle/Ellipse/Arc, numeric input, document units (Phase 11) | **Done** -- parametric `path_props` fields, native render/hit-test/SVG/DXF export per shape, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -47,7 +48,7 @@ over gaps.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 10 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 14 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -823,11 +824,13 @@ from a CDN via an import map (the only external runtime dependency
 either frontend has).
 
 **2D sketch (`/`)**: pen tool, select tool, a strict **Polygon** tool
-that demonstrates the geometry validity gate, a **Constrain** tool
-(Phase 9 -- coincident/parallel/perpendicular/fixed-distance via the
-tested Gauss-Newton solver), a real pan/zoom/grid/snap **viewport**
-(Phase 10 -- see below), per-layer visibility, undo/redo, live
-multi-user cursors, comments, **Save**/**.json/.svg/.dxf
+that demonstrates the geometry validity gate, **Line/Rect/Circle/
+Ellipse/Arc** shape tools with numeric dimension input (Phase 11 -- see
+below), a **Constrain** tool (Phase 9 -- coincident/parallel/
+perpendicular/fixed-distance via the tested Gauss-Newton solver), a real
+pan/zoom/grid/snap **viewport** and a **document units** (px/mm/in)
+selector (Phase 10/11 -- see below), per-layer visibility, undo/redo,
+live multi-user cursors, comments, **Save**/**.json/.svg/.dxf
 download**/**Import SVG or DXF**/**Share** (copies an invite link), and
 an offline toggle that closes both the WebSocket and any P2P
 connection.
@@ -909,13 +912,94 @@ the old pixel space, not a breaking migration.
   snap-to-grid check confirming stored points actually land on grid
   multiples (not just that the toggle button changes its own CSS class).
 
+## Shape primitives, numeric input, document units (Phase 11)
+
+**Representation**: a shape (Line, Rectangle, Circle, Ellipse, Arc) is a
+path whose parametric definition lives entirely in `path_props` (e.g.
+`{"shape": "circle", "cx":, "cy":, "r":}`) -- its RGA point list (`paths`)
+stays empty. This is deliberate, not a shortcut: `path_props` is already
+an `LWWMap`, so two users concurrently editing (say) a circle's radius
+and its color merge field-wise for free, with **zero new CRDT code** --
+exactly the reason the brief asks for this representation over storing
+shapes as sampled point lists. Freehand/polygon paths are completely
+unaffected; they still use `path_geom` exclusively, and every existing
+code path that touches it (undo/redo, curves, the validity gate) doesn't
+need to know shapes exist at all.
+
+- **Creation**: click-drag with the matching tool (Line/Rect/Circle/
+  Ellipse/Arc) -- release commits the shape at the dragged size. A
+  negligible drag (effectively a plain click) commits nothing, so a
+  stray click with a shape tool active can't leave a zero-size shape
+  behind.
+- **Numeric input**: an inline panel (`#shapeInputPanel`) shows the
+  shape's defining dimensions (Width/Height for Rect; Radius for Circle;
+  Radius X/Y for Ellipse; Length/Angle for Line -- a more natural way to
+  type a line than two endpoints; Radius/Start/End angle for Arc) --
+  live and read-only while dragging, or freely editable (with a
+  **Create** button, and Enter-to-commit in any field) when no drag is
+  active, creating a new shape at the current view's center with
+  exactly the typed values. Tab-cycling between fields is just the
+  browser's own focus order -- nothing extra was needed for that part of
+  the brief.
+- **Rendering & hit-testing are native per shape kind**, not always
+  faceted to a polyline: `ctx.rect`/`ctx.arc`/`ctx.ellipse` for drawing
+  (so a stored Circle looks like an actual circle at any zoom, not a
+  faceted approximation), and dedicated boundary math per kind for
+  `hitTestPath` (a normalized-distance check for Circle/Ellipse/Arc, an
+  angular-sweep check added for Arc specifically, point-to-segment for
+  Line, four point-to-segment checks for Rect). Shapes are unfilled
+  outlines today (fills are Phase 15), so hit-testing correctly responds
+  only near the boundary stroke, not the interior -- live-verified with
+  exactly that distinction: clicking well inside a circle does *not*
+  select it, clicking on its actual boundary does.
+- **SVG/DXF export are native too**: `<line>`/`<rect>`/`<circle>`/
+  `<ellipse>`/an elliptical-arc `<path>` command in SVG, and
+  `LINE`/a closed `LWPOLYLINE`/`CIRCLE`/`ELLIPSE`/`ARC` in DXF (`ezdxf`
+  has no native rectangle entity) -- a faithful, editable shape in any
+  real vector/CAD tool, not a flattened approximation. Freehand/polygon
+  paths' own export path (including Phase 8's curve segments) is
+  unchanged; shapes just take a different branch checked first.
+
+### Document units (`px` | `mm` | `in`)
+
+A new `settings: LWWMap[str, object]` component on `DrawingDocument` --
+the same serialization/merge/`ops_since` treatment as every other
+component, with its own Python tests, including one confirming a
+snapshot persisted *before* this existed loads cleanly (defaults to an
+empty map rather than `KeyError`). Stored/CRDT geometry is **always**
+raw px-equivalent world units regardless of this setting, at every
+zoom level and in every export -- `units` is a pure *display*-layer
+conversion (cursor readout, the numeric shape panel, SVG/DXF export
+scale), never a migration of existing coordinates. The conversion table
+(`UNITS_PX_PER_UNIT` in `document.py`, mirrored exactly in `sketch.js`)
+assumes the same 96px/inch convention CSS itself uses, so `px` needs no
+special-casing anywhere that already assumed today's raw-pixel
+behavior.
+
+- The adaptive grid (Phase 10's `pickGridStep`) is unit-aware: with
+  `units="mm"`, the grid lands on nice round millimeters (1/2/5/10mm),
+  not nice round pixels that happened to look reasonable on screen.
+  Snap-to-grid reuses the identical step, so it always matches whatever
+  unit is active.
+- SVG export scales every coordinate by `1/px_per_unit(units)` and adds
+  real `width`/`height` attributes with the matching unit suffix
+  alongside the (still-unitless, per SVG convention) `viewBox`. DXF
+  export scales identically and sets the `$INSUNITS` header variable
+  (0=unitless for `px`, 4=millimeters, 1=inches) so a real CAD tool
+  interprets the numbers correctly -- exactly the brief's ask.
+- The `units` setting itself is a real CRDT-backed document setting
+  (unlike Phase 10's view transform, which is deliberately client-local
+  and never synced) -- live-verified with two tabs: changing units in
+  tab A is visible in tab B's own units dropdown, not just tab A's
+  cursor readout.
+
 ## Testing
 
 ```bash
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-260 tests: unit tests per CRDT type and geometry module, serialization
+277 tests: unit tests per CRDT type and geometry module, serialization
 round-trips, delta-sync correctness, a full-mesh (every-pair-order)
 merge convergence test for RGA, a Hypothesis property test fuzzing
 random concurrent insert/delete programs across 3 replicas, SVG/DXF/STL
@@ -980,7 +1064,15 @@ adapter's key-unset and every-failure-mode-degrades-gracefully paths
 built and exported, not a hand-typed fixture) and `generate_mesh_ops`'s
 own meshy-vs-procedural wiring -- none of this exercises Meshy's actual
 live API, see the AI generation section's honest accounting of what
-that means.
+that means. Also 17 new Phase 11 tests: 5 in `tests/test_document.py`
+cover the new `settings` component (independent-field concurrent merge,
+serialization round-trip, and loading cleanly when a pre-Phase-11
+snapshot has no `"settings"` key at all), and 12 across
+`tests/test_export_import.py` cover every shape kind's native SVG/DXF
+element/entity (checked by reading the actual element/`dxftype()` back,
+not just that the file parses) and unit scaling (mm/in coordinate
+scaling, the `$INSUNITS` header variable, and that `units="px"` is
+byte-for-byte identical to the pre-Phase-11 default).
 
 Beyond unit tests, this was driven end-to-end with Playwright against a
 live server multiple times during development: two tabs drawing
@@ -1038,7 +1130,29 @@ file starts with `ISO-10303-21;` and contains real `ADVANCED_FACE`
 records), and the AI Generate panel's new `mesh_source` label (generated
 a house with `MESHY_API_KEY` unset -- the only configuration available
 here -- and confirmed the status line correctly reads "mesh via the
-procedural builder").
+procedural builder"). Phase 10's viewport and Phase 11's shapes/units
+were verified together in one pass: pan/zoom (wheel centered on cursor,
+Space-drag), Fit, snap-to-grid, all five shape kinds drag-created and
+confirmed via `/export/json`, the numeric panel creating a shape with no
+drag at all, Select correctly hit-testing a circle's real boundary (and
+correctly *not* selecting it from well inside), and switching units to
+mm live-updating the cursor readout -- all in the same real browser
+session, with a screenshot confirming the rendered result actually
+looks like five distinct, correctly-shaped, correctly-colored
+primitives, not just that no exception was thrown. This pass itself
+caught a real bug on first try: `shapeDraft` was referenced throughout
+the new code (drag handlers, rendering, the numeric panel) but never
+actually declared, a `ReferenceError` thrown at script load that broke
+page initialization *entirely* -- not just the new shape tools. It
+first surfaced as nearly the *entire* existing e2e suite failing
+uniformly (9 of 10 tests, all with the same generic
+`statusText` never-reaches-"online" timeout), which is exactly the
+signature of "something threw during script load," not a feature-
+specific regression -- confirmed by checking the browser console
+directly rather than guessing from the test failure alone. `node
+--check` (syntax-only) never had a chance of catching this, since it's
+valid syntax, just a missing declaration; only actually running the
+page did.
 
 A third, more interesting one turned up while browser-verifying the
 face color/material editor: `LocalClock` (`common.js`, shared by both
@@ -1060,7 +1174,7 @@ local op.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (10 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (14 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -1086,7 +1200,14 @@ backward-compatible and the zoom indicator updates on wheel-zoom, a
 remote presence cursor projects correctly through a *different,
 asymmetric* view transform on the receiving tab (checked against that
 tab's own live `worldToScreen`, not a hand-computed expectation), and
-snap-to-grid produces genuinely grid-aligned stored points.
+snap-to-grid produces genuinely grid-aligned stored points; and
+(Phase 11) `test_shapes_e2e.py` -- all five shape kinds drag-created and
+confirmed via `/export/json`, the Select tool correctly hit-testing a
+circle's actual boundary stroke (not its unfilled interior -- clicking
+well inside must *not* select it), the numeric panel creating a shape
+with no drag at all, and the `units` document setting (a real CRDT
+setting, unlike Phase 10's deliberately-local view transform) actually
+syncing to a second tab's own dropdown.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

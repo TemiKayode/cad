@@ -526,14 +526,16 @@ async def export_drawing_json(room_id: str) -> Response:
 @app.get("/api/rooms/{room_id}/export/svg", dependencies=[Depends(require_room_access("drawing"))])
 async def export_drawing_svg(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
-    svg = drawing_to_svg_string(room.doc.path_list())
+    units = room.doc.settings_dict().get("units", "px")
+    svg = drawing_to_svg_string(room.doc.path_list(), units=units)
     return _attachment(svg, "image/svg+xml", f"{room_id}.svg")
 
 
 @app.get("/api/rooms/{room_id}/export/dxf", dependencies=[Depends(require_room_access("drawing"))])
 async def export_drawing_dxf(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
-    data = drawing_to_dxf_bytes(room.doc.path_list())
+    units = room.doc.settings_dict().get("units", "px")
+    data = drawing_to_dxf_bytes(room.doc.path_list(), units=units)
     return _attachment(data, "application/dxf", f"{room_id}.dxf")
 
 

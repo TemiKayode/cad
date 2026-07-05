@@ -20,50 +20,139 @@ original M/L-only importer already made for anything else unhandled.
 
 from __future__ import annotations
 
+import math
 import re
 from xml.etree import ElementTree as ET
 
-from crdt_cad.crdt.document import curve_prop_key
+from crdt_cad.crdt.document import curve_prop_key, px_per_unit
 
 Point = tuple[float, float]
 
+# DXF-style unit suffixes SVG understands on <svg width="..."/height="...">
+# (viewBox itself stays unitless, per SVG convention -- these just tell a
+# viewer/consumer what the numbers physically mean).
+_SVG_UNIT_SUFFIX = {"px": "", "mm": "mm", "in": "in"}
 
-def drawing_to_svg_string(paths: list[dict], padding: float = 20.0) -> str:
+
+def _shape_bounds(shape: dict) -> tuple[float, float, float, float] | None:
+    """Returns (min_x, min_y, max_x, max_y) for a shape primitive
+    (Phase 11), or None if `shape` isn't a recognized kind."""
+    kind = shape.get("shape")
+    if kind == "line":
+        xs = [shape["x1"], shape["x2"]]
+        ys = [shape["y1"], shape["y2"]]
+    elif kind == "rect":
+        xs = [shape["x"], shape["x"] + shape["w"]]
+        ys = [shape["y"], shape["y"] + shape["h"]]
+    elif kind == "circle":
+        xs = [shape["cx"] - shape["r"], shape["cx"] + shape["r"]]
+        ys = [shape["cy"] - shape["r"], shape["cy"] + shape["r"]]
+    elif kind == "ellipse":
+        xs = [shape["cx"] - shape["rx"], shape["cx"] + shape["rx"]]
+        ys = [shape["cy"] - shape["ry"], shape["cy"] + shape["ry"]]
+    elif kind == "arc":
+        # Conservative bound: the full circle the arc is cut from --
+        # tighter bounding-box-of-the-actual-sweep isn't worth the extra
+        # trig for a viewBox padding calculation.
+        xs = [shape["cx"] - shape["r"], shape["cx"] + shape["r"]]
+        ys = [shape["cy"] - shape["r"], shape["cy"] + shape["r"]]
+    else:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _shape_svg_element(shape: dict, scale: float) -> str | None:
+    """One native SVG element per shape kind (Phase 11) -- `<line>`,
+    `<rect>`, `<circle>`, `<ellipse>`, or an elliptical-arc `<path>` --
+    rather than always flattening to a polyline, so the exported file is
+    a faithful, editable shape in any real vector tool. Returns None if
+    `shape` isn't a recognized kind (the caller falls back to the
+    point-list `<path>` every freehand/polygon path already uses)."""
+    kind = shape.get("shape")
+    color = shape.get("color", "#111111")
+    stroke_width = shape.get("stroke_width", 2.5) * scale
+    common = f'stroke="{color}" stroke-width="{stroke_width:.3f}" fill="none" stroke-linecap="round" stroke-linejoin="round"'
+    if kind == "line":
+        x1, y1, x2, y2 = (shape["x1"] * scale, shape["y1"] * scale, shape["x2"] * scale, shape["y2"] * scale)
+        return f'<line x1="{x1:.3f}" y1="{y1:.3f}" x2="{x2:.3f}" y2="{y2:.3f}" {common} />'
+    if kind == "rect":
+        x, y, w, h = (shape["x"] * scale, shape["y"] * scale, shape["w"] * scale, shape["h"] * scale)
+        return f'<rect x="{x:.3f}" y="{y:.3f}" width="{w:.3f}" height="{h:.3f}" {common} />'
+    if kind == "circle":
+        cx, cy, r = (shape["cx"] * scale, shape["cy"] * scale, shape["r"] * scale)
+        return f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="{r:.3f}" {common} />'
+    if kind == "ellipse":
+        cx, cy, rx, ry = (shape["cx"] * scale, shape["cy"] * scale, shape["rx"] * scale, shape["ry"] * scale)
+        return f'<ellipse cx="{cx:.3f}" cy="{cy:.3f}" rx="{rx:.3f}" ry="{ry:.3f}" {common} />'
+    if kind == "arc":
+        cx, cy, r = shape["cx"], shape["cy"], shape["r"]
+        start, end = math.radians(shape["start_angle"]), math.radians(shape["end_angle"])
+        x1, y1 = (cx + r * math.cos(start)) * scale, (cy + r * math.sin(start)) * scale
+        x2, y2 = (cx + r * math.cos(end)) * scale, (cy + r * math.sin(end)) * scale
+        sweep_deg = (shape["end_angle"] - shape["start_angle"]) % 360
+        large_arc = 1 if sweep_deg > 180 else 0
+        r_scaled = r * scale
+        d = f"M {x1:.3f},{y1:.3f} A {r_scaled:.3f},{r_scaled:.3f} 0 {large_arc} 1 {x2:.3f},{y2:.3f}"
+        return f'<path d="{d}" {common} />'
+    return None
+
+
+def drawing_to_svg_string(paths: list[dict], padding: float = 20.0, units: str = "px") -> str:
+    scale = 1.0 / px_per_unit(units)
     all_points = [pt for p in paths for pt in p.get("points", [])]
-    if all_points:
-        xs = [pt[0] for pt in all_points]
-        ys = [pt[1] for pt in all_points]
+    bounds = [_shape_bounds(p) for p in paths if p.get("shape")]
+    xs, ys = [], []
+    for pt in all_points:
+        xs.append(pt[0])
+        ys.append(pt[1])
+    for b in bounds:
+        if b is None:
+            continue
+        xs.extend([b[0], b[2]])
+        ys.extend([b[1], b[3]])
+    if xs:
         min_x, max_x = min(xs) - padding, max(xs) + padding
         min_y, max_y = min(ys) - padding, max(ys) + padding
     else:
         min_x, min_y, max_x, max_y = 0.0, 0.0, 100.0, 100.0
+    min_x, min_y, max_x, max_y = min_x * scale, min_y * scale, max_x * scale, max_y * scale
     width, height = max_x - min_x, max_y - min_y
+    suffix = _SVG_UNIT_SUFFIX.get(units, "")
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{min_x:.2f} {min_y:.2f} {width:.2f} {height:.2f}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.2f}{suffix}" height="{height:.2f}{suffix}" '
+        f'viewBox="{min_x:.2f} {min_y:.2f} {width:.2f} {height:.2f}">',
     ]
     for p in paths:
+        if p.get("shape"):
+            el = _shape_svg_element(p, scale)
+            if el is not None:
+                lines.append(el)
+                continue
         pts = p.get("points", [])
         if len(pts) < 2:
             continue
-        d = _path_d_string(pts, p.get("point_ids"), p)
+        scaled_pts = [(x * scale, y * scale) for x, y in pts]
+        d = _path_d_string(scaled_pts, p.get("point_ids"), p, scale)
         color = p.get("color", "#111111")
-        stroke_width = p.get("stroke_width", 2.5)
+        stroke_width = p.get("stroke_width", 2.5) * scale
         lines.append(
-            f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{stroke_width}" '
+            f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{stroke_width:.3f}" '
             'stroke-linecap="round" stroke-linejoin="round" />'
         )
     lines.append("</svg>")
     return "\n".join(lines)
 
 
-def _path_d_string(pts: list[Point], point_ids: list | None, props: dict) -> str:
+def _path_d_string(pts: list[Point], point_ids: list | None, props: dict, scale: float = 1.0) -> str:
     """Emits `M`/`L`/`C`/`Q` commands per segment, based on each point's
     `curve_prop_key` entry in `props` (absent entirely -- e.g. `point_ids`
     itself is None, as every pre-Phase-8 caller's hand-built dict has --
     is treated exactly like "no curve," so this is a pure superset of the
-    old always-straight-lines output)."""
+    old always-straight-lines output). `pts` is assumed already scaled by
+    the caller (Phase 11 units); curve control points (stored raw,
+    unscaled) are scaled here to match."""
     parts = [f"M {pts[0][0]:.2f},{pts[0][1]:.2f}"]
     for i in range(1, len(pts)):
         node_id = point_ids[i] if point_ids and i < len(point_ids) else None
@@ -73,10 +162,10 @@ def _path_d_string(pts: list[Point], point_ids: list | None, props: dict) -> str
             parts.append(f"L {x:.2f},{y:.2f}")
         elif seg["kind"] == "cubic":
             c1, c2 = seg["c1"], seg["c2"]
-            parts.append(f"C {c1[0]:.2f},{c1[1]:.2f} {c2[0]:.2f},{c2[1]:.2f} {x:.2f},{y:.2f}")
+            parts.append(f"C {c1[0]*scale:.2f},{c1[1]*scale:.2f} {c2[0]*scale:.2f},{c2[1]*scale:.2f} {x:.2f},{y:.2f}")
         elif seg["kind"] == "quad":
             c = seg["c"]
-            parts.append(f"Q {c[0]:.2f},{c[1]:.2f} {x:.2f},{y:.2f}")
+            parts.append(f"Q {c[0]*scale:.2f},{c[1]*scale:.2f} {x:.2f},{y:.2f}")
         else:
             parts.append(f"L {x:.2f},{y:.2f}")
     return " ".join(parts)

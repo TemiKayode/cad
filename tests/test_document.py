@@ -230,6 +230,61 @@ def test_presence_updates_are_independent_per_actor():
     assert {p["actor"] for p in doc.presence_list()} == {"alice", "bob"}
 
 
+# -- document settings (Phase 11: units, grid/snap) ---------------------------
+
+
+def test_settings_default_to_empty():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    assert doc.settings_dict() == {}
+
+
+def test_set_setting_roundtrips():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    doc.apply(doc.set_setting("units", "mm"))
+    assert doc.settings_dict()["units"] == "mm"
+
+
+def test_settings_merge_field_wise_like_every_other_prop_bag():
+    """Two actors concurrently setting *different* settings must both
+    survive the merge -- the same LWWMap-per-key guarantee color/width
+    already have on path_props, not a bundled blob that would let one
+    concurrent write silently clobber the other."""
+    clock_a = LamportClock(actor="a")
+    doc_a = DrawingDocument(clock_a)
+    clock_b = LamportClock(actor="b")
+    doc_b = DrawingDocument(clock_b)
+
+    op_units = doc_a.set_setting("units", "in")
+    op_grid = doc_b.set_setting("grid_spacing", 5.0)
+    doc_a.apply(op_grid)
+    doc_b.apply(op_units)
+
+    assert doc_a.settings_dict() == {"units": "in", "grid_spacing": 5.0}
+    assert doc_b.settings_dict() == {"units": "in", "grid_spacing": 5.0}
+
+
+def test_settings_survive_serialization_roundtrip():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    doc.apply(doc.set_setting("units", "mm"))
+    doc.apply(doc.set_setting("snap_step", 2.5))
+    restored = DrawingDocument.from_bytes(LamportClock(actor="b"), doc.to_bytes())
+    assert restored.settings_dict() == {"units": "mm", "snap_step": 2.5}
+
+
+def test_settings_default_to_empty_when_absent_from_an_old_snapshot():
+    """A snapshot persisted before this component existed has no
+    "settings" key at all -- from_dict must default to an empty LWWMap
+    rather than KeyError, so old rooms still load cleanly."""
+    doc = DrawingDocument(LamportClock(actor="a"))
+    d = doc.to_dict()
+    del d["settings"]
+    restored = DrawingDocument.from_dict(LamportClock(actor="b"), d)
+    assert restored.settings_dict() == {}
+    # and it's still a real, usable LWWMap afterward, not a stub
+    restored.apply(restored.set_setting("units", "px"))
+    assert restored.settings_dict() == {"units": "px"}
+
+
 def test_comment_add_and_remove():
     doc = DrawingDocument(LamportClock(actor="a"))
     layer_id, _ = doc.add_layer("L")

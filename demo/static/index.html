@@ -29,7 +29,15 @@
           <button id="toolPolygon">⬠ Polygon (strict)</button>
           <button id="toolConstrain">📐 Constrain</button>
         </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="toolLine">╱ Line</button>
+          <button id="toolRect">▭ Rect</button>
+          <button id="toolCircle">○ Circle</button>
+          <button id="toolEllipse">⬭ Ellipse</button>
+          <button id="toolArc">◜ Arc</button>
+        </div>
         <div class="empty-hint" id="toolHint">Drag to draw a freehand stroke.</div>
+        <div id="shapeInputPanel"></div>
         <div class="tool-row" style="margin-top:6px">
           <button id="undoBtn">⟲ Undo</button>
           <button id="redoBtn">⟳ Redo</button>
@@ -43,6 +51,14 @@
         <div class="empty-hint" style="margin-top:4px">
           Zoom <span id="zoomIndicator">100%</span> · scroll to zoom (centered on cursor),
           middle-drag or Space+drag to pan.
+        </div>
+        <div class="field-row" style="margin-top:6px">
+          <label>Units</label>
+          <select id="unitsSelect" style="width:70px">
+            <option value="px">px</option>
+            <option value="mm">mm</option>
+            <option value="in">in</option>
+          </select>
         </div>
 
         <div class="section-title">File</div>

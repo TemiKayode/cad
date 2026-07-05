@@ -48,6 +48,19 @@ LayerId = str
 CommentId = str
 Point = tuple[float, float]
 
+# Document units (Phase 11): stored/CRDT geometry is always in raw
+# px-equivalent world units, regardless of this setting -- "units" is a
+# *display*-layer conversion (cursor readout, numeric shape input,
+# SVG/DXF export scale), never a migration of existing coordinates. The
+# 96 px/inch convention matches CSS's own px definition, so "px" is
+# exactly 1:1 and needs no special-casing anywhere that already assumes
+# today's raw-pixel behavior.
+UNITS_PX_PER_UNIT = {"px": 1.0, "mm": 96.0 / 25.4, "in": 96.0}
+
+
+def px_per_unit(units: str) -> float:
+    return UNITS_PX_PER_UNIT.get(units, 1.0)
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
@@ -141,7 +154,7 @@ def flatten_path_to_polyline(
 class DocOp:
     """Routable envelope around one op from one of the document's sub-CRDTs."""
 
-    target: str  # "layer" | "layer_prop" | "path_index" | "path_prop" | "path_geom" | "comment" | "presence"
+    target: str  # "layer" | "layer_prop" | "path_index" | "path_prop" | "path_geom" | "comment" | "presence" | "setting"
     payload: dict
     scope: Optional[str] = None  # layer_id / path_id, when the target needs one
 
@@ -163,6 +176,15 @@ class DrawingDocument:
         self.path_props: dict[PathId, LWWMap] = {}
         self.comments: LWWMap[CommentId, dict] = LWWMap(clock)
         self.presence: LWWMap[ActorId, dict] = LWWMap(clock)
+        # Document-level settings (Phase 11: "units": "px"|"mm"|"in", plus
+        # "grid_spacing"/"snap_step" the brief asks for) -- one LWWMap so
+        # concurrent edits to different settings merge field-wise for
+        # free, same as every other prop bag in this file. Stored
+        # geometry is always in raw px-equivalent world units regardless
+        # of this setting -- "units" is a *display*-layer conversion
+        # (cursor readout, numeric shape input, SVG/DXF export scale),
+        # never a migration of existing coordinates.
+        self.settings: LWWMap[str, object] = LWWMap(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -277,6 +299,14 @@ class DrawingDocument:
         op = self.presence.set(actor, cursor)
         return DocOp("presence", op.to_dict())
 
+    # -- document settings (Phase 11: units, grid/snap) -----------------------
+    def set_setting(self, key: str, value: object) -> DocOp:
+        op = self.settings.set(key, value)
+        return DocOp("setting", op.to_dict())
+
+    def settings_dict(self) -> dict:
+        return dict(self.settings.items())
+
     # -- undo / redo: inverted ops, not snapshots --------------------------------
     def undo(self) -> list[DocOp]:
         if not self._undo:
@@ -348,6 +378,8 @@ class DrawingDocument:
             return self.comments.apply(LWWOp.from_dict(op.payload))
         if op.target == "presence":
             return self.presence.apply(LWWOp.from_dict(op.payload))
+        if op.target == "setting":
+            return self.settings.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown doc op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -366,6 +398,7 @@ class DrawingDocument:
                 changed |= self._path_geom(path_id).merge(other.paths[path_id])
         changed |= self.comments.merge(other.comments)
         changed |= self.presence.merge(other.presence)
+        changed |= self.settings.merge(other.settings)
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -423,6 +456,7 @@ class DrawingDocument:
             vc = vc.merge(rga.frontier())
         vc = vc.merge(self.comments.frontier())
         vc = vc.merge(self.presence.frontier())
+        vc = vc.merge(self.settings.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[DocOp]:
@@ -436,6 +470,7 @@ class DrawingDocument:
             out += [DocOp("path_geom", op.to_dict(), scope=path_id) for op in rga.ops_since(vc)]
         out += [DocOp("comment", op.to_dict()) for op in self.comments.ops_since(vc)]
         out += [DocOp("presence", op.to_dict()) for op in self.presence.ops_since(vc)]
+        out += [DocOp("setting", op.to_dict()) for op in self.settings.ops_since(vc)]
         return out
 
     # -- serialization --------------------------------------------------------------
@@ -448,6 +483,7 @@ class DrawingDocument:
             "paths": {pid: rga.to_dict() for pid, rga in self.paths.items()},
             "comments": self.comments.to_dict(),
             "presence": self.presence.to_dict(),
+            "settings": self.settings.to_dict(),
         }
 
     @staticmethod
@@ -460,6 +496,10 @@ class DrawingDocument:
         doc.paths = {pid: RGA.from_dict(clock, r) for pid, r in d["paths"].items()}
         doc.comments = LWWMap.from_dict(clock, d["comments"])
         doc.presence = LWWMap.from_dict(clock, d["presence"])
+        # "settings" (Phase 11) is absent from any snapshot persisted
+        # before this existed -- default to an empty LWWMap rather than
+        # KeyError, so old rooms still load cleanly.
+        doc.settings = LWWMap.from_dict(clock, d["settings"]) if "settings" in d else LWWMap(clock)
         return doc
 
     def to_bytes(self) -> bytes:

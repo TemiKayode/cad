@@ -16,11 +16,32 @@ const state = {
   layers: new Map(),      // id -> {name, ...}
   layerOrder: [],
   pathIndex: new Set(),
-  pathProps: new Map(),   // id -> {layer_id, color, stroke_width}
+  pathProps: new Map(),   // id -> {layer_id, color, stroke_width, [shape props]}
   pathNodes: new Map(),   // id -> [{id,o,v,db}]  (already in document order)
   comments: new Map(),
   presence: new Map(),
+  settings: new Map(),    // "units" | "grid_spacing" | "snap_step" -> value (Phase 11)
 };
+
+// -- document units (Phase 11) ------------------------------------------------
+// Stored/CRDT geometry is always raw px-equivalent world units, regardless
+// of this setting -- "units" is a *display*-layer conversion (cursor
+// readout, shape numeric input, SVG/DXF export scale via the server's own
+// identical table in crdt_cad.crdt.document), never a migration of
+// existing coordinates. Mirrors UNITS_PX_PER_UNIT in document.py exactly.
+const UNITS_PX_PER_UNIT = { px: 1.0, mm: 96.0 / 25.4, in: 96.0 };
+function currentUnits() {
+  return state.settings.get("units") || "px";
+}
+function pxPerUnit() {
+  return UNITS_PX_PER_UNIT[currentUnits()] || 1.0;
+}
+function toDisplayUnits(px) {
+  return px / pxPerUnit();
+}
+function fromDisplayUnits(value) {
+  return value * pxPerUnit();
+}
 
 const ui = {
   tool: "pen",
@@ -43,6 +64,11 @@ let pendingPolygon = [];
 let constraintSelection = [];
 let lastMousePt = null; // world coordinates -- see the view transform section below
 
+// Phase 11 shape primitives: {kind, anchor:[wx,wy], current:[wx,wy]} while
+// a shape tool's click-drag gesture is in progress, else null -- see the
+// "shape primitives" section further down for the full design.
+let shapeDraft = null;
+
 // -- view transform (Phase 10) ------------------------------------------------
 // Pan (panX/panY, screen pixels the world origin is offset by) + zoom are
 // purely client-local UI state -- never synced, never touching the CRDT --
@@ -62,21 +88,25 @@ function worldToScreen(wx, wy) {
   return [wx * view.zoom + view.panX, wy * view.zoom + view.panY];
 }
 
-/** Picks a "nice" world-space grid step (1/2/5 x10^n) so its on-screen
- * spacing stays in a comfortable, zoom-independent pixel range -- used for
- * both grid rendering and snap-to-grid, so snapping always matches
- * whatever grid is currently visible. */
+/** Picks a "nice" world-space grid step (1/2/5 x10^n *in the current
+ * document unit*, then converted back to world px) so its on-screen
+ * spacing stays in a comfortable, zoom-independent pixel range -- used
+ * for both grid rendering and snap-to-grid, so snapping always matches
+ * whatever grid is currently visible. Unit-aware (Phase 11): with
+ * units="mm", the grid lands on nice round millimeters, not nice round
+ * pixels that happen to look reasonable on screen. */
 function pickGridStep(zoom) {
+  const ppu = pxPerUnit();
   const targetScreenPx = 60;
-  const rawStep = targetScreenPx / zoom;
-  const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
-  const residual = rawStep / magnitude;
+  const rawStepInUnits = targetScreenPx / zoom / ppu;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rawStepInUnits)));
+  const residual = rawStepInUnits / magnitude;
   let nice;
   if (residual < 1.5) nice = 1;
   else if (residual < 3.5) nice = 2;
   else if (residual < 7.5) nice = 5;
   else nice = 10;
-  return nice * magnitude;
+  return nice * magnitude * ppu;
 }
 
 function snapWorldPoint([wx, wy]) {
@@ -105,6 +135,7 @@ function observeSnapshotCounters(doc) {
   }
   scanEntries(doc.comments);
   scanEntries(doc.presence);
+  scanEntries(doc.settings);
   clock.observe(maxCounter);
 }
 
@@ -139,10 +170,13 @@ function loadSnapshot(doc) {
   for (const e of doc.comments.entries) if (!e.d) state.comments.set(e.k, e.v);
   state.presence.clear();
   for (const e of doc.presence.entries) if (!e.d) state.presence.set(e.k, e.v);
+  state.settings.clear();
+  for (const e of doc.settings.entries) if (!e.d) state.settings.set(e.k, e.v);
 
   if (!ui.activeLayer || !state.layers.has(ui.activeLayer)) {
     ui.activeLayer = state.layerOrder[0] || null;
   }
+  syncUnitsSelect();
   renderAll();
 }
 
@@ -181,6 +215,9 @@ function applyOp(op) {
     } else {
       state.presence.delete(p.k);
     }
+  } else if (op.target === "setting") {
+    if (!p.d) state.settings.set(p.k, p.v); else state.settings.delete(p.k);
+    syncUnitsSelect();
   }
 }
 
@@ -458,6 +495,20 @@ function removeComment(id) {
   sendOps([op]);
 }
 
+// -- document settings (Phase 11: units, grid/snap) -----------------------------
+
+function setSetting(key, value) {
+  const op = { target: "setting", payload: lwwOp(clock.tick(), key, value, false) };
+  applyOp(op);
+  sendOps([op]);
+}
+
+function syncUnitsSelect() {
+  const select = document.getElementById("unitsSelect");
+  if (select && select.value !== currentUnits()) select.value = currentUnits();
+}
+document.getElementById("unitsSelect").onchange = (e) => setSetting("units", e.target.value);
+
 // -- undo / redo: fresh inverted ops each time, not snapshots --------------------
 
 function undo() {
@@ -558,6 +609,13 @@ canvas.addEventListener("pointerdown", (e) => {
     canvas.style.cursor = "grabbing";
     return;
   }
+  if (isShapeTool(ui.tool)) {
+    const pt = worldPoint(e);
+    shapeDraft = { kind: ui.tool, anchor: pt, current: pt };
+    render();
+    renderShapeInputPanel();
+    return;
+  }
   if (ui.tool !== "pen") return;
   if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
   const pt = worldPoint(e);
@@ -580,6 +638,12 @@ canvas.addEventListener("pointermove", (e) => {
   sendPresence(pt[0], pt[1]);
   lastMousePt = pt;
   updateCursorReadout(pt);
+  if (shapeDraft) {
+    shapeDraft.current = pt;
+    render();
+    renderShapeInputPanel();
+    return;
+  }
   if (drawing) {
     // The "how far before adding a new point" feel should stay constant
     // on screen regardless of zoom, so this threshold compares screen
@@ -601,6 +665,17 @@ window.addEventListener("pointerup", () => {
     panState = null;
     justPanned = true;
     canvas.style.cursor = ui.tool === "select" ? "default" : "crosshair";
+    return;
+  }
+  if (shapeDraft) {
+    // A negligible drag (a plain click) leaves anchor === current --
+    // skip committing a zero-size shape nobody meant to draw.
+    const [ax, ay] = shapeDraft.anchor, [cx, cy] = shapeDraft.current;
+    if (Math.hypot(cx - ax, cy - ay) > 1e-6) {
+      commitShape(shapePropsFromDraft(shapeDraft.kind, shapeDraft.anchor, shapeDraft.current));
+    }
+    shapeDraft = null;
+    renderShapeInputPanel();
     return;
   }
   drawing = null;
@@ -699,7 +774,14 @@ function cancelPolygon() {
 function hitTestPath(screenPt) {
   let best = null, bestDist = 8;
   for (const pathId of state.pathIndex) {
-    if (ui.hiddenLayers.has((state.pathProps.get(pathId) || {}).layer_id)) continue;
+    const props = state.pathProps.get(pathId) || {};
+    if (ui.hiddenLayers.has(props.layer_id)) continue;
+    if (props.shape) {
+      // Shape primitives (Phase 11) have no path_geom points to walk --
+      // hitTestShape has its own dedicated per-kind boundary math.
+      if (hitTestShape(props, screenPt)) return pathId;
+      continue;
+    }
     const pts = pathPoints(pathId).map(([wx, wy]) => worldToScreen(wx, wy));
     for (let i = 0; i < pts.length - 1; i++) {
       const d = distToSegment(screenPt, pts[i], pts[i + 1]);
@@ -854,6 +936,205 @@ function renderConstraintPanel() {
     applyConstraint("fixed_distance", parseFloat(document.getElementById("constraintDistance").value) || 0);
 }
 
+// -- shape primitives (Phase 11) -----------------------------------------------
+// Representation: the parametric definition lives entirely in path_props
+// (e.g. {"shape": "circle", "cx":, "cy":, "r":}) -- the path's RGA point
+// list stays empty. Because path_props is an LWWMap, two users
+// concurrently editing (say) a circle's radius and its color merge
+// field-wise for free, with zero new CRDT code -- exactly the brief's
+// rationale for this representation. Rendering, hit-testing, and export
+// all derive the actual shape from these fields; freehand/polygon paths
+// are completely unaffected (they still use path_geom exclusively).
+
+function isShapeTool(tool) {
+  return tool === "line" || tool === "rect" || tool === "circle" || tool === "ellipse" || tool === "arc";
+}
+
+const SHAPE_FIELD_DEFS = {
+  line: [["length", "Length"], ["angle", "Angle (°)"]],
+  rect: [["w", "Width"], ["h", "Height"]],
+  circle: [["r", "Radius"]],
+  ellipse: [["rx", "Radius X"], ["ry", "Radius Y"]],
+  arc: [["r", "Radius"], ["start_angle", "Start (°)"], ["end_angle", "End (°)"]],
+};
+
+/** Derives full shape props from a click-drag gesture (anchor = where
+ * the drag started, current = live/final mouse position). */
+function shapePropsFromDraft(kind, anchor, current) {
+  const [ax, ay] = anchor, [cx, cy] = current;
+  if (kind === "line") return { shape: "line", x1: ax, y1: ay, x2: cx, y2: cy };
+  if (kind === "rect") {
+    return {
+      shape: "rect",
+      x: Math.min(ax, cx), y: Math.min(ay, cy),
+      w: Math.abs(cx - ax), h: Math.abs(cy - ay),
+    };
+  }
+  if (kind === "circle") return { shape: "circle", cx: ax, cy: ay, r: Math.hypot(cx - ax, cy - ay) };
+  if (kind === "ellipse") return { shape: "ellipse", cx: ax, cy: ay, rx: Math.abs(cx - ax), ry: Math.abs(cy - ay) };
+  if (kind === "arc") {
+    const r = Math.hypot(cx - ax, cy - ay);
+    const startAngle = (Math.atan2(cy - ay, cx - ax) * 180) / Math.PI;
+    // The drag alone only determines radius + start angle -- a fixed
+    // 90-degree default sweep keeps the gesture simple; Start/End angle
+    // are both still freely editable via the numeric panel afterward.
+    return { shape: "arc", cx: ax, cy: ay, r, start_angle: startAngle, end_angle: startAngle + 90 };
+  }
+  return null;
+}
+
+/** A sensible starting shape at the center of the current view -- used
+ * both to seed the numeric panel before any drag has happened, and as
+ * the anchor for the panel's standalone "type dimensions, no drag"
+ * creation path. */
+function defaultShapeProps(kind) {
+  const rect = canvasWrap.getBoundingClientRect();
+  const [wx, wy] = screenToWorld(rect.width / 2, rect.height / 2);
+  if (kind === "line") return { shape: "line", x1: wx - 50, y1: wy, x2: wx + 50, y2: wy };
+  if (kind === "rect") return { shape: "rect", x: wx - 50, y: wy - 25, w: 100, h: 50 };
+  if (kind === "circle") return { shape: "circle", cx: wx, cy: wy, r: 50 };
+  if (kind === "ellipse") return { shape: "ellipse", cx: wx, cy: wy, rx: 60, ry: 35 };
+  if (kind === "arc") return { shape: "arc", cx: wx, cy: wy, r: 50, start_angle: 0, end_angle: 90 };
+  return null;
+}
+
+function shapeAnchorOf(kind, props) {
+  if (kind === "line") return [props.x1, props.y1];
+  if (kind === "rect") return [props.x, props.y];
+  return [props.cx, props.cy];
+}
+
+/** Converts a shape's stored (raw world px) props into the numeric
+ * panel's per-field *display* values -- in the current document unit
+ * (Phase 11), and derived (length/angle) for Line specifically since
+ * that's a more natural way to type a line than two endpoints. */
+function shapeDisplayFields(kind, props) {
+  if (kind === "line") {
+    const len = Math.hypot(props.x2 - props.x1, props.y2 - props.y1);
+    const angle = (Math.atan2(props.y2 - props.y1, props.x2 - props.x1) * 180) / Math.PI;
+    return { length: toDisplayUnits(len), angle };
+  }
+  if (kind === "rect") return { w: toDisplayUnits(props.w), h: toDisplayUnits(props.h) };
+  if (kind === "circle") return { r: toDisplayUnits(props.r) };
+  if (kind === "ellipse") return { rx: toDisplayUnits(props.rx), ry: toDisplayUnits(props.ry) };
+  if (kind === "arc") return { r: toDisplayUnits(props.r), start_angle: props.start_angle, end_angle: props.end_angle };
+  return {};
+}
+
+/** The inverse of shapeDisplayFields -- typed panel values (+ a fixed
+ * anchor point) back into full, storable (raw world px) shape props. */
+function shapePropsFromFields(kind, anchor, fields) {
+  const [ax, ay] = anchor;
+  if (kind === "line") {
+    const len = fromDisplayUnits(fields.length);
+    const rad = (fields.angle * Math.PI) / 180;
+    return { shape: "line", x1: ax, y1: ay, x2: ax + len * Math.cos(rad), y2: ay + len * Math.sin(rad) };
+  }
+  if (kind === "rect") return { shape: "rect", x: ax, y: ay, w: fromDisplayUnits(fields.w), h: fromDisplayUnits(fields.h) };
+  if (kind === "circle") return { shape: "circle", cx: ax, cy: ay, r: fromDisplayUnits(fields.r) };
+  if (kind === "ellipse") {
+    return { shape: "ellipse", cx: ax, cy: ay, rx: fromDisplayUnits(fields.rx), ry: fromDisplayUnits(fields.ry) };
+  }
+  if (kind === "arc") {
+    return { shape: "arc", cx: ax, cy: ay, r: fromDisplayUnits(fields.r), start_angle: fields.start_angle, end_angle: fields.end_angle };
+  }
+  return null;
+}
+
+function commitShape(props) {
+  if (!props) return;
+  if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
+  const { id } = addPath(ui.activeLayer, [], actorColor, 2.5, props);
+  ui.selectedPath = id;
+  renderAll();
+  renderShapeInputPanel();
+  return id;
+}
+
+/** While dragging, shows the live-computed dimensions read-only (the
+ * drag itself is what's sizing the shape); otherwise, the fields are
+ * freely editable and Enter/"Create" commits a new shape at the current
+ * view's center using exactly the typed values -- Tab cycling between
+ * fields is just the browser's normal focus order, nothing extra needed. */
+function renderShapeInputPanel() {
+  const panel = document.getElementById("shapeInputPanel");
+  if (!panel) return;
+  if (!isShapeTool(ui.tool)) {
+    panel.innerHTML = "";
+    return;
+  }
+  const kind = ui.tool;
+  const dragging = !!shapeDraft;
+  const props = dragging ? shapePropsFromDraft(kind, shapeDraft.anchor, shapeDraft.current) : defaultShapeProps(kind);
+  const display = shapeDisplayFields(kind, props);
+  const rows = SHAPE_FIELD_DEFS[kind]
+    .map(
+      ([key, label]) => `
+    <div class="field-row">
+      <label>${label}</label>
+      <input class="shapeField" data-key="${key}" type="number" step="0.1"
+        value="${(display[key] || 0).toFixed(2)}" ${dragging ? "readonly" : ""} style="width:80px"/>
+    </div>`
+    )
+    .join("");
+  panel.innerHTML = dragging
+    ? `${rows}<div class="empty-hint">Release to place.</div>`
+    : `${rows}<button id="shapeCommitBtn" style="width:100%;margin-top:4px">Create</button>`;
+  if (dragging) return;
+  const inputs = [...panel.querySelectorAll(".shapeField")];
+  const commit = () => {
+    const fields = {};
+    for (const inp of inputs) fields[inp.dataset.key] = parseFloat(inp.value) || 0;
+    const anchor = shapeAnchorOf(kind, defaultShapeProps(kind));
+    commitShape(shapePropsFromFields(kind, anchor, fields));
+  };
+  document.getElementById("shapeCommitBtn").onclick = commit;
+  for (const inp of inputs) {
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(); }
+    });
+  }
+}
+
+/** Hit-tests a shape primitive against a *screen*-space point (same
+ * constant-on-screen-size rationale as hitTestPath/hitTestPoint) --
+ * returns true if within a small threshold of the shape's boundary. */
+function hitTestShape(shape, screenPt) {
+  const threshold = 8;
+  if (shape.shape === "line") {
+    const [a, b] = [worldToScreen(shape.x1, shape.y1), worldToScreen(shape.x2, shape.y2)];
+    return distToSegment(screenPt, a, b) < threshold;
+  }
+  if (shape.shape === "rect") {
+    const corners = [
+      [shape.x, shape.y], [shape.x + shape.w, shape.y],
+      [shape.x + shape.w, shape.y + shape.h], [shape.x, shape.y + shape.h],
+    ].map(([wx, wy]) => worldToScreen(wx, wy));
+    for (let i = 0; i < 4; i++) {
+      if (distToSegment(screenPt, corners[i], corners[(i + 1) % 4]) < threshold) return true;
+    }
+    return false;
+  }
+  if (shape.shape === "circle" || shape.shape === "ellipse" || shape.shape === "arc") {
+    const [scx, scy] = worldToScreen(shape.cx, shape.cy);
+    const rx = (shape.shape === "ellipse" ? shape.rx : shape.r) * view.zoom;
+    const ry = (shape.shape === "ellipse" ? shape.ry : shape.r) * view.zoom;
+    const dx = screenPt[0] - scx, dy = screenPt[1] - scy;
+    // Normalize into a unit circle (handles ellipse's independent radii)
+    // and compare the boundary distance in that normalized space, scaled
+    // back by the smaller radius for a reasonable screen-pixel threshold.
+    const normDist = Math.hypot(dx / rx, dy / ry);
+    if (Math.abs(normDist - 1) * Math.min(rx, ry) > threshold) return false;
+    if (shape.shape !== "arc") return true;
+    let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+    let start = shape.start_angle, end = shape.end_angle;
+    const sweep = ((end - start) % 360 + 360) % 360;
+    let rel = ((angle - start) % 360 + 360) % 360;
+    return rel <= sweep;
+  }
+  return false;
+}
+
 function distToSegment(p, a, b) {
   const [px, py] = p, [ax, ay] = a, [bx, by] = b;
   const dx = bx - ax, dy = by - ay;
@@ -868,17 +1149,27 @@ document.getElementById("toolPen").onclick = () => setTool("pen");
 document.getElementById("toolSelect").onclick = () => setTool("select");
 document.getElementById("toolPolygon").onclick = () => setTool("polygon");
 document.getElementById("toolConstrain").onclick = () => setTool("constrain");
+document.getElementById("toolLine").onclick = () => setTool("line");
+document.getElementById("toolRect").onclick = () => setTool("rect");
+document.getElementById("toolCircle").onclick = () => setTool("circle");
+document.getElementById("toolEllipse").onclick = () => setTool("ellipse");
+document.getElementById("toolArc").onclick = () => setTool("arc");
+const TOOL_BUTTON_IDS = {
+  pen: "toolPen", select: "toolSelect", polygon: "toolPolygon", constrain: "toolConstrain",
+  line: "toolLine", rect: "toolRect", circle: "toolCircle", ellipse: "toolEllipse", arc: "toolArc",
+};
 function setTool(tool) {
   if (ui.tool === "polygon" && tool !== "polygon") cancelPolygon();
   if (ui.tool === "constrain" && tool !== "constrain") { constraintSelection = []; renderConstraintPanel(); }
+  if (isShapeTool(ui.tool) && tool !== ui.tool) { shapeDraft = null; }
   ui.tool = tool;
-  document.getElementById("toolPen").classList.toggle("active", tool === "pen");
-  document.getElementById("toolSelect").classList.toggle("active", tool === "select");
-  document.getElementById("toolPolygon").classList.toggle("active", tool === "polygon");
-  document.getElementById("toolConstrain").classList.toggle("active", tool === "constrain");
+  for (const [t, id] of Object.entries(TOOL_BUTTON_IDS)) {
+    document.getElementById(id).classList.toggle("active", tool === t);
+  }
   canvas.style.cursor = tool === "select" ? "default" : "crosshair";
   render();
   renderToolHint();
+  renderShapeInputPanel();
 }
 
 function renderToolHint() {
@@ -892,6 +1183,8 @@ function renderToolHint() {
     hint.textContent = "Drag to draw a freehand stroke.";
   } else if (ui.tool === "constrain") {
     hint.textContent = "Click two points (any paths) to relate them -- coincident, parallel, perpendicular, or a fixed distance apart.";
+  } else if (isShapeTool(ui.tool)) {
+    hint.textContent = "Drag to size and place, or type exact dimensions below.";
   } else {
     hint.textContent = "Click a path to select it.";
   }
@@ -904,7 +1197,10 @@ function updateZoomIndicator() {
 }
 
 function updateCursorReadout([wx, wy]) {
-  document.getElementById("cursorCoords").textContent = `${wx.toFixed(1)}, ${wy.toFixed(1)}`;
+  const units = currentUnits();
+  const dx = toDisplayUnits(wx), dy = toDisplayUnits(wy);
+  const suffix = units === "px" ? "" : units;
+  document.getElementById("cursorCoords").textContent = `${dx.toFixed(units === "px" ? 1 : 2)}, ${dy.toFixed(units === "px" ? 1 : 2)}${suffix ? " " + suffix : ""}`;
 }
 
 /** Fits all visible (non-hidden-layer) geometry into view with some
@@ -997,6 +1293,46 @@ function drawGrid(rect) {
   ctx.restore();
 }
 
+/** Traces + (usually) strokes a shape primitive (Phase 11) natively --
+ * ctx.rect/ctx.arc/ctx.ellipse -- rather than faceting to a polyline,
+ * called from inside render()'s world-space transform so it can use raw
+ * world coordinates directly. `isDraftPreview` skips applying the
+ * shape's own color/width (the caller has already set a dashed preview
+ * style) and skips the selection glow -- used for the live in-progress
+ * drag preview, which isn't a committed, selectable path yet. */
+function drawShapePath(props, isSelected, isDraftPreview = false) {
+  ctx.beginPath();
+  if (props.shape === "line") {
+    ctx.moveTo(props.x1, props.y1);
+    ctx.lineTo(props.x2, props.y2);
+  } else if (props.shape === "rect") {
+    ctx.rect(props.x, props.y, props.w, props.h);
+  } else if (props.shape === "circle") {
+    ctx.arc(props.cx, props.cy, props.r, 0, Math.PI * 2);
+  } else if (props.shape === "ellipse") {
+    ctx.ellipse(props.cx, props.cy, props.rx, props.ry, 0, 0, Math.PI * 2);
+  } else if (props.shape === "arc") {
+    ctx.arc(props.cx, props.cy, props.r, (props.start_angle * Math.PI) / 180, (props.end_angle * Math.PI) / 180);
+  }
+  if (isDraftPreview) {
+    ctx.stroke();
+    return;
+  }
+  ctx.strokeStyle = props.color || "#e7e9ee";
+  ctx.lineWidth = props.stroke_width || 2.5;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.stroke();
+  if (isSelected) {
+    ctx.save();
+    ctx.strokeStyle = "#4dabf7";
+    ctx.lineWidth = (props.stroke_width || 2.5) + 4;
+    ctx.globalAlpha = 0.25;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
 function render() {
   const rect = canvasWrap.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
@@ -1013,6 +1349,10 @@ function render() {
   for (const pathId of state.pathIndex) {
     const props = state.pathProps.get(pathId) || {};
     if (ui.hiddenLayers.has(props.layer_id)) continue;
+    if (props.shape) {
+      drawShapePath(props, pathId === ui.selectedPath);
+      continue;
+    }
     const entries = liveEntries(state.pathNodes.get(pathId));
     const pts = entries.map((n) => n.v);
     if (pts.length === 0) continue;
@@ -1064,6 +1404,15 @@ function render() {
     for (let i = 1; i < pendingPolygon.length; i++) ctx.lineTo(pendingPolygon[i][0], pendingPolygon[i][1]);
     if (lastMousePt) ctx.lineTo(lastMousePt[0], lastMousePt[1]);
     ctx.stroke();
+    ctx.restore();
+  }
+
+  if (shapeDraft) {
+    ctx.save();
+    ctx.strokeStyle = "#ffd43b";
+    ctx.lineWidth = 2 / view.zoom;
+    ctx.setLineDash([6 / view.zoom, 4 / view.zoom]);
+    drawShapePath(shapePropsFromDraft(shapeDraft.kind, shapeDraft.anchor, shapeDraft.current), false, true);
     ctx.restore();
   }
 
@@ -1155,9 +1504,10 @@ function renderPathList() {
     const props = state.pathProps.get(pathId) || {};
     const row = document.createElement("div");
     row.className = "path-row" + (pathId === ui.selectedPath ? " active" : "");
+    const label = props.shape ? `${props.shape}` : `${pathPoints(pathId).length} pts`;
     row.innerHTML = `
       <span class="path-swatch" style="background:${props.color || "#eee"}"></span>
-      <span class="name">${pathPoints(pathId).length} pts · ${escapeHtml((state.layers.get(props.layer_id) || {}).name || "?")}</span>
+      <span class="name">${label} · ${escapeHtml((state.layers.get(props.layer_id) || {}).name || "?")}</span>
       <button class="ghost-btn" data-act="del">✕</button>
     `;
     row.querySelector(".name").onclick = () => { ui.selectedPath = pathId; renderAll(); };
@@ -1236,6 +1586,7 @@ function renderAll() {
   renderPathList();
   renderSelectionPanel();
   renderConstraintPanel();
+  renderShapeInputPanel();
   renderPresenceList();
 }
 
