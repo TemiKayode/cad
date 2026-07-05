@@ -287,10 +287,24 @@ function redo() {
 
 // -- relay connection -----------------------------------------------------------
 
-function applyIncomingOps(ops) {
+function applyIncomingOps(ops, fromActor) {
   for (const op of ops) applyOp(op);
   ui.opsCount += ops.length;
   syncScene();
+  // Phase D6: mirrors sketch.js's identical remote-edit flash -- see its
+  // comment. Mesh ops key their touched geometry differently: a vertex
+  // move/create carries the vertex id as `scope`; a face op carries the
+  // face id. Both get flashed the same way in syncScene's own render.
+  if (fromActor && fromActor !== actorId) {
+    const color = (state.presence.get(fromActor) || {}).color;
+    if (color) {
+      for (const op of ops) {
+        if (op.target === "vertex" && state.vertices.has(op.payload.k)) flashRemoteEdit(op.payload.k, color);
+        else if (op.target === "face_index" && state.faceIndex.has(op.payload.k)) flashRemoteEdit(op.payload.k, color);
+        else if (op.target === "face_geom" && state.faceIndex.has(op.face_id)) flashRemoteEdit(op.face_id, color);
+      }
+    }
+  }
 }
 
 // `conn`/`p2p` are assigned inside the async bootstrap below (ensureRoomAccess
@@ -316,13 +330,22 @@ let conn, p2p;
       if (persistedOutbox.length) syncScene();
     },
     onDelta: (ops) => applyIncomingOps(ops),
-    onOps: (ops) => applyIncomingOps(ops),
+    onOps: (ops, from) => applyIncomingOps(ops, from),
     onStatus: (status) => setStatus(status),
     onSaved: (at) => { setSaveState("saved", at); showToast("Saved", "success"); },
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
     onValidityWarning: (faces, problems) => applyValidityWarning(faces, problems),
     onRole: (role) => {
       viewerMode = applyViewerModeUI(role);
+      // Phase D6: unlike the 2D demo (which sends presence continuously
+      // on mousemove), 3D only ever sends it at discrete commit points
+      // (placing/dragging a vertex) -- without this, a collaborator who
+      // joins and just looks around stays completely invisible to
+      // everyone else's avatar stack/cursor layer until their first
+      // edit. One ping right after connecting (not gated on viewerMode
+      // -- a read-only viewer is still a real participant worth seeing)
+      // fixes that; every subsequent real interaction still updates it.
+      sendPresence([controls.target.x, controls.target.y, controls.target.z]);
     },
     token,
     kind: "mesh",
@@ -331,7 +354,7 @@ let conn, p2p;
   });
 
   p2p = new P2PManager(conn, actorId, {
-    onPeerData: (_peerActorId, ops) => applyIncomingOps(ops),
+    onPeerData: (peerActorId, ops) => applyIncomingOps(ops, peerActorId),
     onPeerStatus: () => updateP2pPill(),
   });
 })();
@@ -861,6 +884,11 @@ camera.lookAt(0, 0, 0);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0, 0);
 controls.enableDamping = true;
+// Phase D6 follow mode: "any manual pan/zoom exits" -- OrbitControls
+// fires its own "start" event only for a genuine user-driven pointer/
+// wheel gesture, never for the programmatic controls.target.set() the
+// follow-mode tick itself does, so this can't immediately undo itself.
+controls.addEventListener("start", exitFollow);
 
 // -- orthographic-ish view buttons (Phase 16) ------------------------------------
 // Repositions the *existing* perspective camera to standard axis-aligned
@@ -875,6 +903,7 @@ controls.enableDamping = true;
 const DEFAULT_CAMERA_POSITION = [6, 6, 8];
 const VIEW_DISTANCE = 12;
 function setCameraView(view) {
+  exitFollow(); // Phase D6: a manual view change exits follow mode
   controls.target.set(0, 0, 0);
   if (view === "top") {
     // Looking straight down -Y with the default up=(0,1,0) leaves the
@@ -944,7 +973,21 @@ const faceMeshes = new Map();
 const invalidFaceOutlines = new Map();
 
 const FACE_PALETTE = [0x4dabf7, 0x69db7c, 0xffd43b, 0xda77f2, 0xff922b, 0x38d9a9, 0xf783ac];
+
+// Phase D6: id (vertex or face) -> a Three.js numeric color, briefly, for
+// "a just-arrived remote edit flashes its color" -- see flashRemoteEdit
+// and its onOps call site. vertexColor/faceColor both check this first
+// so the existing per-frame syncScene() material assignment is all that's
+// needed to show (and, once the entry expires, stop showing) it.
+const remoteEditFlashes = new Map();
+function flashRemoteEdit(id, cssColor) {
+  remoteEditFlashes.set(id, parseInt(cssColor.slice(1), 16));
+  syncScene();
+  setTimeout(() => { remoteEditFlashes.delete(id); syncScene(); }, 600);
+}
+
 function faceColor(faceId) {
+  if (remoteEditFlashes.has(faceId)) return remoteEditFlashes.get(faceId);
   const props = state.faceProps.get(faceId);
   if (props && typeof props.color === "string" && /^#[0-9a-fA-F]{6}$/.test(props.color)) {
     return parseInt(props.color.slice(1), 16);
@@ -969,6 +1012,7 @@ function buildFaceGeometry(loop) {
 }
 
 function vertexColor(id) {
+  if (remoteEditFlashes.has(id)) return remoteEditFlashes.get(id);
   if (pendingFaceLoop.includes(id)) return 0xffd43b;
   return 0xd7dbe0;
 }
@@ -1021,6 +1065,11 @@ function syncScene() {
     } else {
       mesh.geometry.dispose();
       mesh.geometry = geo;
+      // Phase D6: faceColor() was previously only ever read at mesh
+      // creation time -- an existing face's material color never
+      // updated afterward, which would have made flashRemoteEdit a
+      // silent no-op for any face that already had a mesh.
+      mesh.material.color.set(faceColor(id));
     }
   }
 
@@ -1590,27 +1639,79 @@ function renderPresenceList() {
     row.innerHTML = `<span class="path-swatch" style="background:${p.color || "#4dabf7"}"></span><span class="name">${escapeHtml(p.name || "?")}</span>`;
     list.appendChild(row);
   }
-  renderAvatarStack(actorName, actorColor, others);
+  renderAvatarStack(actorName, actorColor, others, toggleFollow, followingActorId);
 }
+
+// Phase D6: mirrors sketch.js's tickPresenceCursors -- eased position in
+// 3D *world* space (not screen space, so the ease stays correct as the
+// camera itself moves), idle-fade after 3s. actorId -> {pos, targetPos,
+// lastMovedAt, el}.
+const CURSOR_IDLE_FADE_MS = 3000;
+const remoteCursorState = new Map();
 
 function renderPresenceOverlay() {
   const layer = document.getElementById("cursorLayer");
-  layer.innerHTML = "";
   const rect = renderer.domElement.getBoundingClientRect();
+  const now = performance.now();
+  const seen = new Set();
   for (const [actor, p] of state.presence) {
     if (actor === actorId || !p || !p.pos) continue;
-    const v = new THREE.Vector3(p.pos[0], p.pos[1], p.pos[2]).project(camera);
-    if (v.z > 1) continue;
-    const x = (v.x * 0.5 + 0.5) * rect.width;
-    const y = (-v.y * 0.5 + 0.5) * rect.height;
-    const el = document.createElement("div");
-    el.className = "cursor-label";
-    el.style.left = x + "px";
-    el.style.top = y + "px";
-    el.style.background = p.color || "#4dabf7";
-    el.textContent = p.name || actor;
-    layer.appendChild(el);
+    seen.add(actor);
+    let cs = remoteCursorState.get(actor);
+    if (!cs) {
+      cs = { pos: [...p.pos], targetPos: p.pos, lastMovedAt: now, el: null };
+      remoteCursorState.set(actor, cs);
+    }
+    if (cs.targetPos[0] !== p.pos[0] || cs.targetPos[1] !== p.pos[1] || cs.targetPos[2] !== p.pos[2]) {
+      cs.targetPos = p.pos;
+      cs.lastMovedAt = now;
+    }
+    const t = 1 - Math.exp(-16 / 80); // same ~80ms ease as the 2D demo
+    for (let i = 0; i < 3; i++) cs.pos[i] += (cs.targetPos[i] - cs.pos[i]) * t;
+
+    const v = new THREE.Vector3(...cs.pos).project(camera);
+    if (v.z > 1) { cs.el?.remove(); cs.el = null; continue; }
+    if (!cs.el) {
+      cs.el = document.createElement("div");
+      cs.el.className = "cursor-label";
+      cs.el.innerHTML = '<div class="cursor-dot"></div><div class="cursor-name"></div>';
+      layer.appendChild(cs.el);
+    }
+    cs.el.style.left = (v.x * 0.5 + 0.5) * rect.width + "px";
+    cs.el.style.top = (-v.y * 0.5 + 0.5) * rect.height + "px";
+    cs.el.querySelector(".cursor-dot").style.background = p.color || "#4dabf7";
+    cs.el.querySelector(".cursor-name").style.background = p.color || "#4dabf7";
+    cs.el.querySelector(".cursor-name").textContent = p.name || actor;
+    cs.el.classList.toggle("idle", now - cs.lastMovedAt > CURSOR_IDLE_FADE_MS);
   }
+  for (const [actor, cs] of remoteCursorState) {
+    if (!seen.has(actor)) {
+      cs.el?.remove();
+      remoteCursorState.delete(actor);
+    }
+  }
+  // Follow mode (Phase D6 stretch goal): move the OrbitControls target
+  // to whoever's being followed, every frame -- their own camera
+  // position/orientation is never broadcast (client-local-only, per the
+  // brief), so this can only mean "keep orbiting around where they are,"
+  // not a full camera-pose sync.
+  if (followingActorId) {
+    const followed = remoteCursorState.get(followingActorId);
+    if (followed) controls.target.set(...followed.pos);
+  }
+}
+
+// -- follow mode (Phase D6 stretch goal) -----------------------------------------
+
+let followingActorId = null;
+
+function toggleFollow(id) {
+  followingActorId = followingActorId === id ? null : id;
+  renderPresenceList();
+}
+
+function exitFollow() {
+  if (followingActorId) followingActorId = null;
 }
 
 setInterval(() => {

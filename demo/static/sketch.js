@@ -169,6 +169,32 @@ function flashPath(pathId) {
   setTimeout(() => { flashingPathIds.delete(pathId); render(); }, 600);
 }
 
+// Phase D6: pathId -> the remote actor's color, for a "just arrived"
+// edit flash -- same 600ms-and-self-clearing mechanic as the rejection
+// flash above, but keyed by *who* made the change rather than a fixed
+// danger color, and triggered by any incoming op from another actor
+// (see onOps below), not a rejection.
+const remoteEditFlashes = new Map();
+function flashRemoteEdit(pathId, color) {
+  remoteEditFlashes.set(pathId, color);
+  render();
+  setTimeout(() => { remoteEditFlashes.delete(pathId); render(); }, 600);
+}
+
+/** The color of whichever *other* actor currently has `pathId`
+ * selected, or null -- drives the hairline remote-selection outline.
+ * Presence broadcasts each actor's own selection (see sendPresence's
+ * `sel` field); if two remote actors somehow selected the same path,
+ * this just shows whichever one iterates first, which is an acceptable
+ * simplification for a rare edge case. */
+function remoteSelectionColorFor(pathId) {
+  for (const [otherId, p] of state.presence) {
+    if (otherId === actorId || !p) continue;
+    if (Array.isArray(p.sel) && p.sel.includes(pathId)) return p.color;
+  }
+  return null;
+}
+
 // -- view transform (Phase 10) ------------------------------------------------
 // Pan (panX/panY, screen pixels the world origin is offset by) + zoom are
 // purely client-local UI state -- never synced, never touching the CRDT --
@@ -363,10 +389,25 @@ function revertRejectedOp(op) {
   if (idx !== -1) nodes.splice(idx, 1);
 }
 
-function applyIncomingOps(ops) {
+function applyIncomingOps(ops, fromActor) {
   for (const op of ops) applyOp(op);
   ui.opsCount += ops.length;
   renderAll();
+  // Phase D6: "a just-arrived remote edit flashes its color at low
+  // opacity" -- only for ops that touch a specific path (path_geom/
+  // path_prop both carry the path id as `scope`); a layer/comment op
+  // has no single piece of geometry to point the flash at.
+  if (fromActor && fromActor !== actorId) {
+    const color = (state.presence.get(fromActor) || {}).color;
+    if (color) {
+      const touched = new Set(
+        ops
+          .filter((op) => (op.target === "path_geom" || op.target === "path_prop") && op.scope)
+          .map((op) => op.scope)
+      );
+      for (const pathId of touched) if (state.pathIndex.has(pathId)) flashRemoteEdit(pathId, color);
+    }
+  }
 }
 
 // -- relay connection -----------------------------------------------------------
@@ -396,7 +437,7 @@ let conn, p2p;
       if (persistedOutbox.length) renderAll();
     },
     onDelta: (ops) => applyIncomingOps(ops),
-    onOps: (ops) => applyIncomingOps(ops),
+    onOps: (ops, from) => applyIncomingOps(ops, from),
     onStatus: (status) => setStatus(status),
     onRejected: (reason, op) => {
       revertRejectedOp(op);
@@ -416,7 +457,7 @@ let conn, p2p;
   });
 
   p2p = new P2PManager(conn, actorId, {
-    onPeerData: (_peerActorId, ops) => applyIncomingOps(ops),
+    onPeerData: (peerActorId, ops) => applyIncomingOps(ops, peerActorId),
     onPeerStatus: () => updateP2pPill(),
   });
 })();
@@ -845,11 +886,19 @@ document.getElementById("redoBtn").onclick = redo;
 // -- presence ---------------------------------------------------------------------
 
 let lastPresenceSent = 0;
+/** `sel` (Phase D6) rides the same throttled payload as position -- a
+ * selection change alone (no mouse movement following it) still gets
+ * picked up within one 400ms status-interval tick (see its call there),
+ * since that tick calls this unthrottled-in-effect by simply not caring
+ * whether the throttle window already elapsed. */
 function sendPresence(x, y) {
   const now = performance.now();
   if (now - lastPresenceSent < 60) return;
   lastPresenceSent = now;
-  const op = { target: "presence", payload: lwwOp(clock.tick(), actorId, { x, y, name: actorName, color: actorColor }, false) };
+  const op = {
+    target: "presence",
+    payload: lwwOp(clock.tick(), actorId, { x, y, name: actorName, color: actorColor, sel: [...ui.selectedPaths] }, false),
+  };
   applyOp(op);
   sendOps([op]);
 }
@@ -899,6 +948,7 @@ function isPanGesture(e) {
 canvas.addEventListener("pointerdown", (e) => {
   if (isPanGesture(e)) {
     e.preventDefault();
+    exitFollow(); // Phase D6: "any manual pan/zoom exits" follow mode
     const [sx, sy] = canvasPoint(e);
     panState = { startSx: sx, startSy: sy, panX0: view.panX, panY0: view.panY };
     canvas.style.cursor = "grabbing";
@@ -1228,6 +1278,7 @@ canvas.addEventListener(
   "wheel",
   (e) => {
     e.preventDefault();
+    exitFollow(); // Phase D6: "any manual pan/zoom exits" follow mode
     const [sx, sy] = canvasPoint(e);
     const [wxBefore, wyBefore] = screenToWorld(sx, sy);
     const factor = Math.exp(-e.deltaY * 0.001);
@@ -2880,6 +2931,7 @@ function updateCursorReadout([wx, wy]) {
  * centered on the world origin) rather than leaving a stale pan/zoom
  * from before everything was deleted. */
 function fitToContent() {
+  exitFollow(); // Phase D6: a manual view change exits follow mode
   const allPts = [];
   for (const pathId of state.pathIndex) {
     if (ui.hiddenLayers.has((state.pathProps.get(pathId) || {}).layer_id)) continue;
@@ -2914,6 +2966,7 @@ document.getElementById("fitToContentBtn").onclick = fitToContent;
  * no cursor position to anchor on for a keyboard-triggered zoom, unlike
  * the wheel handler above) -- Ctrl/Cmd+1 "zoom to 100%" (Phase D4). */
 function zoomTo(targetZoom) {
+  exitFollow(); // Phase D6: a manual view change exits follow mode
   const rect = canvasWrap.getBoundingClientRect();
   const cx = rect.width / 2, cy = rect.height / 2;
   const [wx, wy] = screenToWorld(cx, cy);
@@ -3032,7 +3085,7 @@ function applyFillIfSet(props) {
   ctx.restore();
 }
 
-function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = false, isFlashing = false) {
+function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = false, isFlashing = false, remoteColor = null) {
   if (props.shape === "text") {
     ctx.save();
     ctx.font = `${props.font_size || 16}px sans-serif`;
@@ -3065,6 +3118,15 @@ function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = fa
       ctx.strokeStyle = canvasColor("--danger");
       ctx.globalAlpha = 0.6;
       ctx.lineWidth = 2 / view.zoom;
+      ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.restore();
+    }
+    if (remoteColor) {
+      const b = textBounds(props);
+      ctx.save();
+      ctx.strokeStyle = remoteColor;
+      ctx.globalAlpha = 0.8;
+      ctx.lineWidth = 1.5 / view.zoom;
       ctx.strokeRect(b.x, b.y, b.w, b.h);
       ctx.restore();
     }
@@ -3126,6 +3188,21 @@ function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = fa
     ctx.stroke();
     ctx.restore();
   }
+  if (remoteColor) {
+    // Phase D6: a hairline in a collaborator's own presence color --
+    // either they currently have this path selected, or an op of theirs
+    // just landed on it (flashRemoteEdit) -- constant on-screen width
+    // (divided by zoom) rather than scaling with stroke_width, a
+    // deliberately different visual language from the accent/danger
+    // halos above so "someone else is here" reads distinctly from
+    // "this is selected/hovered/rejected".
+    ctx.save();
+    ctx.strokeStyle = remoteColor;
+    ctx.lineWidth = 1.5 / view.zoom;
+    ctx.globalAlpha = 0.8;
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 /** Paths sorted by layer order, then creation order (Phase 15: fills
@@ -3166,7 +3243,14 @@ function render() {
     // untransformed coordinates either way.
     const wrapped = beginPathTransform(pathId, props);
     if (props.shape) {
-      drawShapePath(props, ui.selectedPaths.has(pathId), false, pathId === hoveredPathId, flashingPathIds.has(pathId));
+      drawShapePath(
+        props,
+        ui.selectedPaths.has(pathId),
+        false,
+        pathId === hoveredPathId,
+        flashingPathIds.has(pathId),
+        remoteEditFlashes.get(pathId) || remoteSelectionColorFor(pathId)
+      );
       if (wrapped) ctx.restore();
       continue;
     }
@@ -3235,6 +3319,18 @@ function render() {
       ctx.strokeStyle = canvasColor("--danger");
       ctx.lineWidth = (props.stroke_width || 2.5) + 5;
       ctx.globalAlpha = 0.6;
+      ctx.stroke();
+      ctx.restore();
+    }
+    const remoteColor = remoteEditFlashes.get(pathId) || remoteSelectionColorFor(pathId);
+    if (remoteColor) {
+      // Phase D6: see the identical block in drawShapePath for the
+      // rationale (constant-width hairline, distinct from the halos
+      // above).
+      ctx.save();
+      ctx.strokeStyle = remoteColor;
+      ctx.lineWidth = 1.5 / view.zoom;
+      ctx.globalAlpha = 0.8;
       ctx.stroke();
       ctx.restore();
     }
@@ -3356,27 +3452,97 @@ function render() {
   }
 
   drawSnapGlyph(activeSnapGlyph);
-
-  renderPresence();
 }
 
-function renderPresence() {
+// -- remote cursors: smooth interpolation + idle name-fade (Phase D6) -----------
+//
+// Runs as its own requestAnimationFrame loop, independent of the
+// reactive main canvas render() above -- a remote cursor needs to keep
+// easing toward its latest known position every frame even when
+// nothing else on screen is dirty, and this is a handful of cheap DOM
+// style writes, not a canvas redraw (see the D8 perf-audit brief's
+// "canvas redraws only on dirty state").
+
+const CURSOR_IDLE_FADE_MS = 3000;
+const remoteCursorState = new Map(); // actorId -> {x, y, targetX, targetY, lastMovedAt, el}
+
+function tickPresenceCursors() {
   const layer = document.getElementById("cursorLayer");
-  layer.innerHTML = "";
+  const now = performance.now();
+  const seen = new Set();
   for (const [actor, p] of state.presence) {
     if (actor === actorId || !p) continue;
-    const el = document.createElement("div");
-    el.className = "cursor-label";
-    // Presence positions are stored/sent in world coordinates (Phase 10)
-    // -- this DOM overlay isn't inside the canvas's transform, so it
-    // needs its own worldToScreen conversion to land in the right place.
-    const [sx, sy] = worldToScreen(p.x, p.y);
-    el.style.left = sx + "px";
-    el.style.top = sy + "px";
-    el.style.background = p.color || "#4dabf7";
-    el.textContent = p.name || actor;
-    layer.appendChild(el);
+    seen.add(actor);
+    let cs = remoteCursorState.get(actor);
+    if (!cs) {
+      cs = { x: p.x, y: p.y, targetX: p.x, targetY: p.y, lastMovedAt: now, el: null };
+      remoteCursorState.set(actor, cs);
+    }
+    if (cs.targetX !== p.x || cs.targetY !== p.y) {
+      cs.targetX = p.x;
+      cs.targetY = p.y;
+      cs.lastMovedAt = now;
+    }
+    // Exponential ease toward the target -- "interpolate with a ~80ms
+    // ease" (the brief), frame-rate-independent via a per-frame factor
+    // rather than a fixed step, so it looks the same at 30fps or 144fps.
+    const t = 1 - Math.exp(-16 / 80);
+    cs.x += (cs.targetX - cs.x) * t;
+    cs.y += (cs.targetY - cs.y) * t;
+
+    if (!cs.el) {
+      cs.el = document.createElement("div");
+      cs.el.className = "cursor-label";
+      cs.el.innerHTML = '<div class="cursor-dot"></div><div class="cursor-name"></div>';
+      layer.appendChild(cs.el);
+    }
+    const [sx, sy] = worldToScreen(cs.x, cs.y);
+    cs.el.style.left = sx + "px";
+    cs.el.style.top = sy + "px";
+    const dot = cs.el.querySelector(".cursor-dot");
+    const nameEl = cs.el.querySelector(".cursor-name");
+    dot.style.background = p.color || "#4dabf7";
+    nameEl.style.background = p.color || "#4dabf7";
+    nameEl.textContent = p.name || actor;
+    cs.el.classList.toggle("idle", now - cs.lastMovedAt > CURSOR_IDLE_FADE_MS);
   }
+  for (const [actor, cs] of remoteCursorState) {
+    if (!seen.has(actor)) {
+      cs.el?.remove();
+      remoteCursorState.delete(actor);
+    }
+  }
+  // Phase D6 follow mode (stretch goal): re-center the viewport on
+  // whoever's being followed every frame, using the same eased position
+  // the cursor dot itself is drawn at (so following looks as smooth as
+  // the cursor does) -- their own zoom/pan is never broadcast (the
+  // brief's own client-local-only constraint), so this can only ever
+  // mean "keep their point centered at my current zoom level," not a
+  // full camera-pose sync.
+  if (followingActorId) {
+    const followed = remoteCursorState.get(followingActorId);
+    if (followed) {
+      const rect = canvasWrap.getBoundingClientRect();
+      view.panX = rect.width / 2 - followed.x * view.zoom;
+      view.panY = rect.height / 2 - followed.y * view.zoom;
+      render();
+    }
+  }
+  requestAnimationFrame(tickPresenceCursors);
+}
+requestAnimationFrame(tickPresenceCursors);
+
+// -- follow mode (Phase D6 stretch goal) -----------------------------------------
+
+let followingActorId = null;
+
+function toggleFollow(id) {
+  followingActorId = followingActorId === id ? null : id;
+  renderPresenceList();
+}
+
+function exitFollow() {
+  if (followingActorId) followingActorId = null;
 }
 
 function renderLayerList() {
@@ -3597,7 +3763,7 @@ function renderPresenceList() {
     row.innerHTML = `<span class="path-swatch" style="background:${p.color || "#4dabf7"}"></span><span class="name">${escapeHtml(p.name || "?")}</span>`;
     list.appendChild(row);
   }
-  renderAvatarStack(actorName, actorColor, others);
+  renderAvatarStack(actorName, actorColor, others, toggleFollow, followingActorId);
 }
 
 function escapeHtml(s) {
@@ -3622,6 +3788,10 @@ setInterval(() => {
   updateStatusCluster(currentConnStatus, conn ? conn.outbox.length : 0);
   const hint = document.getElementById("emptyCanvasHint");
   if (hint) hint.style.display = state.pathIndex.size === 0 ? "block" : "none";
+  // Phase D6: a selection change with no mouse movement after it (e.g.
+  // clicking a path-list row) wouldn't otherwise re-trigger sendPresence
+  // -- this heartbeat picks it up within 400ms regardless.
+  if (lastMousePt) sendPresence(lastMousePt[0], lastMousePt[1]);
 }, 400);
 
 resizeCanvas();

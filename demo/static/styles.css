@@ -321,14 +321,21 @@ input:disabled, select:disabled, textarea:disabled {
 .avatar {
   width: 26px; height: 26px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
-  font-size: 11px; font-weight: 700; color: #06121a;
+  font-size: 11px; font-weight: 700; color: #fff; /* Phase D6: ACTOR_COLORS are now mid-tone/saturated, not pastel -- white clears 4:1+ on all 8, unlike the old palette's near-black text */
   border: 2px solid var(--bg-panel);
   margin-left: -8px;
-  transition: transform var(--t-fast) var(--ease-standard);
+  transition: transform var(--t-fast) var(--ease-standard), opacity var(--t-med) var(--ease-standard);
 }
 .avatar:first-child { margin-left: 0; }
 .avatar:hover { transform: translateY(-2px); z-index: 1; }
 .avatar-overflow { background: var(--bg-raised); color: var(--text-secondary); }
+.avatar.avatar-enter { animation: avatar-enter var(--t-med) var(--ease-standard); }
+@keyframes avatar-enter {
+  from { transform: scale(0.4); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.avatar-clickable { cursor: pointer; }
+.avatar-clickable.following { box-shadow: 0 0 0 2px var(--bg-panel), 0 0 0 4px var(--accent); }
 
 /* -- bottom status strip -------------------------------------------------- */
 
@@ -414,12 +421,26 @@ canvas { display: block; background: var(--bg-canvas); }
    never trigger a stray text selection on whatever's behind/around it. */
 .canvas-wrap { position: relative; min-height: 0; z-index: var(--z-canvas); user-select: none; }
 
+/* Phase D6: a remote cursor is a small always-visible dot (centered on
+   the actual point) plus a name pill that fades out after 3s of no
+   movement and fades back in the instant it moves -- the outer
+   .cursor-label element is what JS positions (style.left/top), kept
+   as its own stable class/positioning contract since an existing e2e
+   test (test_viewport_e2e.py) asserts against it directly. */
 .cursor-label {
-  position: absolute; pointer-events: none; font-size: 11px;
-  padding: 1px 6px; border-radius: var(--r-sm); color: var(--accent-on); font-weight: 600;
-  transform: translate(8px, -100%);
-  white-space: nowrap;
+  position: absolute; pointer-events: none; white-space: nowrap;
+  transform: translate(-4px, -4px);
 }
+.cursor-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--bg-app);
+}
+.cursor-name {
+  position: absolute; left: 10px; top: -6px; font-size: 11px;
+  padding: 1px 6px; border-radius: var(--r-sm); color: #fff; font-weight: 600;
+  opacity: 1; transition: opacity var(--t-med) var(--ease-standard);
+}
+.cursor-label.idle .cursor-name { opacity: 0; }
 
 .statusbar {
   display: flex; align-items: center; gap: 16px;

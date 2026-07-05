@@ -517,9 +517,18 @@ function closeShortcutOverlay() {
   if (_shortcutOverlayReleaseFocus) { _shortcutOverlayReleaseFocus(); _shortcutOverlayReleaseFocus = null; }
 }
 
+// Phase D6: 8 distinguishable hues, each verified (see the WCAG relative-
+// luminance formula used for --accent in D1) to clear 3:1 against BOTH
+// theme's own --bg-canvas (#0b1120 dark / #ffffff light) *and* 4:1+ with
+// solid white text on top -- the previous 10-color palette was bright/
+// pastel hues tuned for a dark background only (e.g. #ffd43b yellow was
+// a 13:1 vs the dark canvas but only 1.4:1 vs the light one, i.e.
+// functionally invisible there). These are deliberately mid-tone/fully
+// saturated instead of pastel, which is what makes a single hex value
+// work against both a near-black and a near-white canvas at once.
 const ACTOR_COLORS = [
-  "#ff6b6b", "#4dabf7", "#69db7c", "#ffd43b", "#da77f2",
-  "#ff922b", "#38d9a9", "#f783ac", "#748ffc", "#94d82d",
+  "#c92a2a", "#d9480f", "#a5720a", "#2b8a3e",
+  "#0c8599", "#1971c2", "#6f52d1", "#c2255c",
 ];
 
 function initialsOf(name) {
@@ -534,18 +543,48 @@ function initialsOf(name) {
  * initial-circles capped to MAX_VISIBLE with a "+N" overflow chip.
  * `othersEntries` is `[...state.presence.entries()]` already filtered
  * to exclude the local actor. */
-function renderAvatarStack(meName, meColor, othersEntries) {
+// Phase D6: null until the first render, which seeds this silently (no
+// "X joined" toast for people already in the room when this tab
+// connects -- only for genuine arrivals after that).
+let _seenPresenceActors = null;
+
+/** `onAvatarClick(actorId)` is optional (follow mode, Phase D6 stretch
+ * goal) -- each demo passes its own viewport-follow toggle since 2D
+ * pan/zoom and 3D orbit have nothing in common mechanically; common.js
+ * only owns the generic "here's who's in the room" rendering.
+ * `followingId`, also optional, marks whose avatar gets the "you're
+ * following them" ring. */
+function renderAvatarStack(meName, meColor, othersEntries, onAvatarClick, followingId) {
   const stack = document.getElementById("avatarStack");
   if (!stack) return;
   const MAX_VISIBLE = 4;
-  const people = [{ name: meName, color: meColor }, ...othersEntries.map(([, p]) => p).filter(Boolean)];
+  const people = [
+    { id: null, name: meName, color: meColor },
+    ...othersEntries.map(([id, p]) => (p ? { id, name: p.name, color: p.color } : null)).filter(Boolean),
+  ];
+  const currentIds = new Set(people.map((p) => p.id).filter(Boolean));
+
+  const newlyJoined = new Set();
+  if (_seenPresenceActors === null) {
+    _seenPresenceActors = currentIds;
+  } else {
+    for (const id of currentIds) if (!_seenPresenceActors.has(id)) newlyJoined.add(id);
+    for (const p of people) if (newlyJoined.has(p.id)) showToast(`${p.name || "Someone"} joined`, "info");
+    _seenPresenceActors = currentIds; // also drops anyone who left, so a rejoin is greeted again
+  }
+
   stack.innerHTML = "";
   for (const p of people.slice(0, MAX_VISIBLE)) {
     const el = document.createElement("div");
-    el.className = "avatar";
+    el.className = newlyJoined.has(p.id) ? "avatar avatar-enter" : "avatar";
     el.style.background = p.color || "#4dabf7";
     el.textContent = initialsOf(p.name);
     el.title = p.name || "?";
+    if (p.id && onAvatarClick) {
+      el.classList.add("avatar-clickable");
+      if (p.id === followingId) el.classList.add("following");
+      el.onclick = () => onAvatarClick(p.id);
+    }
     stack.appendChild(el);
   }
   const overflow = people.length - MAX_VISIBLE;

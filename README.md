@@ -51,7 +51,8 @@ offline to see the **Time-Travel Merge** panel.
 | Layout: icon tool rail, collapsible panels, document name, avatar stack (Part 3 Phase D2) | **Done** -- canvas gets most of the width back; responsive down to 375px, see below |
 | Input feel: per-tool cursors, hover halo, token-correct snap/marquee colors (Part 3 Phase D3) | **Done** -- no drag-to-resize handles (a pre-existing, deliberate numeric-input-only scope decision, not reopened here), see below |
 | Keyboard-first: command palette, single-key shortcuts, keyboard reachability audit (Part 3 Phase D4) | **Done** -- Ctrl/Cmd+K palette, per-tool single-key shortcuts, arrow-key nudge, Ctrl/Cmd+Z/Y now in the 2D demo too, grouped/searchable "?" overlay, skip-to-canvas link, focus-trapped modals, see below |
-| State legibility: connection/save status cluster, toast queueing, empty states, undo-toasts (Part 3 Phase D5) | **Done** -- honest "Saved"/"Reconnecting" copy matching the real durability model, geometry-rejection red flash (2D only -- 3D has no pre-commit validity gate to hang it off); D6-D8 (presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
+| State legibility: connection/save status cluster, toast queueing, empty states, undo-toasts (Part 3 Phase D5) | **Done** -- honest "Saved"/"Reconnecting" copy matching the real durability model, geometry-rejection red flash (2D only -- 3D has no pre-commit validity gate to hang it off), see below |
+| Multiplayer presence: smooth cursors, avatar delight, remote selection/edit highlights, follow mode (Part 3 Phase D6) | **Done** -- 8-color both-theme-verified actor palette (was 10, pastel, dark-theme-only), a real "3D presence never sent until first edit" gap found and fixed; D7-D8 (signature-moment art direction, perf/a11y audit) still open, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -65,7 +66,7 @@ offline to see the **Time-Travel Merge** panel.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 72 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 80 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -1270,6 +1271,111 @@ stay usable.
 tests/e2e/test_state_legibility_e2e.py adds 8 browser tests. Full e2e
 suite (72 tests) and full non-e2e suite pass.
 
+## Multiplayer presence: cursors, avatars, follow mode (Part 3, Phase D6)
+
+- **A real, both-theme contrast bug found while doing the brief's own
+  "checked against both themes" step**: the pre-existing 10-color
+  `ACTOR_COLORS` (common.js) were bright/pastel hues tuned only for the
+  dark theme -- e.g. `#ffd43b` yellow cleared 13:1 against the dark
+  canvas but only 1.4:1 against the light one, i.e. functionally
+  invisible there. Computing the WCAG relative-luminance contrast ratio
+  for all 10 against both `--bg-canvas` values (same formula used for
+  `--accent` in D1) confirmed every one of them failed the light theme.
+  Replaced with **8 mid-tone, fully saturated hues** (red/orange/amber/
+  green/teal/blue/indigo/pink), each individually verified to clear
+  3:1+ against both canvas backgrounds *and* 4:1+ with solid white
+  text -- pastel colors can't do this at all (a light background
+  against a light color, or a dark background against a dark one, is
+  the failure mode either way), which is what makes "one hex value
+  works on both a near-black and a near-white canvas" require a
+  deliberately mid-luminance band rather than a wide, pretty palette.
+  The avatar-stack initials' text color (previously hardcoded near-
+  black, correct only for the old pastel palette) is now white to
+  match.
+- **Smooth remote cursors**: each demo's cursor-position rendering was
+  rewritten from "rebuild every DOM node from scratch every render,
+  snapped directly to the latest presence value" into its own
+  independent loop (2D: a dedicated `requestAnimationFrame` loop,
+  decoupled from the reactive main canvas `render()`; 3D: folded into
+  the existing per-frame `animate()`) that exponentially eases a
+  persistent per-actor DOM element toward the latest target position
+  (~80ms ease, frame-rate-independent) rather than teleporting, and
+  fades the name label to a bare colored dot after 3s of no movement,
+  instantly reappearing on the next update. 3D eases in *world* space
+  before each frame's camera projection, not screen space, so the ease
+  stays correct even while the camera itself is moving. `.cursor-label`
+  (the element `test_viewport_e2e.py` already asserts `style.left`/
+  `style.top` against) keeps its exact class name and positioning
+  contract; the dot/name split lives in new nested `.cursor-dot`/
+  `.cursor-name` children instead.
+- **Avatar stack**: a new arrival gets a scale/fade entrance
+  (`.avatar-enter`, a `@keyframes` reduced-motion already neutralizes
+  globally) and a quiet "`X` joined" toast -- tracked via a
+  previously-seen-actor-ids `Set` in `renderAvatarStack` that seeds
+  itself silently on the very first render (so nobody already in the
+  room gets greeted as "joining" the moment *you* connect) and forgets
+  an id once they leave, so a rejoin is greeted again.
+- **Remote selection/edit visibility (2D only)**: presence now also
+  broadcasts the sender's own `ui.selectedPaths` (riding the same
+  throttled payload, plus a 400ms heartbeat fallback for a selection
+  change with no mouse movement after it, e.g. clicking a path-list
+  row); any path another actor currently has selected gets a
+  constant-width hairline outline in their color
+  (`remoteSelectionColorFor`), and any path touched by an incoming op
+  from another actor (`onOps`'s now-threaded `from` parameter) briefly
+  flashes the same way in their color for 600ms (`flashRemoteEdit`) --
+  the identical self-clearing mechanic as D5's rejection flash, just
+  keyed by *who* instead of a fixed danger color. **No 3D equivalent**:
+  mesh rooms have no per-path-boundary selection concept broadcastable
+  the same way (`ui.selectedFace` is a single id, and highlighting a
+  Three.js face in a collaborator's color would need real
+  material/outline work distinct from the 2D canvas-stroke approach) --
+  a deliberate scope trim, not attempted here. 3D *does* get the
+  edit-flash (vertex/face material color, briefly, on an incoming op
+  from another actor) since that reuses the exact same op-and-color
+  plumbing, just applied to `vertexColor()`/`faceColor()` instead of a
+  canvas stroke -- and fixed a real, adjacent bug while wiring it up:
+  an existing face mesh's material color was previously only ever set
+  once at mesh *creation*, never re-applied on a later `syncScene()`,
+  so the flash would have been a silent no-op for any face that
+  already existed.
+- **A real gap this phase's own two-tab verification found**: 3D only
+  ever sent presence at discrete commit points (placing/dragging a
+  vertex) -- unlike 2D, which sends continuously on mousemove. A
+  collaborator who joined and just looked around stayed completely
+  invisible (no avatar, no cursor) to everyone else until their first
+  edit. `onRole` now sends one presence ping immediately once
+  connected (not gated on viewer role -- a read-only viewer is still a
+  real participant worth seeing), matching what a live two-tab test
+  actually exposed rather than what the code looked like it should do
+  in isolation. The same pass also found both demos' WebRTC
+  `onPeerData` callbacks silently discarding the sending peer's actor
+  id (`_peerActorId` was prefixed-unused) -- fixed so the edit-flash
+  also works for P2P-sourced ops, not just server-relayed ones.
+- **Follow mode** (stretch goal within this phase): clicking another
+  actor's avatar toggles `followingActorId`; every frame (the same
+  cursor-easing loop above), the local viewport re-centers on their
+  eased position -- 2D re-pans `view.panX/panY` at the current zoom
+  level, 3D moves the `OrbitControls` target (so the camera keeps
+  orbiting around wherever they are). Neither a full camera *pose* is
+  ever broadcast (viewport state is explicitly client-local-only, per
+  the brief, and per this project's design since Phase 10) -- follow
+  mode can only mean "keep their point centered," not "see exactly what
+  they see," and the popover-adjacent `.following` ring on the avatar
+  is the only UI claiming anything more specific than that. Any manual
+  pan/zoom/orbit (wheel, drag-pan, Fit/Zoom-100%, the 3D view buttons,
+  or OrbitControls' own "start" event) exits it -- verified via
+  OrbitControls' event only firing for a genuine user gesture, never
+  for follow mode's own programmatic `controls.target.set()`, so it
+  can't immediately undo itself.
+
+tests/e2e/test_presence_e2e.py adds 8 browser tests -- the 3D ones are
+necessarily DOM-signal-only (toast text, CSS classes, rendered
+`cursor-label` position), since mesh3d.js's `<script type="module">`
+scoping makes its internal state (unlike sketch.js's classic-script
+globals) unreachable from `page.evaluate`. Full e2e suite (80 tests)
+and full non-e2e suite pass.
+
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
 Before this, the canvas mapped document coordinates 1:1 to screen
@@ -2313,7 +2419,7 @@ which it did, on the first real attempt in both passes.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (72 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (80 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -2460,7 +2566,25 @@ hovering the visible one keeps it showing well past its normal 4s
 duration; deleting a path shows an "Undo" toast whose action button
 restores it; and a self-intersecting strict polygon shows a "Rejected"
 toast while `flashingPathIds` briefly holds that path's id, then clears
-itself.
+itself; and (Phase D6) `test_presence_e2e.py` -- `ACTOR_COLORS` is
+exactly 8 distinct hues, none the old failing yellow; a second tab
+joining triggers a "joined" toast and an entrance-animated avatar on
+the first; a remote cursor's rendered position keeps easing well after
+a big jump rather than landing instantly, and its name label gains/
+loses an `idle` class after 3s of no movement / on the next update;
+`remoteSelectionColorFor` returns a color once another tab selects a
+path, and `remoteEditFlashes` briefly holds that path's id when the
+other tab edits it; clicking another actor's avatar re-pans the local
+view toward them and a manual wheel-zoom clears `followingActorId`
+again; and, for the 3D demo (DOM-signal-only, since its
+`<script type="module">` scoping makes internal state unreachable from
+`page.evaluate`, unlike sketch.js's classic-script globals), a second
+tab that joins and does nothing at all still produces a "joined" toast
+and a visible cursor (the regression test for the "3D presence was
+never sent until the first edit" gap this phase found), the cursor
+gains an `idle` class after 3s and loses it on the next update, and
+follow mode leaves the followed actor's own rendered cursor position
+near the viewport's center.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

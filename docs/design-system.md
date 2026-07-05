@@ -189,8 +189,11 @@ CSS custom property can't reach -- `mesh3d.js` passes it to re-apply
 - The connection/save status cluster, toast system, empty states, and
   destructive-delete confirmations are done -- Phase D5, documented in
   the README's own "State legibility" section, not repeated here.
-- Remote presence cursor color palette (currently `ACTOR_COLORS` in
-  `common.js`, unchanged) checked against both themes is D6.
+- Remote presence cursor color palette is done -- Phase D6 replaced the
+  old 10-color pastel `ACTOR_COLORS` (dark-theme-only, several failed
+  3:1 against the light theme's canvas) with 8 mid-tone hues verified
+  against both, documented in the README's own "Multiplayer presence"
+  section, not repeated here.
 - The Time-Travel Merge modal and AI-generation flow got a token-only
   re-skin here (colors, radii, shadow, `.modal`/`.modal-overlay`
   classes), not the art direction the brief describes for either --
