@@ -151,6 +151,69 @@ input:disabled, select:disabled, textarea:disabled {
 .status-pill.offline .status-dot { background: var(--danger); }
 .status-pill.unauthorized .status-dot { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
 
+/* -- connection/save status cluster (Phase D5 state legibility) --------- */
+
+.status-cluster-wrap { position: relative; }
+.status-cluster {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--border); font-size: 12px; background: var(--bg-raised);
+}
+.status-cluster:hover { border-color: var(--text-secondary); }
+.status-dot-online { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.status-dot-connecting { background: var(--warning); }
+.status-dot-offline { background: var(--danger); }
+.status-dot.pulsing { animation: status-dot-pulse 1.5s ease-in-out infinite; }
+@keyframes status-dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.status-sep { color: var(--text-secondary); }
+#saveLabel { color: var(--text-secondary); font-size: 11px; }
+
+.status-popover {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: var(--z-popover);
+  width: 280px; background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--r-md); box-shadow: var(--shadow-floating);
+  padding: 12px 14px; font-size: 12.5px; line-height: 1.5; color: var(--text-secondary);
+}
+
+/* -- toasts (Phase D5) ---------------------------------------------------- */
+
+.toast-container {
+  position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+  z-index: var(--z-toast); display: flex; flex-direction: column; align-items: center;
+}
+.toast {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px 8px 16px; border-radius: var(--r-sm);
+  font-size: 13px; font-weight: 600; color: var(--accent-on);
+  background: var(--accent); box-shadow: var(--shadow-floating);
+  opacity: 1; transition: opacity var(--t-med) var(--ease-standard);
+}
+.toast.toast-hide { opacity: 0; }
+.toast-success { background: var(--success); }
+.toast-error { background: var(--danger); }
+.toast-action {
+  background: rgba(255, 255, 255, 0.2); border: 1px solid rgba(255, 255, 255, 0.4);
+  color: inherit; font-weight: 700; padding: 3px 10px; font-size: 12px;
+}
+.toast-action:hover { border-color: rgba(255, 255, 255, 0.8); }
+
+/* -- empty-canvas hint (Phase D5) ------------------------------------------ */
+
+.empty-canvas-hint {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  color: var(--text-secondary); font-size: 13px; text-align: center;
+  pointer-events: none; user-select: none; white-space: nowrap;
+}
+
+/* -- geometry-rejection red flash (Phase D5, sketch.js render()) --------- */
+/* canvas-drawn, not a DOM rule -- see canvasColor("--danger") call sites;
+   listed here only so the token's use for this purpose is discoverable. */
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
 /* Phase D2: canvas is the hero -- a slim 48px icon-only tool rail (not
    a labeled button column) plus two collapsible panels, so most of the
    width goes to the drawing, not chrome. */

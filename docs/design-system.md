@@ -186,9 +186,9 @@ CSS custom property can't reach -- `mesh3d.js` passes it to re-apply
 - Command palette, single-key shortcuts, and the keyboard reachability
   audit are done -- Phase D4, documented in the README's own
   "Keyboard-first" section, not repeated here.
-- The connection/save status cluster, toast copy, and empty states are
-  functionally unchanged from before D1 -- just re-skinned onto tokens.
-  Redesigning them is D5.
+- The connection/save status cluster, toast system, empty states, and
+  destructive-delete confirmations are done -- Phase D5, documented in
+  the README's own "State legibility" section, not repeated here.
 - Remote presence cursor color palette (currently `ACTOR_COLORS` in
   `common.js`, unchanged) checked against both themes is D6.
 - The Time-Travel Merge modal and AI-generation flow got a token-only

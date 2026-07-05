@@ -825,7 +825,10 @@ async function persistOutbox(kind, room, actorId, outbox) {
  *   onSnapshot(doc)             -- full authoritative state (new client)
  *   onDelta(ops)                -- ops missed while offline (reconnect)
  *   onOps(ops, fromActor)       -- live broadcast from another client
- *   onStatus(status)            -- "connecting" | "online" | "offline"
+ *   onStatus(status)            -- "connecting" | "reconnecting" | "online" |
+ *     "offline" | "unauthorized" ("reconnecting", Phase D5, is every
+ *     connection attempt after the very first one -- the automatic
+ *     retry loop below, or a user-triggered goOnline())
  *   onRejected(reason, op)      -- server refused one op (validity gate)
  *   onSignal(fromActor, data)   -- WebRTC signaling payload from a peer
  *   onSaved(at)                 -- explicit save confirmed durable
@@ -902,6 +905,13 @@ class RelayConnection {
     this.outbox = initialOutbox ? initialOutbox.slice() : [];
     this.userWantsOffline = false;
     this._reconnectDelay = 1000;
+    // Phase D5: distinguishes the very first connection attempt
+    // ("connecting") from every attempt after that -- including the
+    // automatic retry loop below and a user-triggered goOnline() --
+    // ("reconnecting"), so the status cluster can show a more specific
+    // "Reconnecting..." label instead of a generic one that reads the
+    // same on first load as it does after a real drop.
+    this._everConnected = false;
     this._connect();
   }
 
@@ -917,7 +927,7 @@ class RelayConnection {
 
   _connect() {
     if (this.userWantsOffline) return;
-    this.onStatus("connecting");
+    this.onStatus(this._everConnected ? "reconnecting" : "connecting");
     const ws = new WebSocket(this._wsUrl());
     this.ws = ws;
     ws.onopen = () => {
@@ -950,6 +960,7 @@ class RelayConnection {
 
   _handleMessage(msg) {
     if (msg.type === "snapshot") {
+      this._everConnected = true;
       this.role = msg.role || "editor";
       this.onRole(this.role);
       this.frontier.recordAll(msg.frontier);
@@ -1149,29 +1160,194 @@ function opIdKey(id) {
 }
 
 // -- shared UI feedback: toasts + the Time-Travel Merge preview modal --------------
+//
+// Phase D5: one toast queued and shown at a time (not stacked -- a burst
+// of events, e.g. importing several files back to back, reads as a
+// sequence instead of a pile), auto-dismissing after 4s but pausable on
+// hover (the timer's remaining time survives a hover, it isn't just
+// reset), announced via aria-live so a screen reader hears it without
+// needing focus moved to it, and optionally carrying one action button
+// (e.g. "Undo") -- see showUndoToast below, the concrete case this
+// exists for.
 
-function showToast(message, kind = "info") {
+const _toastQueue = [];
+let _toastShowing = false;
+
+function showToast(message, kind = "info", opts = {}) {
+  _toastQueue.push({ message, kind, opts });
+  _drainToastQueue();
+}
+
+/** A destructive action (deleting a path/face/vertex with dependents)
+ * gets this instead of a blocking confirm() dialog -- the delete
+ * already happened (and is already a normal entry on the existing CRDT
+ * undo stack), this just surfaces a brief, dismissable way back out of
+ * it, matching how e.g. Gmail's "Undone"/trash-with-undo pattern works
+ * rather than asking permission up front. `undoTimes` lets one toast
+ * cover a whole batch delete (each removed item is its own undo-stack
+ * entry, so undoing N of them takes N calls). */
+function showUndoToast(message, undoFn, undoTimes = 1) {
+  showToast(message, "info", {
+    actionLabel: "Undo",
+    onAction: () => { for (let i = 0; i < undoTimes; i++) undoFn(); },
+  });
+}
+
+function _drainToastQueue() {
+  if (_toastShowing || !_toastQueue.length) return;
+  _toastShowing = true;
+  const { message, kind, opts } = _toastQueue.shift();
+
   let container = document.getElementById("toastContainer");
   if (!container) {
     container = document.createElement("div");
     container.id = "toastContainer";
-    container.style.cssText =
-      `position:fixed;bottom:40px;left:50%;transform:translateX(-50%);z-index:var(--z-toast);` +
-      "display:flex;flex-direction:column;gap:6px;align-items:center;";
+    container.className = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    container.setAttribute("role", "status");
     document.body.appendChild(container);
   }
-  const colors = { info: "var(--accent)", success: "var(--success)", error: "var(--danger)" };
+
   const el = document.createElement("div");
-  el.textContent = message;
-  el.style.cssText =
-    `padding:8px 16px;border-radius:var(--r-sm);font-size:13px;font-weight:600;color:var(--accent-on);` +
-    `background:${colors[kind] || colors.info};box-shadow:var(--shadow-floating);` +
-    "transition:opacity var(--t-med) var(--ease-standard);";
+  el.className = `toast toast-${kind}`;
+  const text = document.createElement("span");
+  text.textContent = message;
+  el.appendChild(text);
+  if (opts.actionLabel) {
+    const btn = document.createElement("button");
+    btn.className = "toast-action";
+    btn.textContent = opts.actionLabel;
+    btn.onclick = () => {
+      opts.onAction?.();
+      finish();
+    };
+    el.appendChild(btn);
+  }
   container.appendChild(el);
-  setTimeout(() => {
-    el.style.opacity = "0";
-    setTimeout(() => el.remove(), 300);
-  }, 2800);
+
+  const DURATION = 4000;
+  let remaining = DURATION;
+  let startedAt = Date.now();
+  let timer = setTimeout(finish, DURATION);
+  let finished = false;
+
+  function finish() {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    el.classList.add("toast-hide");
+    setTimeout(() => {
+      el.remove();
+      _toastShowing = false;
+      _drainToastQueue();
+    }, 250);
+  }
+  el.addEventListener("mouseenter", () => {
+    clearTimeout(timer);
+    remaining -= Date.now() - startedAt;
+  });
+  el.addEventListener("mouseleave", () => {
+    startedAt = Date.now();
+    timer = setTimeout(finish, Math.max(remaining, 300));
+  });
+}
+
+// -- connection/save status cluster (Phase D5 state legibility) ---------------
+//
+// #statusText keeps its exact pre-D5 raw value ("online"/"offline"/
+// "connecting"/"reconnecting"/"unauthorized") and is visually hidden
+// (`.sr-only`) rather than removed -- dozens of existing e2e tests
+// across the whole suite wait on `statusText.textContent === 'online'`
+// (or 'offline') as their "the page finished connecting" signal, and
+// changing that machine-readable word out from under them for a purely
+// cosmetic relabel isn't worth the blast radius. #statusLabel is the
+// new human-facing text the brief actually asks for.
+
+const STATUS_COPY = {
+  connecting: { label: "Connecting...", tone: "connecting", pulse: true,
+    detail: "Opening a connection to the room for the first time." },
+  reconnecting: { label: "Reconnecting...", tone: "connecting", pulse: true,
+    detail: "The connection dropped -- retrying automatically. Anything you edit now queues locally and merges in once it's back (see Time-Travel Merge)." },
+  online: { label: "Live", tone: "online", pulse: false,
+    detail: "Connected. Every accepted edit is durably persisted on the server immediately -- \"Save\" just forces an extra version-history checkpoint early." },
+  offline: { label: "Offline", tone: "offline", pulse: false,
+    detail: "You're intentionally disconnected. Edits queue locally (and survive a reload) until you reconnect, then merge automatically with no conflicts." },
+  unauthorized: { label: "Needs a new link", tone: "offline", pulse: false,
+    detail: "This room's shared secret changed, or your access expired -- reload with a fresh invite link." },
+};
+
+/** Called from each demo's own setStatus() wrapper on every connection
+ * status change, and again whenever the offline outbox's length might
+ * have changed (so "N edits queued" stays live while paused). */
+function updateStatusCluster(status, queuedCount) {
+  const dot = document.getElementById("statusDot");
+  const label = document.getElementById("statusLabel");
+  if (!dot || !label) return;
+  const copy = STATUS_COPY[status] || STATUS_COPY.connecting;
+  dot.className = `status-dot status-dot-${copy.tone}`;
+  dot.classList.toggle("pulsing", copy.pulse);
+  label.textContent =
+    status === "offline" && queuedCount > 0
+      ? `Offline -- ${queuedCount} edit${queuedCount === 1 ? "" : "s"} queued`
+      : copy.label;
+  const detail = document.getElementById("statusPopoverDetail");
+  if (detail) detail.textContent = copy.detail;
+}
+
+let _lastSavedAt = null;
+let _saveInFlight = false;
+
+function relativeTimeShort(unixSeconds) {
+  const deltaSec = Date.now() / 1000 - unixSeconds;
+  if (deltaSec < 5) return "just now";
+  if (deltaSec < 60) return `${Math.floor(deltaSec)}s ago`;
+  const mins = Math.floor(deltaSec / 60);
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.floor(mins / 60)}h ago`;
+}
+
+/** `state` is "saving" (a save request is genuinely in flight -- not a
+ * fabricated delay, the round trip really does take a moment) or
+ * "saved" (the server's own onSaved(at) timestamp, or Date.now() for
+ * "whatever's here now is durably persisted" moments like first
+ * connecting). */
+function setSaveState(state, at) {
+  _saveInFlight = state === "saving";
+  if (state === "saved") _lastSavedAt = at ?? Date.now() / 1000;
+  renderSaveLabel();
+}
+
+function renderSaveLabel() {
+  const el = document.getElementById("saveLabel");
+  if (!el) return;
+  if (_saveInFlight) { el.textContent = "Saving..."; return; }
+  el.textContent = _lastSavedAt == null ? "" : `Saved ${relativeTimeShort(_lastSavedAt)}`;
+}
+
+/** Wires the cluster's click-to-open popover (with outside-click and
+ * Esc to close, restoring focus to the button) and a slow tick so
+ * "Saved Nm ago" keeps counting up without needing another save/status
+ * event to re-render it. */
+function initStatusCluster() {
+  const btn = document.getElementById("statusCluster");
+  const popover = document.getElementById("statusPopover");
+  if (!btn || !popover) return;
+  function close() {
+    popover.style.display = "none";
+    btn.setAttribute("aria-expanded", "false");
+  }
+  btn.addEventListener("click", () => {
+    const isOpen = popover.style.display !== "none";
+    popover.style.display = isOpen ? "none" : "block";
+    btn.setAttribute("aria-expanded", String(!isOpen));
+  });
+  document.addEventListener("click", (e) => {
+    if (popover.style.display !== "none" && !btn.contains(e.target) && !popover.contains(e.target)) close();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && popover.style.display !== "none") { close(); btn.focus(); }
+  });
+  setInterval(renderSaveLabel, 30000);
 }
 
 /** Summarizes a batch of DrawingDocument ops into short human-readable

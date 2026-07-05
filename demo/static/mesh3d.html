@@ -47,7 +47,18 @@
       <button id="toggleSecondaryPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle tools & files panel (\)" aria-label="Toggle tools & files panel"><svg class="icon"><use href="#icon-chevron-left"></use></svg></button>
       <button id="toggleRightPanelBtn" class="ghost-btn panel-collapse-btn active" data-tooltip="Toggle inspector panel (\)" aria-label="Toggle inspector panel"><svg class="icon"><use href="#icon-chevron-right"></use></svg></button>
       <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
-      <span id="statusPill" class="status-pill connecting"><span class="status-dot"></span><span id="statusText">connecting</span></span>
+      <div class="status-cluster-wrap">
+        <button id="statusCluster" class="status-cluster" aria-haspopup="true" aria-expanded="false" title="Connection and save status">
+          <span id="statusDot" class="status-dot status-dot-connecting pulsing"></span>
+          <span id="statusLabel">Connecting...</span>
+          <span id="statusText" class="sr-only">connecting</span>
+          <span class="status-sep">&middot;</span>
+          <span id="saveLabel" class="mono"></span>
+        </button>
+        <div id="statusPopover" class="status-popover" style="display:none" role="dialog">
+          <p id="statusPopoverDetail" style="margin:0"></p>
+        </div>
+      </div>
       <span id="p2pPill" class="status-pill" style="display:none"><span class="status-dot"></span><span id="p2pText">P2P</span></span>
       <button id="offlineToggle">Go offline</button>
     </div>
@@ -119,6 +130,7 @@
       <div class="canvas-wrap">
         <canvas id="canvas3d" tabindex="-1"></canvas>
         <div id="cursorLayer"></div>
+        <div id="emptyCanvasHint" class="empty-canvas-hint" style="display:none">Click the grid to place a vertex, or try AI Generate</div>
       </div>
 
       <div class="panel right">
@@ -140,7 +152,6 @@
     <div class="statusbar">
       <span>actor: <b id="actorLabel"></b> <button id="renameActorBtn" class="ghost-btn" title="Change your display name" aria-label="Change your display name"><svg class="icon"><use href="#icon-pen"></use></svg></button></span>
       <span id="opsCounter">0 ops relayed</span>
-      <span id="offlineCounter"></span>
       <span style="flex:1"></span>
       <span>drag to orbit · scroll to zoom · right-drag to pan</span>
     </div>

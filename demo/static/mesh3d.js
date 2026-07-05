@@ -22,6 +22,10 @@ document.getElementById("actorLabel").textContent = `${actorName} (${actorId})`;
 // zoom/pan but never start an edit gesture.
 let viewerMode = false;
 
+// Phase D5: mirrors sketch.js's identical declaration -- see its comment.
+let currentConnStatus = "connecting";
+initStatusCluster();
+
 const clock = new LocalClock(actorId);
 const rid = () => Math.random().toString(36).slice(2, 10);
 const round = (n) => Math.round(n * 100) / 100;
@@ -314,7 +318,7 @@ let conn, p2p;
     onDelta: (ops) => applyIncomingOps(ops),
     onOps: (ops) => applyIncomingOps(ops),
     onStatus: (status) => setStatus(status),
-    onSaved: () => showToast("Saved", "success"),
+    onSaved: (at) => { setSaveState("saved", at); showToast("Saved", "success"); },
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
     onValidityWarning: (faces, problems) => applyValidityWarning(faces, problems),
     onRole: (role) => {
@@ -361,10 +365,11 @@ function sendOps(ops) {
 }
 
 function setStatus(status) {
-  const pill = document.getElementById("statusPill");
-  pill.className = `status-pill ${status}`;
+  currentConnStatus = status;
   document.getElementById("statusText").textContent = status;
+  updateStatusCluster(status, conn ? conn.outbox.length : 0);
   document.getElementById("offlineToggle").textContent = status === "offline" ? "Reconnect" : "Go offline";
+  if (status === "online") setSaveState("saved");
   if (status === "unauthorized") {
     // See the identical comment in sketch.js -- the token we had (or lack
     // thereof) was rejected; clear it and re-prompt rather than let
@@ -398,7 +403,7 @@ document.getElementById("roomInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") location.search = `?room=${encodeURIComponent(e.target.value.trim() || "demo-mesh")}`;
 });
 
-document.getElementById("saveBtn").onclick = () => conn.save();
+document.getElementById("saveBtn").onclick = () => { setSaveState("saving"); conn.save(); };
 
 function triggerDownload(url) {
   const a = document.createElement("a");
@@ -591,6 +596,7 @@ function removeVertex(id) {
   sendOps([op]);
   pushUndo({ kind: "vertex_remove", vertexId: id, previous });
   syncScene();
+  showUndoToast("Vertex deleted", undo);
 }
 
 function removeFace(id) {
@@ -600,6 +606,7 @@ function removeFace(id) {
   pushUndo({ kind: "face_remove", faceId: id });
   if (ui.selectedFace === id) ui.selectedFace = null;
   syncScene();
+  showUndoToast("Face deleted", undo);
 }
 
 function setFaceProp(faceId, key, value) {
@@ -1614,7 +1621,9 @@ setInterval(() => {
   // real, pre-existing (not Phase-16-specific) uncaught exception
   // caught live: "Cannot read properties of undefined (reading
   // 'outbox')" on an early tick.
-  document.getElementById("offlineCounter").textContent = conn && conn.outbox.length ? `${conn.outbox.length} queued offline` : "";
+  updateStatusCluster(currentConnStatus, conn ? conn.outbox.length : 0);
+  const hint = document.getElementById("emptyCanvasHint");
+  if (hint) hint.style.display = state.vertices.size === 0 ? "block" : "none";
 }, 400);
 
 // -- resize & render loop -----------------------------------------------------------

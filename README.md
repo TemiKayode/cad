@@ -50,7 +50,8 @@ offline to see the **Time-Travel Merge** panel.
 | Design system: color/type/space/motion tokens, dark+light theme, icon sprite (Part 3 Phase D1) | **Done** -- every emoji glyph replaced with a hand-authored SVG icon, `docs/design-system.md`, see below |
 | Layout: icon tool rail, collapsible panels, document name, avatar stack (Part 3 Phase D2) | **Done** -- canvas gets most of the width back; responsive down to 375px, see below |
 | Input feel: per-tool cursors, hover halo, token-correct snap/marquee colors (Part 3 Phase D3) | **Done** -- no drag-to-resize handles (a pre-existing, deliberate numeric-input-only scope decision, not reopened here), see below |
-| Keyboard-first: command palette, single-key shortcuts, keyboard reachability audit (Part 3 Phase D4) | **Done** -- Ctrl/Cmd+K palette, per-tool single-key shortcuts, arrow-key nudge, Ctrl/Cmd+Z/Y now in the 2D demo too, grouped/searchable "?" overlay, skip-to-canvas link, focus-trapped modals; D5-D8 (state legibility, presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
+| Keyboard-first: command palette, single-key shortcuts, keyboard reachability audit (Part 3 Phase D4) | **Done** -- Ctrl/Cmd+K palette, per-tool single-key shortcuts, arrow-key nudge, Ctrl/Cmd+Z/Y now in the 2D demo too, grouped/searchable "?" overlay, skip-to-canvas link, focus-trapped modals, see below |
+| State legibility: connection/save status cluster, toast queueing, empty states, undo-toasts (Part 3 Phase D5) | **Done** -- honest "Saved"/"Reconnecting" copy matching the real durability model, geometry-rejection red flash (2D only -- 3D has no pre-commit validity gate to hang it off); D6-D8 (presence polish, signature-moment art direction, perf/a11y audit) still open, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -64,7 +65,7 @@ offline to see the **Time-Travel Merge** panel.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 64 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 72 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -1172,6 +1173,103 @@ stay usable.
   asserting the shortcut-overlay's row count rather than just that the
   overlay opened.
 
+## State legibility: status, toasts, empty states (Part 3, Phase D5)
+
+- **Connection/save status cluster** (top bar, replacing the old
+  `#statusPill`): one compact button -- a colored dot + human label
+  (`Live`, `Connecting...`, `Reconnecting...`, `Offline`, or `Offline --
+  N edits queued` once something's actually queued) plus a separate
+  `Saved <relative time>` / `Saving...` sub-label -- that opens a
+  popover on click explaining the current state in a sentence and
+  closes on Esc or an outside click, restoring focus to the button
+  either way (`trapFocusIn`-adjacent, though this is a plain toggle
+  popover rather than a full modal). `#statusText` -- the exact raw
+  machine word ("online"/"offline"/etc.) dozens of existing e2e tests
+  across the whole suite wait on -- is kept, unchanged, as a visually
+  hidden (`.sr-only`) element alongside the new human-facing
+  `#statusLabel`, rather than repurposed: changing what dozens of tests
+  key off of for a cosmetic relabel wasn't worth the blast radius, and
+  decoupling "the machine-readable state hook" from "the copy a human
+  reads" is good practice regardless.
+  - **A genuinely new distinction, not just a relabel**: `RelayConnection`
+    (common.js) previously reported the exact same `"connecting"` status
+    for the very first connection attempt and for every automatic retry
+    after a drop. It now tracks `_everConnected` and reports
+    `"reconnecting"` for every attempt after the first, so "just opened
+    the page" and "the connection just dropped and is retrying" read
+    differently, matching the brief's pulsing `Reconnecting...` state.
+  - **The save-state label is honest about what this architecture
+    actually guarantees**, not a generic autosave-spinner clone: the
+    server already durably persists every accepted op immediately (see
+    `RelayConnection.save()`'s own docstring) -- there is no "unsaved
+    changes" window to fake a spinner for. `"Saving..."` only shows for
+    the genuine, if usually brief, round trip of an explicit Save click
+    (which forces an early version-history checkpoint); reaching
+    `"online"` (a fresh snapshot/delta just arrived) is itself treated
+    as an honest "saved just now" moment, since whatever's now on
+    screen IS the server's current durable state, even if the user
+    never explicitly clicked Save this session. The popover's own
+    explanation text spells this distinction out, per the brief's own
+    framing: "this is where the project's honest offline/merge model
+    becomes visible UX."
+  - Two view-only-camera-operation buttons were found, while wiring
+    this, to be needlessly disabled for a read-only viewer (2D's Fit
+    button, 3D's Top/Front/Right/Perspective view buttons -- both live
+    inside `.panel.left`, which Phase 17's `.viewer-mode` CSS disables
+    wholesale) -- marked `always-enabled`, matching Save/export, a small
+    fix in the same spirit as D4's keyboard-parity one.
+- **Toast system upgrade** (`showToast`, common.js): now a real FIFO
+  queue -- one toast shown at a time (a burst of events, e.g. importing
+  several files back to back, reads as a sequence instead of a pile),
+  4s auto-dismiss that's genuinely pausable on hover (the *remaining*
+  time survives the hover, it isn't just reset), and the container
+  carries `aria-live="polite"` + `role="status"` so a screen reader
+  hears each one without focus ever needing to move to it. Every toast
+  in the app already ran through this one function (save confirmations,
+  share-link-copied, import results, solver failures, generation
+  success/failure -- all pre-existing), so upgrading it upgraded all of
+  them at once; the only genuinely new call site is the rejection flash
+  below. A new `showUndoToast(message, undoFn, undoTimes)` adds an
+  inline "Undo" action button to a toast -- see destructive
+  confirmations below.
+- **Destructive confirmations**: there was no blocking `confirm()`
+  dialog anywhere in the app to remove (deletes already went through
+  the existing CRDT undo stack silently) -- what was actually missing
+  was any *visible* way back out of one. Deleting a path (2D: the path
+  list's own delete button, the Selection panel's "Delete path", the
+  bulk "Delete N paths" button, and the Delete/Backspace key) and
+  deleting a face or vertex (3D) now show a `showUndoToast(...)` whose
+  "Undo" button calls the existing `undo()` exactly enough times to
+  cover the whole batch (each deleted item is its own undo-stack entry,
+  so restoring 3 of them takes 3 calls) -- no new undo machinery, just
+  a visible affordance for machinery that was already there.
+- **Empty states**: a centered, quiet `.empty-canvas-hint` over the
+  canvas -- "Press P and drag to draw &middot; ? for shortcuts" (2D) /
+  "Click the grid to place a vertex, or try AI Generate" (3D) -- shown
+  whenever the document is empty (`state.pathIndex.size === 0` / 
+  `state.vertices.size === 0`, checked on the same 400ms interval that
+  already drove the old ops/offline counters) and hidden the instant
+  there's something there. `pointer-events: none` so it never intercepts
+  the click/drag that would dismiss it.
+- **Geometry-rejection red flash**: pairs the existing "Rejected: ..."
+  toast (already shown for every `path_geom` rejection -- self-
+  intersecting strict polygons, zero-length segments) with a brief
+  (600ms) `--danger`-colored halo around the specific path the
+  rejection was about, drawn the same way as the D3 hover halo (an
+  `isFlashing` parameter threaded through `drawShapePath` and the
+  freehand render branch) so no geometry needs re-tracing. Guarded to
+  only fire if the path survived the rejection with live points (a
+  brand-new strict polygon whose every point gets rejected has nothing
+  left to flash, and that's fine -- the toast alone still explains what
+  happened). **3D has no equivalent**: mesh rooms have no pre-commit
+  validity gate at all (a CRDT merge can't be rejected without breaking
+  convergence -- see `_validate_op`'s own docstring), so there's no
+  `onRejected` path to hang a flash off of; this is an architectural
+  fact, not a scope choice.
+
+tests/e2e/test_state_legibility_e2e.py adds 8 browser tests. Full e2e
+suite (72 tests) and full non-e2e suite pass.
+
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
 Before this, the canvas mapped document coordinates 1:1 to screen
@@ -2215,7 +2313,7 @@ which it did, on the first real attempt in both passes.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (64 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (72 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -2349,7 +2447,20 @@ direct state manipulation (since a viewer's pointerdown gesture is
 already blocked outright, there's no click-driven way to select
 something to test against, so the test isolates exactly what this
 phase changed: whether the keyboard handler itself checks
-`viewerMode`).
+`viewerMode`); and (Phase D5) `test_state_legibility_e2e.py` -- the
+status cluster reads "Live" once online (while `#statusText` keeps its
+old raw "online" word unchanged) and its popover opens with a non-empty
+explanation and closes on Esc, restoring focus to the button; going
+offline and then queuing an edit updates the label to "Offline -- N
+edits queued"; the save label reads "Saved just now" both right after
+connecting and after an explicit Save click; the empty-canvas hint
+shows on a fresh room and hides the instant something's drawn, in both
+demos; three toasts queued back-to-back show exactly one at a time, and
+hovering the visible one keeps it showing well past its normal 4s
+duration; deleting a path shows an "Undo" toast whose action button
+restores it; and a self-intersecting strict polygon shows a "Rejected"
+toast while `flashingPathIds` briefly holds that path's id, then clears
+itself.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

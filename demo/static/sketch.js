@@ -20,6 +20,13 @@ document.getElementById("actorLabel").textContent = `${actorName} (${actorId})`;
 // but never start an edit gesture.
 let viewerMode = false;
 
+// Phase D5: the connection status cluster's own outbox-queued-count
+// label needs re-rendering on every render pass (queued count changes
+// as edits happen while offline, not just on a status transition), so
+// it's kept here rather than re-derived from the DOM each time.
+let currentConnStatus = "connecting";
+initStatusCluster();
+
 const clock = new LocalClock(actorId);
 const rid = () => Math.random().toString(36).slice(2, 10);
 
@@ -145,6 +152,22 @@ let activeSnapGlyph = null;
 // hovering under the Select tool, or null -- drives both the subtle
 // hover halo (render()) and the cursor (canvas.style.cursor).
 let hoveredPathId = null;
+// Phase D5: path ids currently showing the brief red "rejected" flash
+// (see flashPath() and the onRejected handler below) -- a Set rather
+// than a single id since nothing rules out two rejections landing
+// close enough together to overlap in time.
+const flashingPathIds = new Set();
+/** Briefly flags `pathId` for the red flash render.js draws for it,
+ * then clears itself -- paired with the "Rejected: ..." toast so the
+ * *which* geometry it was about is visible at a glance, not just named
+ * in text. No-ops harmlessly if the path doesn't exist to flash (e.g.
+ * every point of a brand-new strict polygon got rejected, leaving
+ * nothing live) -- see the onRejected call site. */
+function flashPath(pathId) {
+  flashingPathIds.add(pathId);
+  render();
+  setTimeout(() => { flashingPathIds.delete(pathId); render(); }, 600);
+}
 
 // -- view transform (Phase 10) ------------------------------------------------
 // Pan (panX/panY, screen pixels the world origin is offset by) + zoom are
@@ -379,8 +402,9 @@ let conn, p2p;
       revertRejectedOp(op);
       renderAll();
       showToast(`Rejected: ${reason}`, "error");
+      if (op.target === "path_geom" && op.scope && state.pathIndex.has(op.scope)) flashPath(op.scope);
     },
-    onSaved: () => showToast("Saved", "success"),
+    onSaved: (at) => { setSaveState("saved", at); showToast("Saved", "success"); },
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeDocOps, proceed),
     onRole: (role) => {
       viewerMode = applyViewerModeUI(role);
@@ -427,10 +451,15 @@ function sendOps(ops) {
 }
 
 function setStatus(status) {
-  const pill = document.getElementById("statusPill");
-  pill.className = `status-pill ${status}`;
+  currentConnStatus = status;
   document.getElementById("statusText").textContent = status;
+  updateStatusCluster(status, conn ? conn.outbox.length : 0);
   document.getElementById("offlineToggle").textContent = status === "offline" ? "Reconnect" : "Go offline";
+  // Reaching "online" means a fresh snapshot/delta just arrived --
+  // whatever's now shown IS the server's own durably-persisted state,
+  // so this is an honest moment to mark as "saved" even if the user
+  // never explicitly clicked Save this session.
+  if (status === "online") setSaveState("saved");
   if (status === "unauthorized") {
     // The token we had (or lack thereof) was rejected -- clear it and
     // re-prompt rather than let RelayConnection keep retrying with the
@@ -469,7 +498,7 @@ document.getElementById("roomInput").addEventListener("keydown", (e) => {
 
 // -- save / download / import / share --------------------------------------------
 
-document.getElementById("saveBtn").onclick = () => conn.save();
+document.getElementById("saveBtn").onclick = () => { setSaveState("saving"); conn.save(); };
 
 function triggerDownload(url) {
   const a = document.createElement("a");
@@ -2579,6 +2608,7 @@ function deleteSelection() {
   if (!ids.length) return;
   for (const id of ids) removePath(id);
   renderAll();
+  showUndoToast(ids.length === 1 ? "Path deleted" : `${ids.length} paths deleted`, undo, ids.length);
 }
 
 /** Serializes the selection to JSON on the clipboard (plain data, no
@@ -3002,7 +3032,7 @@ function applyFillIfSet(props) {
   ctx.restore();
 }
 
-function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = false) {
+function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = false, isFlashing = false) {
   if (props.shape === "text") {
     ctx.save();
     ctx.font = `${props.font_size || 16}px sans-serif`;
@@ -3026,6 +3056,15 @@ function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = fa
       ctx.globalAlpha = 0.5;
       ctx.lineWidth = 1 / view.zoom;
       ctx.setLineDash([4 / view.zoom, 3 / view.zoom]);
+      ctx.strokeRect(b.x, b.y, b.w, b.h);
+      ctx.restore();
+    }
+    if (isFlashing) {
+      const b = textBounds(props);
+      ctx.save();
+      ctx.strokeStyle = canvasColor("--danger");
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 2 / view.zoom;
       ctx.strokeRect(b.x, b.y, b.w, b.h);
       ctx.restore();
     }
@@ -3076,6 +3115,17 @@ function drawShapePath(props, isSelected, isDraftPreview = false, isHovered = fa
     ctx.stroke();
     ctx.restore();
   }
+  if (isFlashing) {
+    // Phase D5: pairs with the "Rejected: ..." toast so *which* geometry
+    // a rejected edit was about is visible at a glance -- independent of
+    // (drawn in addition to, not instead of) the selection/hover halos.
+    ctx.save();
+    ctx.strokeStyle = canvasColor("--danger");
+    ctx.lineWidth = (props.stroke_width || 2.5) + 5;
+    ctx.globalAlpha = 0.6;
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 /** Paths sorted by layer order, then creation order (Phase 15: fills
@@ -3116,7 +3166,7 @@ function render() {
     // untransformed coordinates either way.
     const wrapped = beginPathTransform(pathId, props);
     if (props.shape) {
-      drawShapePath(props, ui.selectedPaths.has(pathId), false, pathId === hoveredPathId);
+      drawShapePath(props, ui.selectedPaths.has(pathId), false, pathId === hoveredPathId, flashingPathIds.has(pathId));
       if (wrapped) ctx.restore();
       continue;
     }
@@ -3175,6 +3225,16 @@ function render() {
       ctx.strokeStyle = canvasColor("--accent");
       ctx.lineWidth = (props.stroke_width || 2.5) + 3;
       ctx.globalAlpha = 0.15;
+      ctx.stroke();
+      ctx.restore();
+    }
+    if (flashingPathIds.has(pathId)) {
+      // Phase D5: brief red flash pairing a "Rejected: ..." toast with
+      // *which* geometry it was about -- independent of selection/hover.
+      ctx.save();
+      ctx.strokeStyle = canvasColor("--danger");
+      ctx.lineWidth = (props.stroke_width || 2.5) + 5;
+      ctx.globalAlpha = 0.6;
       ctx.stroke();
       ctx.restore();
     }
@@ -3363,7 +3423,12 @@ function renderPathList() {
       else selectOnly(pathId);
       renderAll();
     };
-    row.querySelector('[data-act="del"]').onclick = (e) => { e.stopPropagation(); removePath(pathId); renderAll(); };
+    row.querySelector('[data-act="del"]').onclick = (e) => {
+      e.stopPropagation();
+      removePath(pathId);
+      renderAll();
+      showUndoToast("Path deleted", undo);
+    };
     list.appendChild(row);
   }
 }
@@ -3487,7 +3552,11 @@ function renderSelectionPanel() {
     setPathProp(pathId, "transform", { ...getTransform(state.pathProps.get(pathId) || {}), scale: parseFloat(e.target.value) || 1 });
   document.getElementById("selDuplicate").onclick = duplicateSelection;
   if (props.group_id) document.getElementById("selUngroup").onclick = () => { ungroupPath(pathId); renderAll(); };
-  document.getElementById("selDelete").onclick = () => { removePath(pathId); renderAll(); };
+  document.getElementById("selDelete").onclick = () => {
+    removePath(pathId);
+    renderAll();
+    showUndoToast("Path deleted", undo);
+  };
 
   commentPanel.innerHTML = "";
   const commentsForPath = [...state.comments.entries()].filter(([, c]) => c && c.path_id === pathId);
@@ -3550,7 +3619,9 @@ function renderAll() {
 
 setInterval(() => {
   document.getElementById("opsCounter").textContent = `${ui.opsCount} ops relayed`;
-  document.getElementById("offlineCounter").textContent = conn.outbox.length ? `${conn.outbox.length} queued offline` : "";
+  updateStatusCluster(currentConnStatus, conn ? conn.outbox.length : 0);
+  const hint = document.getElementById("emptyCanvasHint");
+  if (hint) hint.style.display = state.pathIndex.size === 0 ? "block" : "none";
 }, 400);
 
 resizeCanvas();
