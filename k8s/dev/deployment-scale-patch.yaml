@@ -1,0 +1,34 @@
+# Strategic-merge patch executing k8s/README.md's "Scaling to replicas > 1"
+# recipe: RollingUpdate is safe once every replica shares Postgres+Redis
+# instead of a per-pod SQLite file; CRDT_CAD_DB_PATH is removed in favor of
+# CRDT_CAD_DATABASE_URL/CRDT_CAD_REDIS_URL; the PVC volume/mount are removed
+# by k8s/dev/pvc-delete-patch.yaml alongside this one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crdt-cad
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {}
+  template:
+    spec:
+      containers:
+        - name: crdt-cad
+          env:
+            - name: CRDT_CAD_DB_PATH
+              $patch: delete
+            - name: CRDT_CAD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: crdt-cad-database
+                  key: url
+            - name: CRDT_CAD_REDIS_URL
+              value: redis://crdt-cad-redis:6379/0
+          volumeMounts:
+            - name: data
+              $patch: delete
+      volumes:
+        - name: data
+          $patch: delete

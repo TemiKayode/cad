@@ -1,0 +1,52 @@
+# Single-node Redis for LOCAL VALIDATION ONLY -- not production-grade. No
+# persistence, no replication/Sentinel/Cluster. A real deployment brings
+# its own managed Redis (ElastiCache, Memorystore, Upstash, etc.) and
+# points CRDT_CAD_REDIS_URL at it -- see k8s/README.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crdt-cad-redis
+  labels:
+    app: crdt-cad-redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: crdt-cad-redis
+  template:
+    metadata:
+      labels:
+        app: crdt-cad-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crdt-cad-redis
+  labels:
+    app: crdt-cad-redis
+spec:
+  selector:
+    app: crdt-cad-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

@@ -69,6 +69,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from pathlib import Path
@@ -429,6 +430,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Kubernetes sets HOSTNAME to the pod name automatically; falls back to
+# socket.gethostname() so this is still meaningful outside a cluster.
+# Exists so multi-replica fan-out (Phase 18.2's Mode B) can be verified by
+# reading which pod actually answered a given request, rather than trusting
+# the Service's load-balancing blindly.
+POD_NAME = os.environ.get("HOSTNAME") or socket.gethostname()
+
+
+@app.middleware("http")
+async def _add_served_by_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Served-By"] = POD_NAME
+    return response
+
+
 class _NoCacheStaticFiles(StaticFiles):
     """Forces browsers to always revalidate (via the ETag/Last-Modified
     conditional GET Starlette already sets) instead of trusting a local
@@ -477,6 +493,7 @@ async def health() -> dict:
         "drawing_rooms": len(drawing_room_manager.rooms),
         "mesh_rooms": len(mesh_room_manager.rooms),
         "connections": drawing_room_manager.connection_count() + mesh_room_manager.connection_count(),
+        "served_by": POD_NAME,
     }
 
 

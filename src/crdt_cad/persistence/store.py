@@ -275,6 +275,12 @@ class SQLiteStore(DocumentStore):
             return row[0] if row else None
 
 
+# Arbitrary fixed key for the schema-init advisory lock in
+# PostgresStore._init_pool -- any int64 works, it just needs to be the same
+# constant across every replica so they contend on the same lock.
+_SCHEMA_LOCK_KEY = 872_631_004_591
+
+
 class PostgresStore(DocumentStore):
     """Postgres-backed store for real horizontal scaling -- multiple
     server *processes* (e.g. several k8s replicas) sharing the same room
@@ -333,38 +339,52 @@ class PostgresStore(DocumentStore):
     async def _init_pool(self):
         pool = await self._asyncpg.create_pool(self._dsn)
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS documents (
-                    kind TEXT NOT NULL,
-                    room_id TEXT NOT NULL,
-                    data BYTEA NOT NULL,
-                    updated_at DOUBLE PRECISION NOT NULL,
-                    display_name TEXT,
-                    PRIMARY KEY (kind, room_id)
+            # Kubernetes Mode B starts every replica against the same
+            # brand-new database at once (verified against a real 3-replica
+            # kind deployment in Phase 18.2). Each replica's IF NOT EXISTS
+            # checks "does this exist?" before creating it, so two replicas
+            # can both see "no" and both try to CREATE TABLE -- a genuine
+            # Postgres catalog race (duplicate key on pg_type_typname_nsp_index),
+            # not a logic bug in the SQL itself. A session-scoped advisory
+            # lock serializes this one-time schema step across every
+            # replica's startup; a plain SQL-level lock (e.g. a lock table)
+            # can't be taken before the tables it would guard exist yet.
+            await conn.execute("SELECT pg_advisory_lock($1)", _SCHEMA_LOCK_KEY)
+            try:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS documents (
+                        kind TEXT NOT NULL,
+                        room_id TEXT NOT NULL,
+                        data BYTEA NOT NULL,
+                        updated_at DOUBLE PRECISION NOT NULL,
+                        display_name TEXT,
+                        PRIMARY KEY (kind, room_id)
+                    )
+                    """
                 )
-                """
-            )
-            # A fresh CREATE TABLE above already includes display_name, but
-            # a pre-Phase-17 database created before this column existed
-            # needs it added explicitly -- ADD COLUMN IF NOT EXISTS is a
-            # real Postgres feature (unlike sqlite3's ALTER TABLE), so no
-            # try/except dance is needed here.
-            await conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS display_name TEXT")
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS room_versions (
-                    id BIGSERIAL PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    room_id TEXT NOT NULL,
-                    data BYTEA NOT NULL,
-                    created_at DOUBLE PRECISION NOT NULL
+                # A fresh CREATE TABLE above already includes display_name, but
+                # a pre-Phase-17 database created before this column existed
+                # needs it added explicitly -- ADD COLUMN IF NOT EXISTS is a
+                # real Postgres feature (unlike sqlite3's ALTER TABLE), so no
+                # try/except dance is needed here.
+                await conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS display_name TEXT")
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS room_versions (
+                        id BIGSERIAL PRIMARY KEY,
+                        kind TEXT NOT NULL,
+                        room_id TEXT NOT NULL,
+                        data BYTEA NOT NULL,
+                        created_at DOUBLE PRECISION NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_room_versions_room ON room_versions(kind, room_id, created_at)"
-            )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_room_versions_room ON room_versions(kind, room_id, created_at)"
+                )
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock($1)", _SCHEMA_LOCK_KEY)
         return pool
 
     def save(self, kind: str, room_id: str, data: bytes) -> None:

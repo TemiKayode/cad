@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Mode B overlay: composes the base (Mode A) manifests, adds a throwaway
+# dev Postgres + Redis, and patches the base Deployment/PVC into the
+# scaled configuration k8s/README.md's "Scaling to replicas > 1" section
+# describes. Apply with `kubectl apply -k k8s/dev/`. See postgres.yaml/
+# redis.yaml/secret.yaml for why this is local-validation-only, not a
+# production recipe.
+resources:
+  - ../base
+  - postgres.yaml
+  - redis.yaml
+  - secret.yaml
+
+patches:
+  - path: deployment-scale-patch.yaml
+  - path: pvc-delete-patch.yaml

@@ -1,0 +1,67 @@
+# Single-node Postgres for LOCAL VALIDATION ONLY -- not production-grade.
+# No replication, no backups, ephemeral emptyDir storage (data is lost if
+# this pod is rescheduled), and a plaintext dev password committed below.
+# A real deployment brings its own managed Postgres (RDS, Cloud SQL,
+# Neon, etc.) and points CRDT_CAD_DATABASE_URL at it -- see
+# k8s/README.md's "Scaling to replicas > 1" section.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crdt-cad-postgres
+  labels:
+    app: crdt-cad-postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: crdt-cad-postgres
+  template:
+    metadata:
+      labels:
+        app: crdt-cad-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: crdt_cad
+            - name: POSTGRES_PASSWORD
+              value: crdt_cad_dev_only
+            - name: POSTGRES_DB
+              value: crdt_cad
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "crdt_cad"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "crdt_cad"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: pgdata
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crdt-cad-postgres
+  labels:
+    app: crdt-cad-postgres
+spec:
+  selector:
+    app: crdt-cad-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

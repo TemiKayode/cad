@@ -151,6 +151,68 @@ def test_display_name_roundtrips(store):
     assert store.set_display_name("drawing", _room_id(), "X") is False
 
 
+# -- Phase 18.2: concurrent schema init (found against a real 3-replica
+# kind deployment -- every pod's PostgresStore.__init__ races
+# CREATE TABLE IF NOT EXISTS against the same brand-new database) --------
+
+
+def test_concurrent_stores_against_fresh_database_all_initialize():
+    """Regression test for a real crash seen standing up Mode B on kind:
+    3 replicas starting at once against an empty database all raced
+    `CREATE TABLE IF NOT EXISTS`, and Postgres's own "IF NOT EXISTS" check
+    isn't atomic against a concurrent CREATE -- one replica's CREATE would
+    lose the race with `duplicate key value violates unique constraint
+    "pg_type_typname_nsp_index"` and the pod would crash-loop. Fixed with
+    an advisory lock around schema init (see PostgresStore._init_pool);
+    this drops the tables to recreate the fresh-database race and asserts
+    every concurrent instance now initializes cleanly."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    async def _drop_schema():
+        import asyncpg
+
+        conn = await asyncpg.connect(TEST_DSN)
+        try:
+            await conn.execute("DROP TABLE IF EXISTS documents, room_versions CASCADE")
+        finally:
+            await conn.close()
+
+    try:
+        asyncio.run(_drop_schema())
+    except Exception as exc:
+        pytest.skip(f"no local Postgres reachable at {TEST_DSN} ({exc})")
+        return
+
+    stores = []
+    errors = []
+
+    def _make_store():
+        try:
+            return PostgresStore(TEST_DSN)
+        except Exception as exc:  # noqa: BLE001 -- collecting for the assertion below
+            errors.append(exc)
+            return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = [pool.submit(_make_store) for _ in range(5)]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    stores.append(result)
+
+        assert not errors, f"concurrent PostgresStore init raised: {errors}"
+        assert len(stores) == 5
+
+        room = _room_id()
+        stores[0].save("drawing", room, b"survived the concurrent-init race")
+        assert stores[-1].load("drawing", room) == b"survived the concurrent-init race"
+    finally:
+        for s in stores:
+            s.close()
+
+
 def test_version_history_roundtrips_and_prunes(store):
     room = _room_id()
     ids = [store.save_version("drawing", room, f"snap-{i}".encode(), keep=3) for i in range(5)]

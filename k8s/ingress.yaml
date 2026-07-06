@@ -1,0 +1,39 @@
+# NOT part of the default `kubectl apply -k k8s/` set -- not every target
+# has nginx-ingress, so this is applied manually (`kubectl apply -f
+# k8s/ingress.yaml`), same pattern as hpa.yaml. Verified against a real
+# ingress-nginx controller on kind (Phase 18.3): `wss://` end-to-end
+# through the ingress, WebSocket connections held open past nginx's
+# default 60s idle timeout, TLS terminated at the ingress.
+#
+# `host` and the TLS secret below are placeholders -- change `host` to
+# your real domain, and either point `secretName` at a Secret you created
+# yourself (`kubectl create secret tls <name> --cert=... --key=...`, or a
+# cert-manager Certificate resource) or let Caddy handle TLS instead (see
+# docs/deployment.md's VPS path) and skip this Ingress+TLS section
+# entirely.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: crdt-cad
+  annotations:
+    # WebSocket connections are long-lived and mostly idle between edits;
+    # nginx-ingress's default 60s proxy timeouts would silently drop them.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - crdt-cad.example.com
+      secretName: crdt-cad-tls
+  rules:
+    - host: crdt-cad.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: crdt-cad
+                port:
+                  name: http

@@ -1,0 +1,8 @@
+# Mode B shares state via Postgres, not a per-pod local file, so the
+# base kustomization's PVC (sized and documented for single-replica SQLite
+# only -- see k8s/pvc.yaml) is dropped entirely in this overlay.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crdt-cad-data
+$patch: delete

@@ -1,8 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# Thin passthrough to base/ -- kept at this path so `kubectl apply -k k8s/`
+# (Mode A, the documented default) keeps working unchanged. The actual
+# manifests live in k8s/base/ so that k8s/dev/'s overlay (Mode B) can
+# reference `../base` as a sibling instead of an ancestor -- kustomize
+# refuses ("cycle detected") when an overlay's own directory is nested
+# inside the directory tree its base resources come from.
+#
 # hpa.yaml is intentionally excluded -- see k8s/README.md.
 resources:
-  - deployment.yaml
-  - service.yaml
-  - pvc.yaml
+  - base/

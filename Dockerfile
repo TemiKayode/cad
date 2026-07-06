@@ -12,7 +12,11 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY demo ./demo
 
-RUN pip install --no-cache-dir .
+# The postgres/redis extras are small (asyncpg, redis-py) and installing
+# them unconditionally means one image serves both Mode A (SQLite,
+# single replica) and Mode B (Postgres+Redis, replicas > 1) -- see
+# k8s/README.md -- with no separate build for either.
+RUN pip install --no-cache-dir ".[postgres,redis]"
 
 # Persisted SQLite snapshots live here; mount a volume at this path to
 # survive container recreation (see docker-compose.yml).

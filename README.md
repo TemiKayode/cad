@@ -70,9 +70,9 @@ offline to see the **Time-Travel Merge** panel.
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
 | Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 89 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
-| Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
+| Kubernetes manifests | **Validated on a real cluster** (kind) -- Mode A (1 replica/SQLite) and Mode B (3 replicas/Postgres+Redis, cross-pod fan-out, rolling restarts) both verified, HPA (CPU-based, scale 1->6->1 confirmed under real load), TLS ingress (`wss://` end-to-end), CI smoke test on every push -- see `k8s/README.md` |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
-| True horizontal scaling of room state (multi-pod) | **Done** -- optional `PostgresStore` + Redis pub/sub fan-out, opt-in via env vars, live-verified with two real server processes -- see below and `k8s/README.md` |
+| True horizontal scaling of room state (multi-pod) | **Done** -- optional `PostgresStore` + Redis pub/sub fan-out, opt-in via env vars, live-verified with two real server processes *and* against real Kubernetes pods (Phase 18) -- see below and `k8s/README.md` |
 | Pyodide/WASM client-side engine | **Not built** -- deliberate; see rationale below |
 
 ## Quickstart

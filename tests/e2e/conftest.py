@@ -3,6 +3,13 @@ browser -- these exercise the actual client JS + WS relay + persistence
 together, which `fastapi.testclient`-based tests (fast, but in-process and
 JS-free) can't. Each test gets its own process on a free port and its own
 temp SQLite file, so tests never share room state.
+
+Set ``CRDT_CAD_E2E_LIVE_SERVER_URL`` to point every ``live_server``-based
+test at an already-running deployment instead (e.g. a `kubectl
+port-forward`'d Service in front of a real multi-pod cluster -- see
+k8s/README.md's Phase 18.2 verification) -- no subprocess is spawned, and
+room ids used across a run should be unique (kind's Postgres-backed rooms
+persist between runs, unlike the default per-test temp SQLite file).
 """
 
 import os
@@ -66,6 +73,18 @@ def live_server_factory(tmp_path):
 
 
 def _start_server(tmp_path, extra_env: dict | None = None):
+    external_url = os.environ.get("CRDT_CAD_E2E_LIVE_SERVER_URL")
+    if external_url:
+        if extra_env:
+            raise RuntimeError(
+                "CRDT_CAD_E2E_LIVE_SERVER_URL can't be combined with extra_env -- "
+                "the external deployment's env is already fixed, not something this "
+                "process controls."
+            )
+        _wait_until_healthy(external_url)
+        yield external_url
+        return
+
     port = _free_port()
     db_path = tmp_path / f"e2e-{port}.db"
     env = os.environ.copy()
