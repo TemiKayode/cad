@@ -221,6 +221,15 @@ input:disabled, select:disabled, textarea:disabled {
   display: grid;
   grid-template-columns: 48px 220px 1fr 260px;
   min-height: 0;
+  /* Phase D8 kill-list note: this is a layout-property transition (the
+     one deliberate exception in the whole stylesheet) -- animating it
+     is the entire point of a collapsing panel actually reflowing the
+     canvas to reclaim the space, which a transform-only fake (sliding
+     the panel off-screen while its grid track stays full width) can't
+     produce; the canvas wouldn't visibly expand to fill the gap. Fires
+     once per manual toggle, not on a continuous per-frame hot path
+     (scroll/drag/pan), so it isn't competing with the 60fps budget the
+     kill-list rule is really protecting. */
   transition: grid-template-columns var(--t-med) var(--ease-standard);
 }
 .body.secondary-collapsed { grid-template-columns: 48px 0px 1fr 260px; }
@@ -321,13 +330,13 @@ input:disabled, select:disabled, textarea:disabled {
 .avatar {
   width: 26px; height: 26px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
-  font-size: 11px; font-weight: 700; color: #fff; /* Phase D6: ACTOR_COLORS are now mid-tone/saturated, not pastel -- white clears 4:1+ on all 8, unlike the old palette's near-black text */
+  font-size: 11px; font-weight: 700; color: var(--on-solid-fill); /* Phase D6: ACTOR_COLORS are now mid-tone/saturated, not pastel -- clears 4:1+ on all 8, unlike the old palette's near-black text */
   border: 2px solid var(--bg-panel);
   margin-left: -8px;
   transition: transform var(--t-fast) var(--ease-standard), opacity var(--t-med) var(--ease-standard);
 }
 .avatar:first-child { margin-left: 0; }
-.avatar:hover { transform: translateY(-2px); z-index: 1; }
+.avatar:hover, .avatar:focus-visible { transform: translateY(-2px); z-index: var(--z-toolbar); }
 .avatar-overflow { background: var(--bg-raised); color: var(--text-secondary); }
 .avatar.avatar-enter { animation: avatar-enter var(--t-med) var(--ease-standard); }
 @keyframes avatar-enter {
@@ -437,7 +446,7 @@ canvas { display: block; background: var(--bg-canvas); }
 }
 .cursor-name {
   position: absolute; left: 10px; top: -6px; font-size: 11px;
-  padding: 1px 6px; border-radius: var(--r-sm); color: #fff; font-weight: 600;
+  padding: 1px 6px; border-radius: var(--r-sm); color: var(--on-solid-fill); font-weight: 600;
   opacity: 1; transition: opacity var(--t-med) var(--ease-standard);
 }
 .cursor-label.idle .cursor-name { opacity: 0; }
@@ -583,12 +592,16 @@ a.pill-link { color: var(--text-secondary); text-decoration: none; }
    first Tab press on any page reveals a way to jump past the top bar
    and tool rail straight to the canvas/room grid. */
 .skip-link {
-  position: fixed; top: -100px; left: 8px; z-index: var(--z-modal);
+  position: fixed; top: 8px; left: 8px; z-index: var(--z-modal);
   background: var(--accent); color: var(--accent-on); font-weight: 700;
   padding: 10px 16px; border-radius: var(--r-sm); text-decoration: none;
-  transition: top var(--t-fast) var(--ease-standard);
+  /* Phase D8 kill-list: transitioning `top` (a layout property) worked
+     but was needlessly expensive -- transform is compositor-only and
+     produces the identical slide-in-from-above visual. */
+  transform: translateY(-140px);
+  transition: transform var(--t-fast) var(--ease-standard);
 }
-.skip-link:focus { top: 8px; }
+.skip-link:focus { transform: translateY(0); }
 
 /* -- Time-Travel Merge preview (Phase D7 art direction) ------------------- */
 
@@ -653,7 +666,7 @@ a.pill-link { color: var(--text-secondary); text-decoration: none; }
 /* -- mesh validity warning banner (crdt_cad.geometry.mesh_validity) ------ */
 
 .danger-btn {
-  background: var(--danger); border: none; color: #fff; font-weight: 700;
+  background: var(--danger); border: none; color: var(--on-solid-fill); font-weight: 700;
   padding: 6px 14px; border-radius: var(--r-sm); cursor: pointer; font-size: 12px;
 }
 

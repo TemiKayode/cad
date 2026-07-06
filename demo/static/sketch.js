@@ -903,6 +903,54 @@ function sendPresence(x, y) {
   sendOps([op]);
 }
 
+// Phase D8 perf audit: a pointermove handler can fire far more often
+// than 60fps on a high-poll-rate mouse/trackpad -- sendPresence's own
+// 60ms throttle already bounds *network* frequency, but the cursor
+// coordinate readout's DOM write (updateCursorReadout) had no such
+// bound at all before this. Both are coalesced here to at most once
+// per animation frame: pointermove just records the latest point
+// (cheap), a single pending rAF callback (scheduled once, not once per
+// event) does the actual work.
+let pendingReadoutPt = null;
+let readoutRafScheduled = false;
+function scheduleCursorReadoutAndPresence(pt) {
+  pendingReadoutPt = pt;
+  if (readoutRafScheduled) return;
+  readoutRafScheduled = true;
+  requestAnimationFrame(() => {
+    readoutRafScheduled = false;
+    if (!pendingReadoutPt) return;
+    updateCursorReadout(pendingReadoutPt);
+    sendPresence(pendingReadoutPt[0], pendingReadoutPt[1]);
+  });
+}
+
+/** Same coalescing idea, for the canvas redraw itself -- measured live
+ * during this phase's own perf audit: a scripted (and, on a high-poll-
+ * rate mouse, a real) pointermove burst during pan/drag on a 500-path
+ * document could call render() synchronously many times within a
+ * single animation frame, each one a full redraw, which is exactly the
+ * kind of >16ms-per-frame scripting cost the brief calls out. All the
+ * state a redraw reads (view.panX/panY, selectDrag, constrainDrag,
+ * shapeDraft, hoveredPathId, ...) is already mutated synchronously by
+ * the caller before this is called -- deferring the actual draw to the
+ * next frame is safe and just means "draw once with whatever the
+ * latest state is by then," which is exactly the desired behavior when
+ * several pointermove events land in the same frame. Only used for the
+ * hot pointermove-driven paths (pan/select-drag/constrain-drag/shape-
+ * draft/drawing/hover) below -- one-off render() calls elsewhere (after
+ * undo/redo, adding/removing a path, a tool switch) aren't a hot loop
+ * and gain nothing from batching. */
+let renderRafScheduled = false;
+function requestRender() {
+  if (renderRafScheduled) return;
+  renderRafScheduled = true;
+  requestAnimationFrame(() => {
+    renderRafScheduled = false;
+    render();
+  });
+}
+
 // -- canvas & tools -------------------------------------------------------------
 
 const canvas = document.getElementById("canvas");
@@ -993,14 +1041,13 @@ canvas.addEventListener("pointermove", (e) => {
     const [sx, sy] = canvasPoint(e);
     view.panX = panState.panX0 + (sx - panState.startSx);
     view.panY = panState.panY0 + (sy - panState.startSy);
-    render();
+    requestRender();
     return;
   }
   const screenPt = canvasPoint(e);
   const pt = worldPoint(e);
-  sendPresence(pt[0], pt[1]);
   lastMousePt = pt;
-  updateCursorReadout(pt);
+  scheduleCursorReadoutAndPresence(pt);
   if (selectDrag) {
     handleSelectDragMove(screenPt, pt);
     return;
@@ -1010,14 +1057,14 @@ canvas.addEventListener("pointermove", (e) => {
       constrainDrag.moved = true;
     }
     constrainDrag.livePos = pt;
-    render();
+    requestRender();
     return;
   }
   if (shapeDraft) {
     const { point: snapped, glyph } = resolveSnapPoint(pt, new Set());
     shapeDraft.current = snapped;
     activeSnapGlyph = glyph;
-    render();
+    requestRender();
     renderShapeInputPanel();
     return;
   }
@@ -1029,10 +1076,10 @@ canvas.addEventListener("pointermove", (e) => {
     if (dist > 2.5) {
       drawing.lastPointId = appendPoint(drawing.pathId, drawing.lastPointId, pt);
       drawing.lastScreenPt = screenPt;
-      render();
+      requestRender();
     }
   } else if (ui.tool === "polygon" && pendingPolygon.length) {
-    render();
+    requestRender();
   } else if (ui.tool === "select") {
     // Phase D3: hover feedback -- only when idle (every other branch
     // above already `return`ed for an active drag/draft/draw gesture).
@@ -1040,7 +1087,7 @@ canvas.addEventListener("pointermove", (e) => {
     canvas.style.cursor = hit ? "move" : "default";
     if (hit !== hoveredPathId) {
       hoveredPathId = hit;
-      render();
+      requestRender();
     }
   }
 });
@@ -1235,10 +1282,10 @@ function handleSelectDragMove(screenPt, pt) {
       snappedPivot[0] - selectDrag.primaryPivotWorld0[0],
       snappedPivot[1] - selectDrag.primaryPivotWorld0[1],
     ];
-    render();
+    requestRender();
   } else {
     selectDrag.currentScreen = screenPt;
-    render();
+    requestRender();
   }
 }
 
@@ -1287,7 +1334,7 @@ canvas.addEventListener(
     // "zoom centered on cursor" per the brief.
     view.panX = sx - wxBefore * view.zoom;
     view.panY = sy - wyBefore * view.zoom;
-    render();
+    requestRender();
     updateZoomIndicator();
   },
   { passive: false }
@@ -1903,7 +1950,10 @@ function renderConstraintBadge(spec) {
   const cy = positions.reduce((s, p) => s + p[1], 0) / positions.length;
   const [sx, sy] = worldToScreen(cx, cy);
   ctx.save();
-  ctx.fillStyle = "#ffd43b";
+  // Phase D8 kill-list: this (and every other hardcoded canvas color
+  // below) predates the D1 token migration and was missed by it --
+  // never actually followed a theme switch until now.
+  ctx.fillStyle = canvasColor("--warning");
   ctx.font = "13px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -2061,7 +2111,7 @@ function renderDimension(dim) {
   const la = [a[0] + nx * offset, a[1] + ny * offset];
   const lb = [b[0] + nx * offset, b[1] + ny * offset];
   ctx.save();
-  ctx.strokeStyle = "#4dabf7";
+  ctx.strokeStyle = canvasColor("--accent");
   ctx.lineWidth = 1 / view.zoom;
   ctx.beginPath();
   ctx.moveTo(a[0], a[1]); ctx.lineTo(la[0], la[1]);
@@ -2071,7 +2121,7 @@ function renderDimension(dim) {
   const mx = (la[0] + lb[0]) / 2, my = (la[1] + lb[1]) / 2;
   const label = `${toDisplayUnits(length).toFixed(2)}${unitSuffix() ? " " + unitSuffix() : ""}`;
   ctx.font = `${14 / view.zoom}px sans-serif`;
-  ctx.fillStyle = "#4dabf7";
+  ctx.fillStyle = canvasColor("--accent");
   ctx.textAlign = "center";
   ctx.fillText(label, mx, my - 4 / view.zoom);
   ctx.restore();
@@ -3345,7 +3395,7 @@ function render() {
 
   if (ui.tool === "polygon" && pendingPolygon.length) {
     ctx.save();
-    ctx.strokeStyle = "#ffd43b";
+    ctx.strokeStyle = canvasColor("--warning");
     ctx.lineWidth = 2 / view.zoom; // constant on-screen thickness for this transient preview
     ctx.setLineDash([6 / view.zoom, 4 / view.zoom]);
     ctx.beginPath();
@@ -3358,7 +3408,7 @@ function render() {
 
   if (shapeDraft) {
     ctx.save();
-    ctx.strokeStyle = "#ffd43b";
+    ctx.strokeStyle = canvasColor("--warning");
     ctx.lineWidth = 2 / view.zoom;
     ctx.setLineDash([6 / view.zoom, 4 / view.zoom]);
     drawShapePath(shapePropsFromDraft(shapeDraft.kind, shapeDraft.anchor, shapeDraft.current), false, true);
@@ -3375,11 +3425,12 @@ function render() {
   // world transform is active).
   if (ui.tool === "polygon" && pendingPolygon.length) {
     ctx.save();
+    ctx.fillStyle = canvasColor("--warning");
     for (const [i, pt] of pendingPolygon.entries()) {
       const [sx, sy] = worldToScreen(pt[0], pt[1]);
+      ctx.globalAlpha = i === 0 ? 1 : 0.5; // first vertex (closes the polygon) stands out from the rest
       ctx.beginPath();
       ctx.arc(sx, sy, i === 0 ? 6 : 4, 0, Math.PI * 2);
-      ctx.fillStyle = i === 0 ? "#ffd43b" : "#ffe89b";
       ctx.fill();
     }
     ctx.restore();
@@ -3387,7 +3438,7 @@ function render() {
 
   if (ui.tool === "constrain" && constraintSelection.length) {
     ctx.save();
-    ctx.strokeStyle = "#ffd43b";
+    ctx.strokeStyle = canvasColor("--warning");
     ctx.lineWidth = 2;
     for (const sel of constraintSelection) {
       // A shape_center pick (Phase 14, for tangent) has no nodeId to
@@ -3406,7 +3457,7 @@ function render() {
 
   if (ui.tool === "measure" && measureMode !== "area" && measureSelection.length) {
     ctx.save();
-    ctx.strokeStyle = "#51cf66";
+    ctx.strokeStyle = canvasColor("--success");
     ctx.lineWidth = 2;
     for (const sel of measureSelection) {
       const pos = livePosOf(sel.pathId, sel.nodeId);
@@ -3421,7 +3472,7 @@ function render() {
 
   if (ui.tool === "dimension" && dimensionSelection.length) {
     ctx.save();
-    ctx.strokeStyle = "#4dabf7";
+    ctx.strokeStyle = canvasColor("--accent");
     ctx.lineWidth = 2;
     for (const sel of dimensionSelection) {
       const pos = livePosOf(sel.pathId, sel.nodeId);

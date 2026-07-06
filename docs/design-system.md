@@ -194,10 +194,10 @@ CSS custom property can't reach -- `mesh3d.js` passes it to re-apply
   3:1 against the light theme's canvas) with 8 mid-tone hues verified
   against both, documented in the README's own "Multiplayer presence"
   section, not repeated here.
-- The Time-Travel Merge modal and AI-generation flow got a token-only
-  re-skin here (colors, radii, shadow, `.modal`/`.modal-overlay`
-  classes), not the art direction the brief describes for either --
-  that's D7.
+- The Time-Travel Merge modal and AI-generation flow are fully art-
+  directed -- Phase D7, documented in the README's own "Signature
+  moments" section, not repeated here.
 - The full WCAG/screenshot audit (contrast automation, touch targets,
-  focus-ring visibility, `aria-label` sweep, kill-list) is D8's job, run
-  once, at the end of Part 3 -- not repeated per phase.
+  focus-ring visibility, `aria-label` sweep, kill-list) is done --
+  Phase D8, documented in the README's own "Performance and polish
+  audit" section. **Part 3 (D1-D8) is complete.**

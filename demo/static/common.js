@@ -548,6 +548,18 @@ function initialsOf(name) {
 // connects -- only for genuine arrivals after that).
 let _seenPresenceActors = null;
 
+/** A real bug found in Phase D8's own verification: renderAvatarStack
+ * runs on every presence update, not just once per join (any further
+ * ping from the same newly-joined actor -- even the 400ms heartbeat --
+ * re-renders the whole stack before the 220ms entrance animation has
+ * finished). Checking "is this id new *this specific call*" meant a
+ * second call within that window silently rebuilt the avatar without
+ * `avatar-enter`, cutting the animation off before it visibly played.
+ * Tracking membership with a time-based expiry instead means the class
+ * stays applied across however many re-renders happen inside the
+ * window, not just the first one. */
+const _recentlyJoinedIds = new Set();
+
 /** `onAvatarClick(actorId)` is optional (follow mode, Phase D6 stretch
  * goal) -- each demo passes its own viewport-follow toggle since 2D
  * pan/zoom and 3D orbit have nothing in common mechanically; common.js
@@ -564,26 +576,47 @@ function renderAvatarStack(meName, meColor, othersEntries, onAvatarClick, follow
   ];
   const currentIds = new Set(people.map((p) => p.id).filter(Boolean));
 
-  const newlyJoined = new Set();
   if (_seenPresenceActors === null) {
     _seenPresenceActors = currentIds;
   } else {
-    for (const id of currentIds) if (!_seenPresenceActors.has(id)) newlyJoined.add(id);
-    for (const p of people) if (newlyJoined.has(p.id)) showToast(`${p.name || "Someone"} joined`, "info");
+    for (const id of currentIds) {
+      if (_seenPresenceActors.has(id)) continue;
+      // Genuinely new as of *this* call (not just "not in the entrance
+      // window") -- toast exactly once, and hold the entrance class for
+      // 300ms (> the 220ms --t-med animation) regardless of how many
+      // more times this function gets called in the meantime.
+      const person = people.find((p) => p.id === id);
+      showToast(`${(person && person.name) || "Someone"} joined`, "info");
+      _recentlyJoinedIds.add(id);
+      setTimeout(() => _recentlyJoinedIds.delete(id), 300);
+    }
     _seenPresenceActors = currentIds; // also drops anyone who left, so a rejoin is greeted again
   }
 
   stack.innerHTML = "";
   for (const p of people.slice(0, MAX_VISIBLE)) {
     const el = document.createElement("div");
-    el.className = newlyJoined.has(p.id) ? "avatar avatar-enter" : "avatar";
+    el.className = _recentlyJoinedIds.has(p.id) ? "avatar avatar-enter" : "avatar";
     el.style.background = p.color || "#4dabf7";
     el.textContent = initialsOf(p.name);
     el.title = p.name || "?";
     if (p.id && onAvatarClick) {
       el.classList.add("avatar-clickable");
       if (p.id === followingId) el.classList.add("following");
+      // Phase D8 kill-list: follow-mode was mouse-only (a bare onclick on
+      // a <div>, no tabindex/keyboard path at all) -- found auditing for
+      // "no hover-only [or, here, click-only] functionality without a
+      // keyboard/touch path". A real <button> would also work, but
+      // .avatar-overflow's own "+N" chip below it deliberately isn't
+      // interactive, so a mixed button/div stack seemed more surprising
+      // than a consistent div stack with explicit ARIA semantics.
+      el.setAttribute("role", "button");
+      el.setAttribute("tabindex", "0");
+      el.setAttribute("aria-label", `Follow ${p.name || "this collaborator"}`);
       el.onclick = () => onAvatarClick(p.id);
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onAvatarClick(p.id); }
+      });
     }
     stack.appendChild(el);
   }

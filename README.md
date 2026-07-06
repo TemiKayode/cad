@@ -53,7 +53,8 @@ offline to see the **Time-Travel Merge** panel.
 | Keyboard-first: command palette, single-key shortcuts, keyboard reachability audit (Part 3 Phase D4) | **Done** -- Ctrl/Cmd+K palette, per-tool single-key shortcuts, arrow-key nudge, Ctrl/Cmd+Z/Y now in the 2D demo too, grouped/searchable "?" overlay, skip-to-canvas link, focus-trapped modals, see below |
 | State legibility: connection/save status cluster, toast queueing, empty states, undo-toasts (Part 3 Phase D5) | **Done** -- honest "Saved"/"Reconnecting" copy matching the real durability model, geometry-rejection red flash (2D only -- 3D has no pre-commit validity gate to hang it off), see below |
 | Multiplayer presence: smooth cursors, avatar delight, remote selection/edit highlights, follow mode (Part 3 Phase D6) | **Done** -- 8-color both-theme-verified actor palette (was 10, pastel, dark-theme-only), a real "3D presence never sent until first edit" gap found and fixed, see below |
-| Signature moments: Time-Travel Merge redesign, staged AI generation (Part 3 Phase D7) | **Done** -- per-author-colored merge chips, converge animation, copy audited to never say "conflict"; AI-gen progress genuinely driven by real WS batch arrival (not a fake timer), stage labels derived from real face-material data; D8 (perf/a11y audit) still open, see below |
+| Signature moments: Time-Travel Merge redesign, staged AI generation (Part 3 Phase D7) | **Done** -- per-author-colored merge chips, converge animation, copy audited to never say "conflict"; AI-gen progress genuinely driven by real WS batch arrival (not a fake timer), stage labels derived from real face-material data, see below |
+| Performance and polish audit -- gate before "done" (Part 3 Phase D8) | **Done** -- **Part 3 (D1-D8) complete.** 2D render() measured at ~1.1ms/call (500 paths); 3D's equivalent hit a real sandbox limit (SwiftShader software WebGL, documented, not papered over); CLS 0.002-0.01 on all 3 pages; kill-list sweep found and fixed several real, pre-existing gaps (see below) |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -67,7 +68,7 @@ offline to see the **Time-Travel Merge** panel.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 84 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 89 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -1469,6 +1470,115 @@ batch* arrives by a progress line and a ~15° camera orbit.
 tests/e2e/test_art_direction_e2e.py adds 4 browser tests. Full e2e
 suite (84 tests) and full non-e2e suite pass.
 
+## Performance and polish audit (Part 3, Phase D8 — gate before "done")
+
+- **60fps verification, measured directly rather than assumed**: a
+  500-path 2D document's own `render()` call, timed in-page across 20
+  repeated calls, takes **0.7-3.2ms** (avg ~1.1ms) -- comfortably inside
+  the 16ms/frame budget. Presence updates and the cursor coordinate
+  readout (previously two separate synchronous calls directly inside
+  the `pointermove` handler, with no bound on how often a high-poll-
+  rate mouse could trigger them) are now coalesced into a single
+  `requestAnimationFrame` callback (`scheduleCursorReadoutAndPresence`),
+  and the canvas redraw itself during pan/select-drag/constrain-drag/
+  shape-draft/drawing/zoom is similarly coalesced (`requestRender`) so
+  several `pointermove`/`wheel` events landing in the same frame only
+  trigger one redraw, not one each.
+  - **The 3D demo's equivalent verification hit a real environment
+    limit, documented rather than papered over**: `camera`/`renderer`
+    are module-scoped in mesh3d.js and unreachable from `page.evaluate`
+    (the same constraint noted repeatedly since D6), and a scripted
+    orbit/zoom/pan gesture profiled via the browser's own `longtask`
+    `PerformanceObserver` showed 50-119ms tasks even on a modest
+    160-vertex mesh. Checking `WEBGL_debug_renderer_info` confirmed why:
+    this sandboxed environment's Chromium falls back to **SwiftShader**
+    (`ANGLE ... SwiftShader Device ... SwiftShader driver`) -- a
+    CPU-only software WebGL implementation with no real GPU behind it,
+    roughly 50-100x slower than hardware-accelerated rendering for
+    anything WebGL. This makes genuine 60fps validation of the 3D
+    demo's actual frame cost impossible to obtain honestly in this
+    specific environment (real end-user hardware has a GPU), so it
+    isn't claimed here -- the 2D Canvas2D path doesn't depend on GPU
+    acceleration the same way and was verified directly and
+    conclusively instead. Attempting to reach the brief's literal
+    1,000-vertex target also surfaced a smaller, separate, informational
+    finding: repeated AI-generation calls in the same room don't
+    accumulate vertices (each run stayed at exactly 160) -- deterministic
+    vertex ids derived from spec+index rather than randomized, so
+    repeat generations from a similar prompt overwrite the same LWW
+    slots instead of adding new ones. Not a bug worth chasing down
+    mid-audit, just noted for whoever next needs a large synthetic mesh
+    to test against.
+- **No layout shift**: measured with the real Layout Instability API
+  (`PerformanceObserver({type: 'layout-shift'})`) across all three
+  pages during page load and web-font swap -- cumulative layout shift
+  scores of 0.002-0.010, an order of magnitude under the "good" 0.1
+  threshold, so no `size-adjust`/`ascent-override` font-face metric
+  tuning was needed on top of the existing `font-display: swap` +
+  metric-compatible system-font fallback stacks.
+- **`tests/e2e/test_design_system.py`** (5 browser tests): a screenshot
+  matrix (2 demos x 4 viewport widths [375/768/1280/1920] x 2 themes =
+  16 images, archived to `docs/screenshots/audit_*.png`) that also
+  asserts every combination loads cleanly with no console errors;
+  every icon-only button across all three pages carries a non-empty
+  `aria-label`; the first real Tab stop shows a visible
+  (`outline-style: solid`, non-zero width) focus ring; the mobile
+  bottom tool-rail's buttons are all >=44x44 CSS px at the 375px
+  breakpoint; and `--text-primary`/`--text-secondary` clear 4.5:1
+  against both `--bg-app` and `--bg-panel` in both themes (computed via
+  the same WCAG relative-luminance formula used throughout this whole
+  Part, read live from `getComputedStyle` rather than eyeballed from
+  the token values).
+- **`tests/test_frontend_kill_list.py`** (4 fast, non-browser tests,
+  static analysis over the source): no emoji glyph anywhere in
+  `demo/static/*.html`/`*.js`; every `z-index` declaration outside
+  `tokens.css` itself routes through a `var(--z-*)` token; the sole
+  `outline: none` in the whole stylesheet is the modern
+  `:focus:not(:focus-visible)` complement to a real `:focus-visible`
+  ring (paired, not a bare removal); and the sole transition on a
+  layout-triggering property (`.body`'s `grid-template-columns`, the
+  panel-collapse animation) is a documented, deliberate exception --
+  the entire point of that transition is the canvas actually reflowing
+  to reclaim the freed width, which a transform-only fake (sliding the
+  panel off-screen while its grid track stays full width) can't
+  produce, and it fires once per manual toggle rather than on a
+  continuous per-frame hot path.
+- **Real, if minor, bugs this sweep actually found and fixed**, not
+  just confirmed clean:
+  - `.avatar:hover`'s `z-index: 1` was a raw, unscaled value (should
+    have been `var(--z-toolbar)`), and the skip-link animated `top` (a
+    layout property) instead of `transform` for an identical visual
+    result at lower cost -- both predate this phase.
+  - Follow mode's avatar click targets (D6) had no keyboard path at all
+    -- a bare `onclick` on a `<div>` with no `tabindex`, caught by
+    exactly the kind of audit this phase is for. Now `role="button"`,
+    `tabindex="0"`, an `aria-label` naming who it follows, and an
+    Enter/Space keydown handler alongside the existing click.
+  - Several canvas-drawn UI elements -- constraint-relation badges,
+    dimension lines/labels, the in-progress polygon/shape-draft preview,
+    and the constrain/measure/dimension tools' own selection markers --
+    were never migrated to `canvasColor()` during D1's original token
+    migration, so they silently never followed a theme switch (one,
+    the dimension-line blue, happened to equal the dark theme's
+    `--accent` by coincidence, masking the gap there specifically).
+    All now read live theme tokens.
+  - Three remaining hardcoded `#fff` values (avatar initials, remote-
+    cursor name pills, the danger button) were consolidated into a new
+    `--on-solid-fill` token -- distinct from `--accent-on` because none
+    of these three backgrounds are `--accent` itself, and (verified)
+    white clears 4:1+ against all of them in both themes without
+    needing `--accent-on`'s per-theme flip.
+
+**Definition of done, D1-D8**: every phase is committed individually
+(see the git log); the full pytest suite (375 tests) and the full e2e
+suite (89 tests, opt-in via `-m e2e`) both pass; both demos share the
+same `tokens.css` with zero remaining hard-coded colors/spacing/
+z-index outside it (verified above); both themes pass this phase's own
+audit; `docs/screenshots/` is current (the 4 README hero images plus
+16 new audit screenshots); and this README's own
+[Design system](#design-system-part-3-phase-d1) section has linked
+`docs/design-system.md` since D1.
+
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
 Before this, the canvas mapped document coordinates 1:1 to screen
@@ -2512,7 +2622,7 @@ which it did, on the first real attempt in both passes.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (84 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (89 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -2694,7 +2804,25 @@ repeated UI clicks would only serialize behind `#genBtn`'s own
 disabled state and a fourth click's timing-dependent race was exactly
 the kind of flakiness this suite has caught before; the fourth,
 real, UI-driven click then reliably 429s) produces a danger toast with
-an inline Retry action and leaves the prompt text untouched.
+an inline Retry action and leaves the prompt text untouched; and
+(Phase D8) `test_design_system.py` -- a 16-image screenshot matrix (2
+demos x 4 viewport widths x 2 themes) archived to
+`docs/screenshots/audit_*.png`, asserting every combination loads with
+no console errors; every icon-only button on all three pages has a
+non-empty `aria-label`; the first real Tab stop shows a visible focus
+ring; the 375px-breakpoint mobile tool-rail's buttons are all >=44px in
+both dimensions; and `--text-primary`/`--text-secondary` clear 4.5:1
+against both `--bg-app` and `--bg-panel` in both themes, computed live
+from `getComputedStyle` rather than assumed from the token values.
+`tests/test_frontend_kill_list.py` (4 tests, no browser needed, part of
+the plain `pytest tests/` run) statically checks the same properties
+the D8 brief's kill list names: no emoji glyph anywhere in
+`demo/static/*.html`/`*.js`; every `z-index` outside `tokens.css`
+itself uses a `var(--z-*)` token; the one `outline: none` in the whole
+stylesheet is paired with a real `:focus-visible` ring, not a bare
+removal; and the one transition on a layout-triggering property
+(`.body`'s `grid-template-columns`) is the single documented,
+deliberate exception.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

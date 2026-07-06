@@ -170,11 +170,19 @@ def test_follow_mode_recenters_view_and_exits_on_manual_zoom_in_2d(live_server, 
         assert page_a.eval_on_selector("#avatarStack .avatar-clickable", "el => el.classList.contains('following')")
         assert page_a.evaluate("followingActorId") is not None
 
-        pan_before = page_a.evaluate("[view.panX, view.panY]")
+        pan_before_x, pan_before_y = page_a.evaluate("[view.panX, view.panY]")
         page_b.mouse.move(box_b["x"] + 500, box_b["y"] + 60, steps=1)
-        page_a.wait_for_timeout(300)
+        # Poll rather than a fixed sleep -- under system load (this
+        # suite has repeatedly found full-run timing tighter than an
+        # isolated run), a fixed 300ms wasn't always enough for B's
+        # presence update to round-trip and for A's own tick to re-pan,
+        # even though it reliably does eventually.
+        page_a.wait_for_function(
+            f"view.panX !== {pan_before_x} || view.panY !== {pan_before_y}",
+            timeout=5000,
+        )
         pan_after = page_a.evaluate("[view.panX, view.panY]")
-        assert pan_after != pan_before, "following should re-pan the view toward the followed actor"
+        assert pan_after != [pan_before_x, pan_before_y]
 
         canvas_a = page_a.locator("#canvas")
         box_a = canvas_a.bounding_box()
