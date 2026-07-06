@@ -52,7 +52,8 @@ offline to see the **Time-Travel Merge** panel.
 | Input feel: per-tool cursors, hover halo, token-correct snap/marquee colors (Part 3 Phase D3) | **Done** -- no drag-to-resize handles (a pre-existing, deliberate numeric-input-only scope decision, not reopened here), see below |
 | Keyboard-first: command palette, single-key shortcuts, keyboard reachability audit (Part 3 Phase D4) | **Done** -- Ctrl/Cmd+K palette, per-tool single-key shortcuts, arrow-key nudge, Ctrl/Cmd+Z/Y now in the 2D demo too, grouped/searchable "?" overlay, skip-to-canvas link, focus-trapped modals, see below |
 | State legibility: connection/save status cluster, toast queueing, empty states, undo-toasts (Part 3 Phase D5) | **Done** -- honest "Saved"/"Reconnecting" copy matching the real durability model, geometry-rejection red flash (2D only -- 3D has no pre-commit validity gate to hang it off), see below |
-| Multiplayer presence: smooth cursors, avatar delight, remote selection/edit highlights, follow mode (Part 3 Phase D6) | **Done** -- 8-color both-theme-verified actor palette (was 10, pastel, dark-theme-only), a real "3D presence never sent until first edit" gap found and fixed; D7-D8 (signature-moment art direction, perf/a11y audit) still open, see below |
+| Multiplayer presence: smooth cursors, avatar delight, remote selection/edit highlights, follow mode (Part 3 Phase D6) | **Done** -- 8-color both-theme-verified actor palette (was 10, pastel, dark-theme-only), a real "3D presence never sent until first edit" gap found and fixed, see below |
+| Signature moments: Time-Travel Merge redesign, staged AI generation (Part 3 Phase D7) | **Done** -- per-author-colored merge chips, converge animation, copy audited to never say "conflict"; AI-gen progress genuinely driven by real WS batch arrival (not a fake timer), stage labels derived from real face-material data; D8 (perf/a11y audit) still open, see below |
 | Hosted ML mesh-gen adapter (Meshy, `MESHY_API_KEY`) | **Built, not verified** (Phase 9) -- no API key available to test against the live service; fallback-to-procedural path is verified, see below |
 | Geometry validity gate (reject zero-length / self-intersecting) | **Done**, server-side pre-commit gate; demoed live via the strict Polygon tool |
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
@@ -66,7 +67,7 @@ offline to see the **Time-Travel Merge** panel.
 | Offline outbox durability (survives a hard refresh/closed tab) | **Done** -- IndexedDB, no JS CRDT engine added, see below |
 | Prometheus metrics (`prometheus_client`) | **Done** |
 | CI (GitHub Actions: pytest/ruff, e2e, Docker build) | **Done** -- `.github/workflows/ci.yml` |
-| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 80 tests |
+| Committed browser e2e suite (`tests/e2e/`, Playwright) | **Done**, opt-in via `-m e2e`, 84 tests |
 | Docker image + Compose stack | **Done**, built and run-verified, persistence-across-restart verified |
 | Kubernetes manifests | Written, **not validated against a live cluster** (none was available) -- see `k8s/README.md` for the important caveat on replica count |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
@@ -1376,6 +1377,98 @@ scoping makes its internal state (unlike sketch.js's classic-script
 globals) unreachable from `page.evaluate`. Full e2e suite (80 tests)
 and full non-e2e suite pass.
 
+## Signature moments: Time-Travel Merge and AI generation (Part 3, Phase D7)
+
+**Time-Travel Merge redesign** (`showMergePreviewModal`, common.js): a
+two-column branch comparison -- "While you were away" (this actor's own
+offline edits) and "Meanwhile, in the room" (everyone else's) -- each a
+timeline of change chips (an icon per op kind: `plus`/`x`/`pen` for
+add/remove/edit) rather than the previous plain bulleted list, with a
+`.merge-spine` connecting them down into a single accent "Merge now"
+button, the only primary button on screen.
+- **Chips are colored per individual author, not one flat color per
+  column.** `describeDocOps`/`describeMeshOps` were restructured to
+  group by `(actorId, label)` instead of `label` alone -- every op's
+  `payload.id` is already `[counter, actorId]` (the same
+  `LocalClock.tick()` shape used everywhere else), so each chip's
+  `colorForActor(actorId)` reuses D6's own presence-color
+  infrastructure. This matters concretely once more than one
+  collaborator was active during the same offline stretch: two
+  different authors' edits in the "Meanwhile" column render as two
+  differently-colored chip groups, not one undifferentiated pile.
+- **"Two lines joining" on merge**: clicking "Merge now" adds a
+  `.merge-converging` class (both columns slide/fade toward the
+  spine, 220ms = `--t-med`, reduced-motion-safe for free via
+  tokens.css's existing global rule) before the overlay is actually
+  removed and a "Merged -- N changes combined" success toast fires.
+- **Copy audited end to end for the brief's explicit constraint**: this
+  is a preview of an automatic, lossless merge, never a "conflict" to
+  "resolve" -- the word "conflict" does not appear anywhere in the new
+  copy (verified by an e2e test asserting exactly that), matching how
+  the pre-D7 modal already got this right and D7 didn't regress it.
+
+**AI generation staging** (`generateMesh`, mesh3d.js): a distinct
+"thinking" state (an animated gradient border on the prompt input, the
+standard double-background-layer CSS trick, `.ai-thinking`) while the
+prompt is being interpreted, replaced the instant the *first real ops
+batch* arrives by a progress line and a ~15° camera orbit.
+- **The progress line is driven by genuinely arriving data, not a fake
+  timer**: `Room.commit_ops_batched` (server/app.py) really does
+  broadcast the newly-generated mesh's ops in separate WS messages as
+  it commits them (150 ops/batch by default), with no `exclude` on that
+  broadcast -- so the requesting tab's own WebSocket connection
+  receives every batch while its own `fetch()` for `/generate` is still
+  pending. `applyIncomingOps`'s already-threaded `from` parameter
+  (Phase D6) makes it trivial to recognize these as `ai_generator_bot`
+  ops and react to them.
+- **The stage labels ("Building floor, roof, walls...") are derived
+  from real data, not invented**: `generate_mesh_ops` flattens every
+  floor's vertices, then every floor's faces, into one flat op list
+  *before* `commit_ops_batched` ever chunks it by raw op count -- there
+  is no per-batch "this batch is the floor" tag server-side, and batch
+  boundaries fall at arbitrary points relative to construction stages.
+  Each face op does carry a real `material` `face_prop`, though
+  (`procedural_house.py`: the user's chosen floor material, `"roof"`/
+  `"concrete"`, or `"exterior_wall"`/`"interior_wall"`), so the client
+  classifies each arriving batch's materials into floor/roof/walls and
+  accumulates a `Set` of stages actually seen so far -- in whatever
+  order they truly land (floor, then roof, then walls, in practice --
+  not necessarily the brief's illustrative wording), rather than
+  guessing at a schedule. For a small, fast local generation this
+  state can last under half a second (verified directly: a 6-bedroom/
+  4-floor generation showed "Building floor, roof, walls..." for about
+  340ms before the final result replaced it) -- genuinely brief, not
+  hidden or faked to look longer.
+- **Completion toast names the actual actor**: "Built by
+  ai_generator_bot -- N vertices, M faces", using the server's own
+  `result.actor` field (already `"ai_generator_bot"`,
+  `crdt_cad.ai.generator.DEFAULT_ACTOR_ID`) rather than a hardcoded
+  string.
+- **Failures render as a danger toast with the server's own reason, an
+  inline Retry, and the prompt preserved** -- reusing `showToast`'s
+  generic `{actionLabel, onAction}` option (the same mechanism D5's
+  undo-toasts already use) rather than adding new toast plumbing;
+  verified against a real 429 (the rate limiter, not a mock), since the
+  client's error handling is generic across every non-ok response and
+  a 422/504 would hit the identical code path.
+- **The camera orbit is a real Three.js camera move, not a CSS
+  animation** -- tokens.css's global `prefers-reduced-motion` rule
+  can't neutralize it the way it does everywhere else motion appears in
+  this app, so `orbitCameraDuringGeneration()` checks
+  `window.matchMedia("(prefers-reduced-motion: reduce)")` directly and
+  no-ops entirely when it matches. Runs on a fixed ~4s tween from
+  whenever generation starts (not tied to exact batch timing) and holds
+  its final position once done. **Not covered by the committed e2e
+  suite**: `camera`/`controls` are module-scoped in mesh3d.js and
+  unreachable from `page.evaluate` (same constraint noted in D6's
+  section) with no DOM-observable proxy for "did the camera actually
+  rotate" the way there was for follow mode's cursor-centering --
+  verified only via live screenshots during this phase, a documented
+  gap rather than a skipped-silently one.
+
+tests/e2e/test_art_direction_e2e.py adds 4 browser tests. Full e2e
+suite (84 tests) and full non-e2e suite pass.
+
 ## 2D viewport: pan, zoom, grid, snap (Phase 10, `sketch.js`)
 
 Before this, the canvas mapped document coordinates 1:1 to screen
@@ -2419,7 +2512,7 @@ which it did, on the first real attempt in both passes.
 
 All of the ad-hoc Playwright verification above was, for most of this
 project's life, exactly that -- ad-hoc, run by hand, never committed.
-`tests/e2e/` (80 tests, opt-in via `pytest -m e2e`, excluded from a plain
+`tests/e2e/` (84 tests, opt-in via `pytest -m e2e`, excluded from a plain
 `pytest tests/` run so a fresh checkout without Chromium installed still
 passes) makes several of those scenarios permanent, regression-tested
 code instead of tribal knowledge: two tabs drawing concurrently and
@@ -2584,7 +2677,24 @@ and a visible cursor (the regression test for the "3D presence was
 never sent until the first edit" gap this phase found), the cursor
 gains an `idle` class after 3s and loses it on the next update, and
 follow mode leaves the followed actor's own rendered cursor position
-near the viewport's center.
+near the viewport's center; and (Phase D7) `test_art_direction_e2e.py`
+-- the Time-Travel Merge modal's text never contains "conflict" and
+does contain both new column titles; a chip in the "while you were
+away" column and a chip in the "meanwhile" column have different
+computed `border-left-color`s (proving per-author, not per-column,
+coloring); clicking "Merge now" immediately applies the
+`merge-converging` class before the 220ms removal delay, and a
+"changes combined" toast follows; a large-enough AI generation shows
+the `ai-thinking` shimmer immediately, then a "Building..." progress
+line before the shimmer clears, then a completion toast naming
+`ai_generator_bot` with vertex/face counts; and a real 429 (the actual
+rate limiter -- 3 direct warm-up requests via Playwright's own request
+context exhaust its capacity-3 token bucket deterministically, since
+repeated UI clicks would only serialize behind `#genBtn`'s own
+disabled state and a fourth click's timing-dependent race was exactly
+the kind of flakiness this suite has caught before; the fourth,
+real, UI-driven click then reliably 429s) produces a danger toast with
+an inline Retry action and leaves the prompt text untouched.
 Each spins up a real `uvicorn` subprocess on a free port with its own
 temp SQLite file (`tests/e2e/conftest.py`), so they exercise the actual
 client JS against the actual relay -- not an in-process

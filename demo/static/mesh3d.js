@@ -291,6 +291,11 @@ function applyIncomingOps(ops, fromActor) {
   for (const op of ops) applyOp(op);
   ui.opsCount += ops.length;
   syncScene();
+  // Phase D7: drives the AI-generation progress line off the same real
+  // batches this fetch's own WS connection is already receiving -- see
+  // noteGenerationBatch's own comment for why this is genuinely
+  // arrival-driven, not a fake timer.
+  if (fromActor === AI_GENERATOR_ACTOR_ID) noteGenerationBatch(ops);
   // Phase D6: mirrors sketch.js's identical remote-edit flash -- see its
   // comment. Mesh ops key their touched geometry differently: a vertex
   // move/create carries the vertex id as `scope`; a face op carries the
@@ -554,6 +559,84 @@ const genBtn = document.getElementById("genBtn");
 const genPromptInput = document.getElementById("genPromptInput");
 const genStatus = document.getElementById("genStatus");
 
+// -- AI generation staging (Phase D7 art direction) ------------------------------
+//
+// The ops really do stream in batches over the WS relay the requesting
+// tab is already connected to (Room.commit_ops_batched, server/app.py --
+// broadcast() there has no `exclude`, so the requester gets its own
+// batches too, while its own fetch() is still pending), so the progress
+// line below is driven by genuinely arriving `ops` messages, not a
+// fake timer. There is no per-batch "this batch is the floor/walls/
+// roof" tag server-side, though (generate_mesh_ops flattens every
+// floor's vertices, then every floor's faces, into one flat op list
+// before commit_ops_batched ever chunks it by raw size) -- so the
+// stage names below are derived honestly from each batch's own
+// face_prop "material" values (procedural_house.py tags every face
+// with one: the user's chosen floor material, "roof"/"concrete", or
+// "exterior_wall"/"interior_wall") rather than invented outright, and
+// accumulate in whatever order they're actually seen (floor-then-roof-
+// then-walls in practice, not necessarily the brief's illustrative
+// "floor... walls... roof..." wording).
+const AI_GENERATOR_ACTOR_ID = "ai_generator_bot";
+let generationInFlight = false;
+const generationStagesSeen = new Set();
+
+function stageForMaterial(material) {
+  if (typeof material !== "string") return null;
+  if (material.includes("wall")) return "walls";
+  if (material === "roof" || material === "concrete") return "roof";
+  return "floor";
+}
+
+/** Called from applyIncomingOps for every batch while a generation is
+ * in flight -- the first call also flips the prompt box from the
+ * "thinking" shimmer to the progress line, since the first ops batch
+ * arriving is the honest signal that interpretation finished and
+ * building started (not a fixed timer guessing at it). */
+function noteGenerationBatch(ops) {
+  if (!generationInFlight) return;
+  if (genPromptInput.classList.contains("ai-thinking")) {
+    genPromptInput.classList.remove("ai-thinking");
+  }
+  for (const op of ops) {
+    if (op.target === "face_prop" && op.payload.k === "material") {
+      const stage = stageForMaterial(op.payload.v);
+      if (stage) generationStagesSeen.add(stage);
+    }
+  }
+  genStatus.textContent = `Building ${[...generationStagesSeen].join(", ")}...`;
+}
+
+/** ~15 degree orbit around the current camera-to-target radius while
+ * geometry lands, skipped entirely under prefers-reduced-motion (a
+ * Three.js camera move isn't a CSS animation/transition, so the global
+ * reduced-motion rule in tokens.css can't neutralize it the way it does
+ * everywhere else motion is used in this app -- this has to check the
+ * media query itself). Runs on a fixed ~4s tween rather than being tied
+ * to exact batch timing, holding its final position once done. Returns
+ * a cleanup function that stops it early (called if generation fails
+ * fast, before the tween would otherwise finish on its own). */
+function orbitCameraDuringGeneration() {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return () => {};
+  const totalRadians = (15 * Math.PI) / 180;
+  const startAngle = Math.atan2(camera.position.z, camera.position.x);
+  const radius = Math.hypot(camera.position.x, camera.position.z);
+  const startTime = performance.now();
+  const DURATION_MS = 4000;
+  let active = true;
+  function tick() {
+    if (!active) return;
+    const t = Math.min((performance.now() - startTime) / DURATION_MS, 1);
+    const angle = startAngle + totalRadians * t;
+    camera.position.x = radius * Math.cos(angle);
+    camera.position.z = radius * Math.sin(angle);
+    camera.lookAt(controls.target);
+    if (t < 1) requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+  return () => { active = false; };
+}
+
 async function generateMesh() {
   const prompt = genPromptInput.value.trim();
   if (!prompt) {
@@ -562,7 +645,11 @@ async function generateMesh() {
   }
   genBtn.disabled = true;
   genBtn.textContent = "Generating…";
-  genStatus.textContent = "Generating mesh — this can take a few seconds…";
+  generationInFlight = true;
+  generationStagesSeen.clear();
+  genPromptInput.classList.add("ai-thinking");
+  genStatus.textContent = "Interpreting your prompt...";
+  const stopOrbit = orbitCameraDuringGeneration();
   try {
     const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/generate`, "mesh", room), {
       method: "POST",
@@ -581,17 +668,23 @@ async function generateMesh() {
     // a mesh; any failure there silently falls back to "procedural",
     // same as it always was.
     const meshVia = result.mesh_source === "meshy" ? "Meshy" : "the procedural builder";
-    showToast(`Generated ${result.vertex_count} vertices / ${result.face_count} faces via ${meshVia}`, "success");
+    showToast(`Built by ${result.actor} -- ${result.vertex_count} vertices, ${result.face_count} faces`, "success");
     genStatus.textContent =
       `Last generation: ${result.spec.bedrooms} bedroom(s), ${result.spec.floors} floor(s), ` +
       `${escapeHtml(result.spec.floor_material)} floor, ${escapeHtml(result.spec.style)} style (interpreted via ${via}, ` +
       `mesh via ${meshVia}, ${result.batches} batch(es)).`;
   } catch (err) {
-    showToast(`Generation failed: ${err.message}`, "error");
+    // Danger toast with the server's own reason, an inline Retry (the
+    // prompt box is never cleared on failure, so Retry just re-submits
+    // exactly what's already there), per the brief.
+    showToast(`Generation failed: ${err.message}`, "error", { actionLabel: "Retry", onAction: () => generateMesh() });
     genStatus.textContent = `Generation failed: ${err.message}`;
   } finally {
     genBtn.disabled = false;
     genBtn.textContent = "Generate";
+    generationInFlight = false;
+    genPromptInput.classList.remove("ai-thinking");
+    stopOrbit();
   }
 }
 genBtn.onclick = generateMesh;

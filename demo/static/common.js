@@ -1389,85 +1389,130 @@ function initStatusCluster() {
   setInterval(renderSaveLabel, 30000);
 }
 
-/** Summarizes a batch of DrawingDocument ops into short human-readable
- * bullet points for the merge-preview modal. */
+/** Summarizes a batch of DrawingDocument ops into change-chip entries
+ * for the merge-preview modal -- `{icon, label, count, actorId}`,
+ * grouped by (actor, label) rather than label alone, since Phase D7
+ * colors each chip by *who* made it (every op's payload.id is
+ * `[counter, actorId]`, the same LocalClock.tick() shape used
+ * everywhere else in this file). */
 function describeDocOps(ops) {
-  const counts = {};
+  const groups = new Map();
   for (const op of ops) {
     const p = op.payload;
-    let label;
-    if (op.target === "layer") label = p.d ? "removed a layer" : "added a layer";
-    else if (op.target === "path_index") label = p.d ? "removed a path" : "added a path";
-    else if (op.target === "path_prop") label = `changed "${p.k}" on a path`;
-    else if (op.target === "path_geom") label = p.t === "ins" ? "extended a path" : "removed a point";
-    else if (op.target === "comment") label = p.d ? "removed a comment" : "added a comment";
+    const actorId = p.id[1];
+    let label, icon;
+    if (op.target === "layer") { label = p.d ? "removed a layer" : "added a layer"; icon = p.d ? "x" : "plus"; }
+    else if (op.target === "path_index") { label = p.d ? "removed a path" : "added a path"; icon = p.d ? "x" : "plus"; }
+    else if (op.target === "path_prop") { label = `changed "${p.k}" on a path`; icon = "pen"; }
+    else if (op.target === "path_geom") { label = p.t === "ins" ? "extended a path" : "removed a point"; icon = p.t === "ins" ? "pen" : "x"; }
+    else if (op.target === "comment") { label = p.d ? "removed a comment" : "added a comment"; icon = p.d ? "x" : "plus"; }
     else continue; // presence etc. -- not meaningful for a merge review
-    counts[label] = (counts[label] || 0) + 1;
+    const key = `${actorId}|${label}`;
+    const existing = groups.get(key);
+    if (existing) existing.count++;
+    else groups.set(key, { icon, label, count: 1, actorId });
   }
-  return Object.entries(counts).map(([label, n]) => (n > 1 ? `${label} (×${n})` : label));
+  return [...groups.values()];
 }
 
 /** Same idea for MeshCRDT ops. */
 function describeMeshOps(ops) {
-  const counts = {};
+  const groups = new Map();
   for (const op of ops) {
     const p = op.payload;
-    let label;
-    if (op.target === "vertex") label = p.d ? "removed a vertex" : "added/moved a vertex";
-    else if (op.target === "edge") label = p.d ? "removed an edge" : "added an edge";
-    else if (op.target === "face_index") label = p.d ? "removed a face" : "added a face";
-    else if (op.target === "face_geom") label = "edited a face boundary";
+    const actorId = p.id[1];
+    let label, icon;
+    if (op.target === "vertex") { label = p.d ? "removed a vertex" : "added/moved a vertex"; icon = p.d ? "x" : "plus"; }
+    else if (op.target === "edge") { label = p.d ? "removed an edge" : "added an edge"; icon = p.d ? "x" : "plus"; }
+    else if (op.target === "face_index") { label = p.d ? "removed a face" : "added a face"; icon = p.d ? "x" : "plus"; }
+    else if (op.target === "face_geom") { label = "edited a face boundary"; icon = "pen"; }
     else continue;
-    counts[label] = (counts[label] || 0) + 1;
+    const key = `${actorId}|${label}`;
+    const existing = groups.get(key);
+    if (existing) existing.count++;
+    else groups.set(key, { icon, label, count: 1, actorId });
   }
-  return Object.entries(counts).map(([label, n]) => (n > 1 ? `${label} (×${n})` : label));
+  return [...groups.values()];
 }
 
-/** The interactive "Time-Travel Merge" panel: shown when reconnecting
- * after an offline stretch during which *both* sides changed something.
- * This is a review step, not a manual conflict-resolution step -- the
- * CRDT has already guaranteed a consistent merged result either way;
- * this just shows the user what happened on each branch before applying. */
+/** The "Time-Travel Merge" panel (Phase D7 art direction): shown when
+ * reconnecting after an offline stretch during which *both* sides
+ * changed something. Two columns of change chips -- "While you were
+ * away" (this actor's own offline edits) and "Meanwhile, in the room"
+ * (everyone else's, each chip colored by its actual author via
+ * colorForActor, not just a single flat "theirs" color, since more
+ * than one collaborator could have been active) -- converging on a
+ * single accent "Merge now" button via a connecting spine. This is a
+ * review step, not a manual conflict-resolution step: the CRDT has
+ * already guaranteed a consistent, lossless merged result either way,
+ * so the copy never says "conflict" -- only "preview"/"combine". */
 function showMergePreviewModal(offlineOps, remoteOps, describeOps, onProceed) {
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
   overlay.style.display = "flex";
   const box = document.createElement("div");
-  box.className = "modal";
-  box.style.cssText = "padding:20px;max-width:520px;font-size:13px;";
+  box.className = "modal merge-modal";
   const mine = describeOps(offlineOps);
   const theirs = describeOps(remoteOps);
-  const list = (items) =>
-    items.length ? `<ul style="margin:0;padding-left:18px;">${items.map((s) => `<li>${s}</li>`).join("")}</ul>` : '<div style="color:var(--text-secondary)">(nothing visible-- ephemeral only)</div>';
+
+  const chipsHtml = (entries) =>
+    entries.length
+      ? entries
+          .map(
+            (e) => `
+        <div class="merge-chip" style="--chip-color:${colorForActor(e.actorId)}">
+          <svg class="icon"><use href="#icon-${e.icon}"></use></svg>
+          <span class="merge-chip-label">${escapeHtmlCommon(e.label)}</span>
+          ${e.count > 1 ? `<span class="merge-chip-count">&times;${e.count}</span>` : ""}
+        </div>`
+          )
+          .join("")
+      : '<div class="merge-chip-empty">(nothing visible -- ephemeral only)</div>';
+
   box.innerHTML = `
-    <h3 style="margin:0 0 8px;font-size:15px;">Reconnected -- Time-Travel Merge</h3>
-    <p style="color:var(--text-secondary);margin:0 0 14px;line-height:1.5;">
-      You edited while offline. Here's what changed on each branch -- the CRDT
-      engine merges both automatically once you continue, with nothing lost
-      and no conflicts to resolve by hand.
+    <h3 class="merge-title">Reconnected -- merging automatically</h3>
+    <p class="merge-subtitle">
+      This previews what's about to combine -- nothing here needs resolving by
+      hand. The CRDT engine already guarantees a consistent, lossless result
+      either way.
     </p>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px;">
-      <div>
-        <div style="font-weight:700;color:var(--accent);margin-bottom:4px;">Your offline branch</div>
-        <div style="color:var(--text-secondary);font-size:11px;margin-bottom:6px;">${offlineOps.length} op(s)</div>
-        ${list(mine)}
+    <div class="merge-columns">
+      <div class="merge-column">
+        <div class="merge-column-title">While you were away</div>
+        <div class="merge-column-count">${offlineOps.length} change(s)</div>
+        <div class="merge-chip-list">${chipsHtml(mine)}</div>
       </div>
-      <div>
-        <div style="font-weight:700;color:var(--success);margin-bottom:4px;">Their branch (while you were away)</div>
-        <div style="color:var(--text-secondary);font-size:11px;margin-bottom:6px;">${remoteOps.length} op(s)</div>
-        ${list(theirs)}
+      <div class="merge-spine" aria-hidden="true"></div>
+      <div class="merge-column">
+        <div class="merge-column-title">Meanwhile, in the room</div>
+        <div class="merge-column-count">${remoteOps.length} change(s)</div>
+        <div class="merge-chip-list">${chipsHtml(theirs)}</div>
       </div>
     </div>
-    <button id="mergeProceedBtn" class="primary-btn" style="width:100%;padding:9px;font-size:13px;">Merge now</button>
+    <button id="mergeProceedBtn" class="primary-btn merge-proceed-btn">Merge now</button>
   `;
   overlay.appendChild(box);
   document.body.appendChild(overlay);
   const releaseFocus = trapFocusIn(box);
   box.querySelector("#mergeProceedBtn").onclick = () => {
-    overlay.remove();
-    releaseFocus();
-    onProceed();
+    // "Two lines joining" -- both columns slide/fade toward the center
+    // spine before the modal is removed (220ms = --t-med; already
+    // reduced-motion-safe for free via tokens.css's global rule zeroing
+    // every animation/transition duration under that media query, same
+    // as everywhere else motion is used in this app).
+    box.classList.add("merge-converging");
+    setTimeout(() => {
+      overlay.remove();
+      releaseFocus();
+      onProceed();
+      const total = offlineOps.length + remoteOps.length;
+      showToast(`Merged -- ${total} change${total === 1 ? "" : "s"} combined`, "success");
+    }, 220);
   };
+}
+
+function escapeHtmlCommon(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // -- WebRTC P2P data-channel sync, signaling relayed over the WS relay -----------
