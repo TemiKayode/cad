@@ -1,22 +1,25 @@
-"""Natural-language -> :class:`HouseSpec` interpretation.
+"""Natural-language -> ``(generator_name, spec)`` interpretation
+(Phase G1: "Interpretation becomes dispatch").
 
 Two paths, always tried in this order:
 
 1. **LLM** (``_llm_interpret``): calls Claude (``claude-fable-5``) via the
-   ``anthropic`` SDK with ``output_config.format`` constrained to the
-   spec's JSON schema, plus the server-side refusal-fallback the model
-   card recommends enabling by default for Fable 5. This is the "use
-   Claude Fable where necessary" part of the pipeline -- turning a vague
-   architectural description into bounded structured parameters is
-   exactly the kind of judgment call an LLM is suited for (a regex can't
-   tell that "a cozy little cottage" implies 1 bedroom while "a large
-   family home" implies 4), whereas the actual 3D construction is
-   handled by deterministic geometry code, not asked of the model.
-2. **Heuristic** (``_heuristic_interpret``): pure regex/keyword
-   extraction, stdlib only. This is not a rare degraded corner case --
-   it's what actually runs in any environment without
-   ``ANTHROPIC_API_KEY``/``ant auth login`` configured, so the pipeline
-   is fully functional and testable without external credentials.
+   ``anthropic`` SDK with the generator registry presented as a **tool
+   catalog** (one tool per generator, each with its own spec's JSON
+   schema) -- not one giant union schema, so adding a new generator to
+   the registry never means hand-widening a shared schema here. Claude
+   picks exactly one generator and fills its spec's fields; deterministic
+   code in that generator's ``build`` function computes every vertex, the
+   same "LLM never emits geometry" rule Part 5's brief states as
+   non-negotiable.
+2. **Heuristic** (``_heuristic_interpret``): keyword dispatch across the
+   registry (``registry.dispatch_by_keyword``), defaulting to the house
+   generator if nothing matches -- the one archetype this pipeline had
+   before Phase G1. For the house generator specifically, the heuristic
+   also does real field extraction (bedrooms/floors/material/style,
+   unchanged from before); every other generator gets its spec's
+   defaults without an API key -- a real, working object, just with
+   "reduced vocabulary" (rule 2), never a broken/silent failure.
 
 ``interpret_prompt`` always tries the LLM path first and falls back on
 *any* exception -- missing credentials, network failure, a safety
@@ -26,40 +29,35 @@ generation feature should be "slightly less clever," never "broken."
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 
+from pydantic import BaseModel
+
 from crdt_cad.ai.house_spec import HouseSpec
+from crdt_cad.ai.registry import dispatch_by_keyword, get_generator, tool_catalog
 
 logger = logging.getLogger("crdt_cad.ai.interpreter")
 
-_HOUSE_SPEC_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "bedrooms": {"type": "integer", "minimum": 1, "maximum": 12},
-        "floors": {"type": "integer", "minimum": 1, "maximum": 4},
-        "floor_material": {"type": "string"},
-        "wall_height_m": {"type": "number", "minimum": 1.5, "maximum": 6.0},
-        "style": {"type": "string"},
-    },
-    "required": ["bedrooms", "floors", "floor_material", "wall_height_m", "style"],
-    "additionalProperties": False,
-}
-
 _SYSTEM_PROMPT = (
-    "You turn a short architectural description into a bounded, structured "
-    "specification for a simple procedural house generator that only builds "
-    "box-based buildings (a rectangular grid of rooms, flat floors/roof, "
-    "straight exterior and interior walls) -- not architectural styles the "
-    "generator can't render, and never more than 12 bedrooms or 4 floors. "
-    "Infer reasonable defaults for anything not mentioned: a typical home "
-    "is 1 bedroom, 1 floor, wall height 2.7m, floor material 'concrete', "
-    "style 'modern'."
+    "You turn a short design/architecture description into a call to exactly "
+    "one of the provided generator tools, filling in its parameters as best "
+    "matches the description. Infer reasonable defaults for anything not "
+    "mentioned rather than leaving a field out. If the description doesn't "
+    "clearly match any specific generator (furniture, architectural element, "
+    "primitive shape), use the 'house' generator as the default -- it is the "
+    "most general fallback for an architectural request."
 )
 
 
-def _heuristic_interpret(prompt: str) -> HouseSpec:
+def _heuristic_interpret(prompt: str) -> tuple[str, BaseModel]:
+    entry = dispatch_by_keyword(prompt) or get_generator("house")
+    if entry.name == "house":
+        return "house", _heuristic_house_spec(prompt)
+    return entry.name, entry.spec_model()
+
+
+def _heuristic_house_spec(prompt: str) -> HouseSpec:
     lowered = prompt.lower()
 
     bedrooms = 1
@@ -96,37 +94,58 @@ def _heuristic_interpret(prompt: str) -> HouseSpec:
             style = keyword
             break
 
-    return HouseSpec(bedrooms=bedrooms, floors=floors, floor_material=floor_material, style=style)
+    garage = "garage" in lowered
+    roof_type = "flat"
+    if "gable" in lowered:
+        roof_type = "gable"
+    elif "hip roof" in lowered or "hipped roof" in lowered:
+        roof_type = "hip"
+
+    floor_area_sq_m = None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:square\s*(?:meter|metre)s?|sq\.?\s*m\b|m2\b|m²)", lowered)
+    if m:
+        floor_area_sq_m = max(2.0, min(2000.0, float(m.group(1))))
+
+    return HouseSpec(
+        bedrooms=bedrooms, floors=floors, floor_material=floor_material, style=style,
+        garage=garage, roof_type=roof_type, floor_area_sq_m=floor_area_sq_m,
+    )
 
 
-def _llm_interpret(prompt: str) -> HouseSpec:
+def _llm_interpret(prompt: str) -> tuple[str, BaseModel]:
     """Raises on any failure; ``interpret_prompt`` catches broadly and
-    falls back to the heuristic parser. Imports ``anthropic`` lazily so
-    this module (and the heuristic path) never require the SDK or
+    falls back to the heuristic dispatcher. Imports ``anthropic`` lazily
+    so this module (and the heuristic path) never require the SDK or
     credentials to be present."""
     import anthropic
 
     client = anthropic.Anthropic()  # resolves ANTHROPIC_API_KEY / an `ant auth login` profile from the environment
+    tools = tool_catalog()
     response = client.beta.messages.create(
         model="claude-fable-5",
         max_tokens=1024,
         betas=["server-side-fallback-2026-06-01"],
         fallbacks=[{"model": "claude-opus-4-8"}],
         system=_SYSTEM_PROMPT,
-        output_config={"format": {"type": "json_schema", "schema": _HOUSE_SPEC_SCHEMA}},
+        tools=tools,
+        tool_choice={"type": "any"},
         messages=[{"role": "user", "content": prompt}],
     )
     if response.stop_reason == "refusal":
         raise RuntimeError(f"model declined the request: {getattr(response, 'stop_details', None)}")
-    text = next(block.text for block in response.content if block.type == "text")
-    return HouseSpec(**json.loads(text))
+    tool_use = next(block for block in response.content if block.type == "tool_use")
+    entry = get_generator(tool_use.name)
+    return entry.name, entry.spec_model(**tool_use.input)
 
 
-def interpret_prompt(prompt: str) -> tuple[HouseSpec, str]:
-    """Returns ``(spec, source)`` where ``source`` is ``"llm"`` or
-    ``"heuristic"`` so callers (and tests) can tell which path ran."""
+def interpret_prompt(prompt: str) -> tuple[str, BaseModel, str]:
+    """Returns ``(generator_name, spec, source)`` where ``source`` is
+    ``"llm"`` or ``"heuristic"`` so callers (and tests) can tell which
+    path ran."""
     try:
-        return _llm_interpret(prompt), "llm"
+        name, spec = _llm_interpret(prompt)
+        return name, spec, "llm"
     except Exception as exc:
-        logger.info("LLM prompt interpretation unavailable (%s); using the heuristic parser", exc)
-        return _heuristic_interpret(prompt), "heuristic"
+        logger.info("LLM prompt interpretation unavailable (%s); using the heuristic dispatcher", exc)
+        name, spec = _heuristic_interpret(prompt)
+        return name, spec, "heuristic"

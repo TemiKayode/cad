@@ -42,6 +42,16 @@ dependencies = [
     "aiortc>=1.9",
     "itsdangerous>=2.2",
     "trimesh>=4.0",
+    # Phase G1 (Part 5): door/window generators need real CSG boolean
+    # cuts (manifold3d is trimesh's pip-installable boolean-engine
+    # backend -- no external CAD program needed); the arch generator (and
+    # any non-convex extruded footprint) needs shapely for correct
+    # polygon triangulation via trimesh.creation.extrude_polygon. Both
+    # core, not optional extras -- these generators are in the "at
+    # minimum" list, expected to work with zero extra installs, the same
+    # bar trimesh itself is held to.
+    "manifold3d>=3.0",
+    "shapely>=2.0",
 ]
 
 [project.optional-dependencies]

@@ -83,6 +83,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from crdt_cad.ai.generator import DEFAULT_ACTOR_ID, generate_mesh_ops
+from crdt_cad.ai.validation import GenerationValidationError
 from crdt_cad.crdt.clock import LamportClock, VectorClock
 from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
@@ -1010,6 +1011,7 @@ class GenerateMeshRequest(BaseModel):
 
 class GenerateMeshResult(BaseModel):
     actor: str
+    generator: str  # which registry entry produced this (Phase G1: "house", "table", "chair", ...)
     interpretation_source: str  # "llm" | "heuristic"
     mesh_source: str  # "meshy" | "procedural"
     spec: dict
@@ -1018,6 +1020,8 @@ class GenerateMeshResult(BaseModel):
     triangle_count: int
     op_count: int
     batches: int
+    watertight: bool
+    manifold: bool
 
 
 @app.post(
@@ -1061,6 +1065,22 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
             status_code=504,
             detail=f"mesh generation exceeded the {GENERATION_TIMEOUT_SECONDS:.0f}s timeout",
         ) from exc
+    except GenerationValidationError as exc:
+        # Rule 1 (AI_GENERATION_PROMPT.md): a validation failure is a
+        # visible, typed error -- never a silently-injected broken mesh.
+        # The report's own fields (not just a joined string) are surfaced
+        # so a client can render exactly what failed, not just "it failed".
+        logger.warning("room %s: generation failed validation for prompt %r: %s", room_id, req.prompt, exc.report.errors)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "generated mesh failed pre-commit validation",
+                "errors": exc.report.errors,
+                "watertight": exc.report.watertight,
+                "manifold": exc.report.manifold,
+                "within_bounds": exc.report.within_bounds,
+            },
+        ) from exc
     except Exception as exc:
         logger.exception("room %s: mesh generation failed for prompt %r", room_id, req.prompt)
         raise HTTPException(status_code=422, detail=f"could not generate mesh: {exc}") from exc
@@ -1070,13 +1090,14 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
 
     batches = await room.commit_ops_batched(result.ops, actor=DEFAULT_ACTOR_ID, batch_size=GENERATION_OPS_BATCH_SIZE)
     logger.info(
-        "room mesh/%s: generated %d ops (%d vertices, %d faces) from prompt %r via %s/%s, sent in %d batches",
+        "room mesh/%s: generated %d ops (%d vertices, %d faces) from prompt %r via %s (%s/%s), sent in %d batches",
         room_id, len(result.ops), result.vertex_count, result.face_count, req.prompt,
-        result.interpretation_source, result.mesh_source, batches,
+        result.generator_name, result.interpretation_source, result.mesh_source, batches,
     )
 
     return GenerateMeshResult(
         actor=DEFAULT_ACTOR_ID,
+        generator=result.generator_name,
         interpretation_source=result.interpretation_source,
         mesh_source=result.mesh_source,
         spec=result.spec.model_dump(),
@@ -1085,6 +1106,8 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
         triangle_count=result.triangle_count,
         op_count=len(result.ops),
         batches=batches,
+        watertight=result.validation.watertight,
+        manifold=result.validation.manifold,
     )
 
 

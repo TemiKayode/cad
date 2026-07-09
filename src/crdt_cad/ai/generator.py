@@ -1,5 +1,6 @@
-"""Orchestrates prompt -> :class:`HouseSpec` -> mesh -> a batch of
-:class:`MeshOp` ready for CRDT injection.
+"""Orchestrates prompt -> ``(generator, spec)`` -> mesh -> a batch of
+:class:`MeshOp` ready for CRDT injection (Phase G1: dispatch across the
+whole generator registry, not just the house archetype).
 
 This module is pure CPU/network work with no ``asyncio`` in it on
 purpose: :func:`generate_mesh_ops` is a plain synchronous function so
@@ -16,10 +17,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from crdt_cad.ai.house_spec import HouseSpec
+from pydantic import BaseModel
+
 from crdt_cad.ai.interpreter import interpret_prompt
+from crdt_cad.ai.mesh_types import GeneratedMesh
 from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy, meshy_api_key
-from crdt_cad.ai.procedural_house import build_house_mesh
+from crdt_cad.ai.registry import get_generator
+from crdt_cad.ai.validation import ValidationReport, validate_generated_mesh, validate_or_raise
 from crdt_cad.crdt.clock import LamportClock
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
 
@@ -35,22 +39,31 @@ _MATERIAL_COLORS = {
     "roof": "#5c4632",
     "exterior_wall": "#d8d2c4",
     "interior_wall": "#e8e4da",
+    "metal": "#9099a3",
 }
 
-
-def _color_for_material(material: str) -> str:
-    return _MATERIAL_COLORS.get(material, "#b8b2a4")
+# The house generator predates pre-commit validation and its own
+# docstring already documents why it doesn't (and isn't expected to)
+# pass a strict watertight/consistent-winding bar -- see
+# validation.py's docstring for the full explanation. Every generator
+# introduced in Phase G1 *is* held to both checks. A hosted-API mesh
+# (Meshy, when configured) is also exempted: its geometry isn't this
+# project's own code, and that whole path is already documented as
+# unverified against the live API (meshy_adapter.py's module docstring).
+_RELAXED_VALIDATION_GENERATORS = {"house"}
 
 
 @dataclass
 class GenerationResult:
     ops: list[MeshOp]
-    spec: HouseSpec
+    generator_name: str
+    spec: BaseModel
     interpretation_source: str  # "llm" | "heuristic"
     mesh_source: str  # "meshy" | "procedural"
     vertex_count: int
     face_count: int
     triangle_count: int
+    validation: ValidationReport
 
 
 def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> GenerationResult:
@@ -59,25 +72,37 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
     whatever ``interpret_prompt``'s LLM path and (if ``MESHY_API_KEY`` is
     set) ``generate_mesh_via_meshy`` perform internally.
 
-    The prompt is always interpreted into a :class:`HouseSpec` (for the
-    response's informational ``spec``/``interpretation_source``, and as
-    the deterministic fallback), independent of which mesh actually gets
+    The prompt is always interpreted into a ``(generator_name, spec)``
+    pair (for the response's informational fields, and as the
+    deterministic fallback), independent of which mesh actually gets
     used: if ``MESHY_API_KEY`` is set and Meshy's hosted text-to-3D API
-    returns a real mesh, that mesh is injected instead of the procedural
-    one -- see ``crdt_cad.ai.meshy_adapter``'s module docstring for why
-    that whole path is unverified against the live API and always
-    degrades safely to the procedural pipeline below on any failure.
-    """
-    spec, source = interpret_prompt(prompt)
+    returns a real mesh, that mesh is injected instead of the
+    dispatched generator's own procedural one -- see
+    ``crdt_cad.ai.meshy_adapter``'s module docstring for why that whole
+    path is unverified against the live API and always degrades safely
+    to the procedural pipeline below on any failure.
 
-    mesh = None
+    Raises :class:`crdt_cad.ai.validation.GenerationValidationError` if
+    the resulting mesh fails pre-commit validation (rule 1: never
+    silently inject a broken mesh) -- callers (the REST endpoint) turn
+    this into a typed, visible error response.
+    """
+    generator_name, spec, source = interpret_prompt(prompt)
+
+    mesh: GeneratedMesh | None = None
     mesh_source = "procedural"
     if meshy_api_key():
         mesh = generate_mesh_via_meshy(prompt)
         if mesh is not None:
             mesh_source = "meshy"
     if mesh is None:
-        mesh = build_house_mesh(spec)
+        mesh = get_generator(generator_name).build(spec)
+
+    relax = generator_name in _RELAXED_VALIDATION_GENERATORS or mesh_source == "meshy"
+    if relax:
+        validation = validate_generated_mesh(mesh, require_watertight=False, require_consistent_winding=False)
+    else:
+        validation = validate_or_raise(mesh)
 
     # Built against a throwaway MeshCRDT (not the live room's document) so
     # every op is minted with a fresh, correctly-ordered OpId from one
@@ -104,10 +129,16 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
 
     return GenerationResult(
         ops=ops,
+        generator_name=generator_name,
         spec=spec,
         interpretation_source=source,
         mesh_source=mesh_source,
         vertex_count=len(mesh.vertices),
         face_count=len(mesh.faces),
         triangle_count=mesh.triangle_count(),
+        validation=validation,
     )
+
+
+def _color_for_material(material: str) -> str:
+    return _MATERIAL_COLORS.get(material, "#b8b2a4")

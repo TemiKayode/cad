@@ -581,11 +581,19 @@ const AI_GENERATOR_ACTOR_ID = "ai_generator_bot";
 let generationInFlight = false;
 const generationStagesSeen = new Set();
 
+// House-specific staging (Phase D7): "walls"/"roof"/"floor" only make
+// sense for the house generator's own material vocabulary
+// (exterior_wall/interior_wall/roof/concrete/<floor material>). Phase
+// G1 added generators whose materials are just "wood"/"stone"/"metal"/
+// etc -- defaulting those to "floor" would be actively misleading (a
+// table has no floor being built), so anything outside the house
+// vocabulary surfaces as its own material name instead.
 function stageForMaterial(material) {
   if (typeof material !== "string") return null;
   if (material.includes("wall")) return "walls";
   if (material === "roof" || material === "concrete") return "roof";
-  return "floor";
+  if (["wood", "marble", "tile", "carpet", "stone"].includes(material)) return "floor";
+  return material || null;
 }
 
 /** Called from applyIncomingOps for every batch while a generation is
@@ -637,6 +645,23 @@ function orbitCameraDuringGeneration() {
   return () => { active = false; };
 }
 
+// Phase G1: generation now dispatches across a whole registry of
+// generators (house, table, chair, box, ...), not just the one house
+// archetype, so the status line can't hardcode HouseSpec's own field
+// names anymore -- a per-generator summary, with a reasonable generic
+// fallback (first few numeric dimension fields) for anything not
+// special-cased here.
+function describeGeneratedSpec(generatorName, spec) {
+  if (generatorName === "house") {
+    return `${spec.bedrooms} bedroom(s), ${spec.floors} floor(s), ${escapeHtml(spec.floor_material)} floor, ${escapeHtml(spec.style)} style`;
+  }
+  const dims = Object.entries(spec)
+    .filter(([key, value]) => typeof value === "number" && key.endsWith("_m"))
+    .slice(0, 4)
+    .map(([key, value]) => `${key.replace(/_m$/, "")}: ${value}m`);
+  return dims.length ? dims.join(", ") : "default dimensions";
+}
+
 async function generateMesh() {
   const prompt = genPromptInput.value.trim();
   if (!prompt) {
@@ -658,21 +683,32 @@ async function generateMesh() {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || `HTTP ${resp.status}`);
+      // `detail` is usually a plain string, but a pre-commit validation
+      // failure (GenerationValidationError, Phase G1 rule 1) returns a
+      // structured object instead ({message, errors, watertight, ...})
+      // so the report's own fields are inspectable, not just a joined
+      // string -- new Error(object) would otherwise stringify to the
+      // useless "[object Object]".
+      const detail = err.detail;
+      const message =
+        typeof detail === "string" ? detail
+        : detail && typeof detail === "object" ? `${detail.message}: ${(detail.errors || []).join("; ")}`
+        : `HTTP ${resp.status}`;
+      throw new Error(message);
     }
     const result = await resp.json();
-    const via = result.interpretation_source === "llm" ? "Claude Fable 5" : "the offline heuristic parser";
+    const via = result.interpretation_source === "llm" ? "Claude Fable 5" : "the offline heuristic dispatcher";
     // mesh_source (Phase 9, unverified against a live Meshy account --
     // see crdt_cad.ai.meshy_adapter's module docstring): "meshy" only
     // when MESHY_API_KEY was set *and* the hosted API actually returned
     // a mesh; any failure there silently falls back to "procedural",
     // same as it always was.
     const meshVia = result.mesh_source === "meshy" ? "Meshy" : "the procedural builder";
+    const validity = result.watertight && result.manifold ? "watertight" : "not fully watertight (see below)";
     showToast(`Built by ${result.actor} -- ${result.vertex_count} vertices, ${result.face_count} faces`, "success");
     genStatus.textContent =
-      `Last generation: ${result.spec.bedrooms} bedroom(s), ${result.spec.floors} floor(s), ` +
-      `${escapeHtml(result.spec.floor_material)} floor, ${escapeHtml(result.spec.style)} style (interpreted via ${via}, ` +
-      `mesh via ${meshVia}, ${result.batches} batch(es)).`;
+      `Last generation: ${escapeHtml(result.generator)} (${describeGeneratedSpec(result.generator, result.spec)}), ` +
+      `${validity}, interpreted via ${via}, mesh via ${meshVia}, ${result.batches} batch(es).`;
   } catch (err) {
     // Danger toast with the server's own reason, an inline Retry (the
     // prompt box is never cleared on failure, so Retry just re-submits

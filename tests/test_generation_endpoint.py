@@ -4,8 +4,14 @@ from fastapi.testclient import TestClient
 
 from crdt_cad.ai.generator import GenerationResult
 from crdt_cad.ai.house_spec import HouseSpec
+from crdt_cad.ai.validation import ValidationReport
 from crdt_cad.server import app as app_module
 from crdt_cad.server.app import app
+
+_EMPTY_VALIDATION = ValidationReport(
+    ok=True, watertight=True, manifold=True, within_bounds=True,
+    vertex_count=0, face_count=0, triangle_count=0, bounding_box=(0.0, 0.0, 0.0),
+)
 
 # `isolated_store` fixture (autouse) lives in tests/conftest.py and applies here too.
 
@@ -94,8 +100,8 @@ def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
     def slow(prompt, *, actor_id="ai_generator_bot"):
         time.sleep(0.3)
         return GenerationResult(
-            ops=[], spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
-            vertex_count=0, face_count=0, triangle_count=0,
+            ops=[], generator_name="house", spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
+            vertex_count=0, face_count=0, triangle_count=0, validation=_EMPTY_VALIDATION,
         )
 
     monkeypatch.setattr(app_module, "generate_mesh_ops", slow)
@@ -108,8 +114,8 @@ def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
 def test_generate_endpoint_returns_422_on_empty_mesh(monkeypatch):
     def empty(prompt, *, actor_id="ai_generator_bot"):
         return GenerationResult(
-            ops=[], spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
-            vertex_count=0, face_count=0, triangle_count=0,
+            ops=[], generator_name="house", spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
+            vertex_count=0, face_count=0, triangle_count=0, validation=_EMPTY_VALIDATION,
         )
 
     monkeypatch.setattr(app_module, "generate_mesh_ops", empty)

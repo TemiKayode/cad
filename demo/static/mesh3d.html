@@ -104,17 +104,19 @@
 
         <div class="section-title"><svg class="icon"><use href="#icon-sparkles"></use></svg>AI Generate</div>
         <div class="tool-row">
-          <input id="genPromptInput" type="text" style="flex:1" placeholder="e.g. a 4 bedroom house with a wooden floor" />
+          <input id="genPromptInput" type="text" style="flex:1" placeholder="e.g. a wooden table, or a 4 bedroom house with a gable roof" />
         </div>
         <div class="tool-row" style="margin-top:6px">
           <button id="genBtn" style="flex:1">Generate</button>
         </div>
         <div class="empty-hint" id="genStatus">
-          Describe a house in plain English. Interpreted by Claude Fable 5
-          into a bounded floor plan (bedrooms/floors/material/style), or by
-          an offline heuristic parser if no API key is configured — then
-          built into a real watertight mesh and synced as CRDT ops, just
-          like any other edit.
+          Describe a house, a piece of furniture (table/chair/shelf), an
+          architectural element (stairs/column/arch/fence/door/window), or
+          a primitive shape (box/cylinder/cone/torus) in plain English.
+          Interpreted by Claude Fable 5 into a bounded specification for
+          the matching generator, or by an offline heuristic dispatcher if
+          no API key is configured — then built into a real watertight
+          mesh and synced as CRDT ops, just like any other edit.
         </div>
 
         <div class="section-title">Selected Face</div>

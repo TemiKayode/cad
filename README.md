@@ -35,7 +35,7 @@ offline to see the **Time-Travel Merge** panel.
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
-| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done** -- Claude Fable 5 prompt interpretation (heuristic fallback, no API key required) + deterministic procedural geometry + optional `pymeshlab` print-repair, injected as batched CRDT ops -- see below for exact scope |
+| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required) + pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched CRDT ops -- see below for exact scope; G2-G7 (scenes, open-vocabulary DSL, iterative editing, eval harness) not started |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
@@ -562,11 +562,11 @@ everyone currently in the room.
 
 ## AI text-to-3D generation (`src/crdt_cad/ai/`)
 
-Type a prompt like *"create a 4 bedroom house with a wooden floor"*
-into the **AI Generate** box on the `/3d` demo, and a real, watertight,
-collaboratively-editable house mesh appears in the scene for everyone
-in the room -- built and synced through the exact same CRDT machinery
-as a hand-placed vertex.
+Type a prompt like *"a wooden dining table"* or *"a 4 bedroom house with
+a gable roof and a garage"* into the **AI Generate** box on the `/3d`
+demo, and a real, watertight, collaboratively-editable mesh appears in
+the scene for everyone in the room -- built and synced through the
+exact same CRDT machinery as a hand-placed vertex.
 
 **Scope, stated honestly up front:** the always-available, fully-tested
 pipeline does *not* run TripoSR, Hunyuan3D, or any other multi-GB GPU
@@ -574,46 +574,142 @@ mesh-diffusion model locally -- this project runs in a sandboxed,
 CPU-only environment with no way to responsibly download, run, or
 verify a several-gigabyte GPU checkpoint. What's built instead is a
 genuinely working split of the same problem into its two real
-sub-problems:
+sub-problems, now (Phase G1, Part 5) generalized from one hardcoded
+archetype to a **registry of generators**:
 
-1. **Language understanding** -- turning "a 4 bedroom house with a
-   wooden floor" into bounded structured parameters (`bedrooms=4`,
-   `floor_material="wood"`, ...) is squarely an LLM-shaped problem, and
-   is where **Claude Fable 5** is actually used
-   (`crdt_cad/ai/interpreter.py`, `_llm_interpret`): `output_config.format`
-   constrains the response to a JSON schema, the model card's
-   server-side refusal-fallback (`betas=["server-side-fallback-2026-06-01"]`
-   + `fallbacks=[{"model": "claude-opus-4-8"}]`) is enabled by default,
-   and `interpret_prompt()` falls back to a pure-regex heuristic parser
-   (`_heuristic_interpret`) on *any* failure -- missing credentials, a
-   network error, a safety refusal, a malformed response. That fallback
-   isn't a rare degraded corner case: it's what actually runs in any
-   environment without `ANTHROPIC_API_KEY` configured (including this
-   one), so the feature is fully functional and fully tested with zero
-   external credentials.
-2. **3D construction** -- this is *not* asked of the model.
-   `procedural_house.py` deterministically builds an actual mesh
-   (floor slab, roof slab, exterior walls, interior partitions sized to
-   the bedroom count) from the interpreted spec: every vertex, edge,
-   and face loop is computed geometry, not a hallucinated guess, and is
-   watertight and axis-aligned-planar by construction (see
-   `tests/test_procedural_house.py`, which checks exactly that -- no
-   duplicate vertices, no zero-length edges, every face genuinely
-   planar).
+1. **Language understanding and dispatch** -- turning "a wooden dining
+   table" into *which generator* (table, not chair or house) plus that
+   generator's own bounded structured parameters (`width_m=1.4`, ...)
+   is squarely an LLM-shaped problem, and is where **Claude Fable 5** is
+   actually used (`crdt_cad/ai/interpreter.py`, `_llm_interpret`): the
+   registry is presented to the model as a **tool catalog** -- one tool
+   per generator, each with its own spec's JSON schema, via real
+   `tools`/`tool_choice` Anthropic tool-use, not one hand-widened union
+   schema that would need editing every time a generator is added. The
+   model's own server-side refusal-fallback
+   (`betas=["server-side-fallback-2026-06-01"]` +
+   `fallbacks=[{"model": "claude-opus-4-8"}]`) is enabled by default,
+   and `interpret_prompt()` falls back to a keyword dispatcher
+   (`_heuristic_interpret`, `registry.dispatch_by_keyword`) on *any*
+   failure -- missing credentials, a network error, a safety refusal, a
+   malformed response. That fallback isn't a rare degraded corner case:
+   it's what actually runs in any environment without
+   `ANTHROPIC_API_KEY` configured (including this one), so the feature
+   is fully functional and fully tested with zero external credentials
+   -- for the house generator specifically the heuristic also does real
+   field extraction (bedrooms/floors/material/style/roof/garage/area,
+   unchanged from before Phase G1); every other generator gets its
+   spec's bounded defaults without an API key, a real working object
+   with reduced vocabulary, never a broken result.
+2. **3D construction** -- this is *not* asked of the model, for any
+   generator. Every entry in `crdt_cad/ai/registry.py`'s `REGISTRY` is a
+   `(bounded pydantic spec, deterministic build function)` pair: every
+   vertex, edge, and face loop is computed geometry, never a
+   hallucinated guess.
 
-`generator.py` orchestrates prompt -> spec -> mesh -> a **chronological
-batch of CRDT ops**, minted under a dedicated `ai_generator_bot` actor
-identity via its own `LamportClock`, built against a throwaway
-`MeshCRDT` scratch instance so every `OpId` is correctly ordered before
-any of it touches a live room:
+### The generator registry: from one archetype to a vocabulary (Phase G1)
+
+Fourteen generators as of this phase, each in `crdt_cad/ai/generators/`,
+each an assembly of the shared primitive builders in `mesh_builder.py`
+(`add_box`/`add_cylinder`/`add_cone`/`add_torus`/`add_extruded_polygon`/
+`add_extruded_profile_xy`) -- building each primitive as its own closed,
+independently-watertight solid means an *assembly* (a table's top plus
+four legs, a fence's posts plus rails) validates as one watertight mesh
+with no boolean union needed, since `trimesh.Trimesh.is_watertight` is a
+global edge-count property that several disjoint closed bodies already
+satisfy:
+
+- **`house`** -- the original generator (`procedural_house.py`), now
+  enriched: `roof_type` (`flat`/`gable`/`hip`, real pitched geometry on
+  the top floor, not just a slab), `garage` (an attached box),
+  `bedrooms_per_floor` (each floor its own footprint, not just its own
+  bedroom count -- "stories with distinct footprints"), `floor_area_sq_m`
+  (uniformly scales the room grid so "a 30 square meter cabin" is
+  honored to the square metre, not just a bedroom count), `wall_material`/
+  `roof_material` (previously hardcoded), and `front_door`/
+  `front_windows` -- real CSG-cut openings (see below) on the ground
+  floor's front wall specifically, not yet every wall on every floor
+  (documented honestly in `build_house_mesh`'s own docstring, not
+  silently pretended).
+- **Primitives** (`generators/primitives.py`): `box`, `cylinder`, `cone`,
+  `torus` -- explicit dimensions in metres, segment counts bounded per
+  spec.
+- **Furniture** (`generators/furniture.py`): `table` (four legs + top),
+  `chair` (four legs + seat + optional backrest -- `back_height_m=0`
+  is a real, valid backless stool, matching its own "stool" dispatch
+  keyword), `shelf` (two side panels + back panel + evenly spaced
+  shelves).
+- **Architectural elements** (`generators/architectural.py`): `stairs`
+  (each step a solid box down to the ground), `column` (base plinth +
+  shaft + capital, three stacked cylinders), `arch` (a genuinely
+  non-convex annulus-segment profile extruded into a solid archway
+  shape -- see below for why that specific shape is what caught a real
+  triangulation bug), `fence` (evenly spaced posts + horizontal rails).
+- **Wall openings** (`generators/wall_opening.py`): `door`, `window` --
+  the one pair that needs a real boolean cut, not just an assembly of
+  disjoint solids, since a door is a *hole through* a wall. Uses
+  `trimesh`'s `manifold3d`-backed boolean engine (a pip-installable,
+  compiled CSG library, no external CAD program) to subtract an opening
+  box from a wall box, extended slightly past both wall faces so the
+  cut boundary is never exactly coplanar with the wall's own faces (a
+  classic degenerate-triangle trap in every CSG engine). `cut_wall_openings`
+  generalizes to *multiple* openings cut from one wall in one pass
+  (a door plus several windows), which is what the house generator's
+  `front_door`/`front_windows` actually calls.
+
+### Pre-commit validation: watertight/manifold/bounds, never a silent bad mesh
+
+Every generator's output goes through `crdt_cad/ai/validation.py` before
+it's ever turned into ops: bounding-box and vertex/face-count ceilings
+(catches a runaway spec before it reaches the browser), a real
+`trimesh`-backed watertightness check (no boundary edges -- an open
+hole in the solid), a winding-consistency check (no non-manifold
+topology), and a degenerate-triangle check (zero-area). A failure
+raises `GenerationValidationError` (typed, not a bare exception),
+which `POST /api/mesh/{room_id}/generate` turns into a `422` whose
+`detail` is the full structured report (`errors`, `watertight`,
+`manifold`, `within_bounds`), not just a joined string -- the AI
+Generate panel renders it directly rather than a generic failure
+message. The **house generator is the one documented exception**: it
+predates this module, and its own docstring already describes why it
+isn't (and wasn't designed to be) strictly watertight or
+winding-consistent -- interior-wall "T-junctions" against the floor/roof
+slabs, an accepted, pre-existing gap (confirmed pre-Phase-5, not a
+regression: the exact same inconsistency reproduces against the
+pre-Phase-5 code). `generator.py` relaxes both checks specifically for
+`"house"` (and for a hosted-API mesh from Meshy, whose geometry isn't
+this project's own code); every generator introduced in Phase G1 is
+held to the full, strict bar.
+
+**A real bug this caught during development, not a hypothetical:** the
+arch generator's silhouette is a genuinely non-convex polygon (an
+annulus segment), and a hand-rolled fan triangulation from one vertex --
+exact for a convex polygon, wrong for a non-convex one -- produced
+degenerate triangles. The fix was switching `add_extruded_polygon`/
+`add_extruded_profile_xy` to delegate real triangulation to
+`trimesh.creation.extrude_polygon` (via `shapely`), which handles convex
+and non-convex simple polygons correctly; `tests/test_ai_mesh_builder.py`
+pins an explicit non-convex L-shape regression case so this can't
+silently regress. **A second real bug**, also caught by the validation
+module rather than assumed away: `add_box`/`add_cylinder`/`add_cone`'s
+initial winding was uniformly inverted (confirmed via `trimesh`'s
+`is_volume` property, not just `is_watertight` -- a mesh can be
+watertight and still have every normal facing inward), which is exactly
+why `is_volume`/orientation is checked explicitly rather than trusting
+`is_watertight` alone.
+
+`generator.py` orchestrates prompt -> `(generator, spec)` -> mesh ->
+validation -> a **chronological batch of CRDT ops**, minted under a
+dedicated `ai_generator_bot` actor identity via its own `LamportClock`,
+built against a throwaway `MeshCRDT` scratch instance so every `OpId`
+is correctly ordered before any of it touches a live room:
 
 - every vertex becomes a `vertices` (`LWWMap`) write,
 - every face becomes a `face_index` add plus an ordered `faces` (`RGA`)
   insert per boundary vertex,
-- the floor face(s) get `face_prop` writes for `material` and a
-  matching `color`, which `mesh3d.js` reads to render the AI-tagged
-  floor in its actual material color instead of the default per-face
-  hash palette.
+- every face with a material gets `face_prop` writes for `material` and
+  a matching `color`, which `mesh3d.js` reads to render it in its
+  actual material color instead of the default per-face hash palette.
 
 **The batching answer, concretely:** `POST /api/mesh/{room_id}/generate`
 (`app.py`) runs `generate_mesh_ops` in a worker thread via
@@ -624,9 +720,14 @@ in fixed-size chunks (150 ops by default,
 `CRDT_CAD_GENERATION_BATCH_SIZE`), `await`ing `asyncio.sleep(0)` between
 each chunk so one large generation never monopolizes the event loop or
 arrives at clients as a single giant WebSocket frame; clients instead
-watch the house build itself in visible stages. A malformed-geometry or
-empty result returns `422`; a timeout returns `504`; both are covered
-in `tests/test_generation_endpoint.py`.
+watch the object build itself in visible stages. A validation failure
+returns `422` with the structured report above; a malformed-geometry or
+empty result also returns `422`; a timeout returns `504`; all covered
+in `tests/test_generation_endpoint.py`. Live-verified in a real browser
+across five generator types (house, table, box, door, chair) with a
+screenshot confirming the door generator's CSG-cut opening actually
+rendered as a real hole through the wall, not just validated as one on
+paper.
 
 **3D-print preparation** (`mesh_repair.py`) is a separate, opt-in path
 -- *not* part of the CRDT-injection pipeline, per the brief's own
