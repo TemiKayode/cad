@@ -70,6 +70,20 @@ The actual *deliverable* of drafting work:
 - Multiple sheets per document; the sheet list lives in the document
   CRDT (LWW per-sheet prop bags — concurrent sheet edits merge
   field-wise).
+- **High-resolution raster export (4K and custom).** Today's PNG export
+  is `canvas.toBlob()` at *screen* resolution (Phase 15) — fine for a
+  quick share, not for print or marketing renders. Add a resolution
+  picker (1×/2×/4K 3840×2160/custom, capped) to both editors: 2D
+  re-renders the scene to an offscreen canvas at the target size (the
+  render path is already resolution-independent world-space); 3D
+  renders one frame to a sized `WebGLRenderTarget`/offscreen canvas and
+  reads it back. Both renderers are already DPR-aware on-screen
+  (`sketch.js` scales by `devicePixelRatio`; `mesh3d.js` calls
+  `renderer.setPixelRatio`), so this is an export-path change only.
+  Verify actual output dimensions and a pixel-sample in e2e; document
+  the GPU-memory cap reasoning. While here: extend the D8-style
+  viewport audit to 3840×2160 (it currently stops at 1920) and fix
+  anything that breaks at 4K window sizes.
 
 ## Phase C4 — Interop: meet the world's formats
 
