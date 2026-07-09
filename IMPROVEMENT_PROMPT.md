@@ -1,6 +1,6 @@
 # Improvement brief: take crdt-cad from verified prototype to production-grade
 
-This is **Part 1 of a five-part plan**: it hardens the platform — security,
+This is **Part 1 of a seven-part plan**: it hardens the platform — security,
 CI, durability, scaling, correctness (phases 1–9 below). **Part 2 lives in
 `FEATURE_IMPROVEMENT_PROMPT.md`** (phases 10–17): the product features that
 make the tool genuinely usable by engineers, designers, and casual users.
@@ -11,14 +11,25 @@ plus the production deployment/ops story (TLS, backups, monitoring,
 published image). **Part 5 lives in `AI_GENERATION_PROMPT.md`** (phases
 G1–G7): the AI text-to-3D pipeline taken from one honest archetype to a
 world-class standard — generator registry, scene composition, sandboxed
-geometry DSL, iterative editing, and a measured eval harness.
+geometry DSL, iterative editing, and a measured eval harness. **Part 6
+lives in `PLATFORM_PROMPT.md`** (phases P1–P7): real identity — accounts,
+per-person permissions, orgs, SSO, collaboration depth (3D comments,
+mentions, notifications, activity), billing readiness, and the
+trust/legal/lifecycle layer. **Part 7 lives in `PRO_CAD_PROMPT.md`**
+(phases C1–C8): professional CAD and reach — modify tools (trim/offset/
+fillet/mirror/arrays), arcs/splines, sheets + title blocks + PDF, interop
+(glTF/3MF/STEP import), components with instances, the staged 3D long
+bet (mesh booleans now, B-Rep design + prototype), mobile/touch + PWA,
+and large-document scale.
 
-**Status (2026-07-09): Parts 1–3 are fully implemented and committed**
-(see git log — phases 1–17 and D1–D8). Part 4 is nearly done: Phase 18 is
-committed; Phase 19's work (19.1–19.6) exists in the working tree but is
-not yet fully verified/committed. Part 5 is not started. An agent picking
-this up should audit `git log` and `git status` first and work only on
-what remains, keeping the phase-by-phase commit discipline.
+**Status (2026-07-09, later):** Parts 1–4 are fully implemented and
+committed (phases 1–19, D1–D8 — see git log). Part 5 is **in progress**
+(G1 generator-registry work in the working tree). Parts 6 and 7 are not
+started. Recommended order: finish Part 5, then Part 6 (every
+monetization path depends on identity), then Part 7 — deviating is fine
+where dependencies allow. An agent picking this up should audit
+`git log` and `git status` first — parallel sessions have worked this
+tree before — and keep the one-commit-per-phase discipline.
 
 ## Context
 
