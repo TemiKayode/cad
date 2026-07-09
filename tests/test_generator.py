@@ -107,6 +107,53 @@ def test_generation_ops_are_chronologically_increasing_per_actor():
     assert len(set(counters)) == len(counters)  # every minted OpId is unique
 
 
+def test_generate_mesh_ops_scene_produces_object_ops_grouped_by_object():
+    """Phase G2: a scene prompt sets generator_name == "scene" and
+    populates ``object_ops`` (one sub-list per placed object, summing to
+    ``ops``) so the server can commit each object as its own batch."""
+    result = generate_mesh_ops("a table with four chairs around it")
+    assert result.generator_name == "scene"
+    assert result.object_ops is not None
+    assert len(result.object_ops) == 5  # 1 table + 4 chairs
+    assert sum(len(group) for group in result.object_ops) == len(result.ops)
+    assert result.validation.ok
+
+
+def test_non_scene_generation_leaves_object_ops_none():
+    result = generate_mesh_ops("a wooden chair")
+    assert result.generator_name != "scene"
+    assert result.object_ops is None
+
+
+def test_scene_faces_are_tagged_with_their_scene_object_index():
+    result = generate_mesh_ops("a table with four chairs around it")
+
+    room_clock = LamportClock(actor="__server__:mesh:test-room")
+    doc = MeshCRDT(room_clock)
+    for op in result.ops:
+        doc.apply(op)
+
+    scene_object_values = {
+        doc.face_props_dict(face_id).get("scene_object")
+        for face_id in doc.face_loops()
+    }
+    assert scene_object_values == {"0", "1", "2", "3", "4"}
+
+
+def test_scene_ops_apply_cleanly_and_produce_one_watertight_merged_mesh():
+    result = generate_mesh_ops("a row of three shelves")
+
+    room_clock = LamportClock(actor="__server__:mesh:test-room")
+    doc = MeshCRDT(room_clock)
+    for op in result.ops:
+        doc.apply(op)
+
+    assert len(doc.vertex_positions()) == result.vertex_count
+    assert len(doc.face_loops()) == result.face_count
+    assert result.validation.watertight
+    assert result.validation.manifold
+
+
 def test_ops_batch_reconstructs_the_same_mesh_as_build_house_mesh_directly():
     from crdt_cad.ai.house_spec import HouseSpec
     from crdt_cad.ai.procedural_house import build_house_mesh

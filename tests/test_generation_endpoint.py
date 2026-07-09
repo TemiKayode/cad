@@ -85,6 +85,55 @@ def test_generate_endpoint_batches_large_meshes(monkeypatch):
     assert body["batches"] == -(-body["op_count"] // 5)  # ceil division
 
 
+def test_generate_endpoint_scene_prompt_populates_the_room_object_by_object():
+    """Phase G2: each scene object is forced into its own batch
+    (Room.commit_ops_grouped_batched), regardless of the default batch
+    size, so `batches` is at least the object count."""
+    client = _client()
+    resp = client.post(
+        "/api/mesh/genroom-scene/generate",
+        json={"prompt": "a table with four chairs around it"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["generator"] == "scene"
+    assert body["spec"]["objects"][0]["generator"] == "table"
+    assert body["vertex_count"] > 0
+    assert body["face_count"] > 0
+    assert body["batches"] >= 5  # 1 table + 4 chairs, one batch boundary each
+
+    export = client.get("/api/mesh/genroom-scene/export/json").json()
+    assert len(export["face_index"]["entries"]) == body["face_count"]
+
+
+def test_generate_endpoint_scene_batches_break_at_object_boundaries(monkeypatch):
+    """Even with a batch size larger than any single object's own op
+    count, every object still gets its own batch -- proving the boundary
+    is forced by object membership, not incidentally by size."""
+    monkeypatch.setattr(app_module, "GENERATION_OPS_BATCH_SIZE", 100_000)
+    client = _client()
+    with client.websocket_connect("/ws/mesh/genroom-scene2") as ws:
+        ws.send_json({"type": "hello", "actor": "watcher"})
+        ws.receive_json()  # initial snapshot
+
+        resp = client.post(
+            "/api/mesh/genroom-scene2/generate",
+            json={"prompt": "a table with four chairs around it"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["batches"] == 5
+
+        seen_scene_objects = set()
+        for _ in range(body["batches"]):
+            msg = ws.receive_json()
+            assert msg["type"] == "ops"
+            for op in msg["ops"]:
+                if op["target"] == "face_prop" and op["payload"]["k"] == "scene_object":
+                    seen_scene_objects.add(op["payload"]["v"])
+        assert seen_scene_objects == {"0", "1", "2", "3", "4"}
+
+
 def test_generate_endpoint_returns_422_on_generation_failure(monkeypatch):
     def boom(prompt, *, actor_id="ai_generator_bot"):
         raise ValueError("simulated malformed geometry")

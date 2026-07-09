@@ -35,7 +35,7 @@ offline to see the **Time-Travel Merge** panel.
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
-| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required) + pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched CRDT ops -- see below for exact scope; G2-G7 (scenes, open-vocabulary DSL, iterative editing, eval harness) not started |
+| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G2 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G3-G7 (open-vocabulary DSL, iterative editing/undo, report-card UI, eval harness, hosted ML tier) not started |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
@@ -728,6 +728,119 @@ across five generator types (house, table, box, door, chair) with a
 screenshot confirming the door generator's CSG-cut opening actually
 rendered as a real hole through the wall, not just validated as one on
 paper.
+
+### Scene composition: SceneSpec + a deterministic layout solver (Phase G2)
+
+A single generator call handles "a wooden dining table," but not "a
+table with four chairs around it" -- that's *multiple* objects in a
+stated spatial relationship, and Phase G2 adds exactly that without
+bending the "the LLM never emits geometry" rule: Claude (or the
+heuristic fallback) only ever names *which* generators, *how many*, and
+states the relation in plain terms (`around`/`on_top_of`/`row`/`beside`/
+`none`); turning that into real `(x, y, z)` coordinates is ordinary
+deterministic code in `scene_layout.py`, never the model.
+
+- **`scene.py`**: `SceneSpec` is a bounded list (1-10) of
+  `SceneObjectSpec` (generator name, its own nested spec re-validated
+  against that generator's real pydantic model -- not accepted as an
+  opaque dict, so a malformed nested spec fails with the same clear
+  error a standalone generation would; a relation; a `target_index`
+  into an *earlier* entry; a `count` 1-12 for "four chairs"-style
+  repetition; a `spacing_m` for rows). A `model_validator` rejects
+  forward/self references and a relation without a target at
+  construction time, before any geometry is built. `expand_scene`
+  builds every object's own mesh (dispatching `count` into that many
+  copies, all sharing one relation/target so the solver can distribute
+  them together) but positions nothing -- building what vs. placing it
+  are kept as separately-testable steps.
+- **`scene_layout.py`**: `solve_layout` computes one translation per
+  object from its *actual measured bounding box*, never an assumed
+  size -- ground-plane snapping (every object's Y sets its AABB's
+  bottom to 0, except `on_top_of`, which snaps to the **target's own
+  measured top after its own placement**, not a guessed height),
+  `around` (the `count` copies distributed evenly around the target's
+  center at a radius derived from both AABBs so they clear the target
+  regardless of its actual size), `row` (evenly spaced along X by
+  `spacing_m`, using each object's own measured width), `beside`
+  (offset from the target's measured edge plus a margin), and `none`
+  (a shared left-to-right placement cursor, so independent objects
+  never collide with each other by construction). A final bounded
+  (6-pass) pairwise-AABB-overlap sweep pushes apart anything from
+  *different* relation groups that could still end up overlapping in
+  the XZ plane (e.g. an `around` circle swinging into a later
+  standalone object's path), skipping pairs that are intentionally
+  related (an `on_top_of` object is *supposed* to overlap its target
+  in Y). `merge_placed_objects` then combines every positioned object
+  into one mesh with globally unique vertex/face ids (each generator's
+  own `build` restarts its own ids at v1/f1, so a shared `MeshBuilder`
+  is what makes a multi-object scene collision-free), returning
+  `per_object_ids` -- which ids in the merged mesh belong to which
+  input object, in build order.
+- **Provenance, ahead of Phase G4's fuller system**: `generator.py`'s
+  `_generate_scene_ops` uses `per_object_ids` to tag every face with a
+  `set_face_prop(face_id, "scene_object", "<index>")` CRDT op alongside
+  the existing `material`/`color` props -- `MeshCRDT.face_props` is a
+  genuine per-face map (unlike `GeneratedMesh.face_materials`, a single
+  string per face), so it already supports all three at once with no
+  schema change.
+- **Visible, object-by-object staging**: the same `per_object_ids`
+  grouping also drives `GenerationResult.object_ops` -- `ops` grouped
+  by object rather than one flat list. `Room.commit_ops_grouped_batched`
+  (new in `app.py`, alongside the existing `commit_ops_batched`) forces
+  a batch boundary between every object *in addition to* the usual
+  size-based chunking within one, so a "table with four chairs around
+  it" visibly places one object, then the next, regardless of how small
+  any single object's own op count is -- extending the Phase D7 staged-
+  build UI pattern. `mesh3d.js`'s `noteGenerationBatch` tracks distinct
+  `scene_object` values seen across arriving batches for an honest
+  "Placing object N..." progress line (a real count of batches that have
+  actually arrived over the WS relay, not a fake timer), and
+  `describeGeneratedSpec` gained a `"scene"` branch (object counts by
+  generator, e.g. "2 object group(s): table, 4x chair") instead of
+  falling through to the single-object dimension-guessing fallback.
+- **Heuristic (no-API-key) scene parsing** (`interpreter.py`,
+  `_heuristic_scene_interpret`): a handful of plain-English patterns --
+  "a table with four chairs around it," "four chairs around a table,"
+  "a box on top of a table," "a row of three shelves" -- parsed with
+  regex and mapped to generator names through the *same* keyword table
+  `dispatch_by_keyword` already uses (so scene parsing never maintains
+  its own separate noun list), with word-or-digit counts
+  (`"four"`/`"4"`) clamped to the same 1-12 range the spec enforces. A
+  prompt that doesn't match any of these shapes just falls through to
+  ordinary single-object dispatch -- reduced vocabulary, never a
+  broken or silently-wrong result. The LLM path gets a `scene` tool
+  added to its catalog (`_SCENE_TOOL`, `SceneSpec.model_json_schema()`
+  as the input schema) alongside every generator's own tool, with the
+  system prompt telling Claude when to reach for it.
+- **Known scope limitation, found during live verification and stated
+  here rather than glossed over**: `solve_layout` only reasons about
+  the objects in *one* generation call -- it has no visibility into
+  geometry a room already contains from an earlier generation or
+  manual edits, so a new scene's placement can end up spatially
+  overlapping pre-existing room content (this is *not* a validation
+  gap: `validate_or_raise` still runs and still catches genuinely
+  malformed geometry -- it's a layout gap, positioning against an
+  empty-room assumption). Scoped out of G2 deliberately rather than
+  half-solved; revisit if/when a phase needs multi-generation spatial
+  awareness.
+
+**Live-verified in a real browser** across all four relations: "a table
+with four chairs around it" (four chairs at equal radius around the
+table, ground-snapped, ai_generator_bot-built, 232 vertices/174 faces,
+watertight), "a box on top of a table" (the box's bottom sits exactly
+on the table's measured top), and "a row of three shelves" (evenly
+spaced, no overlap) -- each confirmed both via screenshot and via the
+status line's honest `N object group(s)` / `N batch(es)` summary.
+19 new tests in `tests/test_ai_scene.py` (spec validation,
+`expand_scene`'s target remapping when a `count>1` object is itself a
+target, every relation's placement math, the cross-group overlap
+sweep, `merge_placed_objects`'s id-uniqueness and translation
+correctness) plus heuristic-parsing and LLM-tool-dispatch tests in
+`test_interpreter.py`, scene-specific `generate_mesh_ops`/endpoint
+tests in `test_generator.py`/`test_generation_endpoint.py` (object-op
+grouping, `scene_object` tagging, forced per-object batch boundaries
+even with an oversized batch-size ceiling) -- 500+ tests green,
+zero regressions.
 
 **3D-print preparation** (`mesh_repair.py`) is a separate, opt-in path
 -- *not* part of the CRDT-injection pipeline, per the brief's own

@@ -23,6 +23,8 @@ from crdt_cad.ai.interpreter import interpret_prompt
 from crdt_cad.ai.mesh_types import GeneratedMesh
 from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy, meshy_api_key
 from crdt_cad.ai.registry import get_generator
+from crdt_cad.ai.scene import SceneSpec, expand_scene, merge_placed_objects
+from crdt_cad.ai.scene_layout import solve_layout
 from crdt_cad.ai.validation import ValidationReport, validate_generated_mesh, validate_or_raise
 from crdt_cad.crdt.clock import LamportClock
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
@@ -64,6 +66,11 @@ class GenerationResult:
     face_count: int
     triangle_count: int
     validation: ValidationReport
+    # Populated only for ``generator_name == "scene"``: `ops` grouped by
+    # scene object, in build order, so the server can commit each object
+    # as its own batch -- a scene appearing object by object rather than
+    # all at once. ``None`` for an ordinary single-object generation.
+    object_ops: list[list[MeshOp]] | None = None
 
 
 def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> GenerationResult:
@@ -88,6 +95,9 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
     this into a typed, visible error response.
     """
     generator_name, spec, source = interpret_prompt(prompt)
+
+    if generator_name == "scene":
+        return _generate_scene_ops(spec, source, actor_id=actor_id)
 
     mesh: GeneratedMesh | None = None
     mesh_source = "procedural"
@@ -133,6 +143,60 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
         spec=spec,
         interpretation_source=source,
         mesh_source=mesh_source,
+        vertex_count=len(mesh.vertices),
+        face_count=len(mesh.faces),
+        triangle_count=mesh.triangle_count(),
+        validation=validation,
+    )
+
+
+def _generate_scene_ops(scene: SceneSpec, source: str, *, actor_id: str) -> GenerationResult:
+    """Phase G2 scene path: build every object's own mesh, position them
+    with the deterministic layout solver (never the LLM), merge into one
+    globally-id-unique mesh, then mint ops *grouped by object* -- both
+    ``ops`` (the flat list, for callers that don't care) and
+    ``object_ops`` (one sub-list per object, for the server to commit as
+    separate batches so the scene appears object by object)."""
+    expanded = expand_scene(scene)
+    translations = solve_layout(expanded)
+    mesh, per_object_ids = merge_placed_objects(expanded, translations)
+
+    relax = any(obj.generator in _RELAXED_VALIDATION_GENERATORS for obj in expanded)
+    if relax:
+        validation = validate_generated_mesh(mesh, require_watertight=False, require_consistent_winding=False)
+    else:
+        validation = validate_or_raise(mesh)
+
+    clock = LamportClock(actor=actor_id)
+    scratch = MeshCRDT(clock)
+    ops: list[MeshOp] = []
+    object_ops: list[list[MeshOp]] = []
+
+    for obj_index, (vertex_ids, face_ids) in enumerate(per_object_ids):
+        this_object_ops: list[MeshOp] = []
+        for vertex_id in vertex_ids:
+            this_object_ops.append(scratch.add_vertex(vertex_id, mesh.vertices[vertex_id]))
+        for face_id in face_ids:
+            loop = mesh.faces[face_id]
+            this_object_ops.extend(scratch.add_face(face_id, loop))
+            material = mesh.face_materials.get(face_id, "")
+            if material:
+                this_object_ops.append(scratch.set_face_prop(face_id, "material", material))
+                this_object_ops.append(scratch.set_face_prop(face_id, "color", _color_for_material(material)))
+            this_object_ops.append(scratch.set_face_prop(face_id, "scene_object", str(obj_index)))
+            for i in range(len(loop)):
+                a, b = loop[i], loop[(i + 1) % len(loop)]
+                this_object_ops.append(scratch.add_edge(a, b))
+        object_ops.append(this_object_ops)
+        ops.extend(this_object_ops)
+
+    return GenerationResult(
+        ops=ops,
+        object_ops=object_ops,
+        generator_name="scene",
+        spec=scene,
+        interpretation_source=source,
+        mesh_source="procedural",
         vertex_count=len(mesh.vertices),
         face_count=len(mesh.faces),
         triangle_count=mesh.triangle_count(),

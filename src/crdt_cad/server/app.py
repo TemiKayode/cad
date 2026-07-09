@@ -443,6 +443,31 @@ class Room:
             await _check_and_broadcast_mesh_validity(self, touched_topology)
         return batches
 
+    async def commit_ops_grouped_batched(self, object_groups: list[list], actor: str, batch_size: int = 150) -> int:
+        """Like :meth:`commit_ops_batched`, but forces a batch boundary
+        between every group in `object_groups` (in addition to the usual
+        size-based chunking within a group) -- Phase G2's per-object
+        staging for scene generation, so a "table with four chairs"
+        arrives as one batch per object regardless of how small each
+        object's own op count is, while still persisting only once at
+        the end rather than once per object."""
+        batches = 0
+        touched_topology = False
+        for group in object_groups:
+            for i in range(0, len(group), max(1, batch_size)):
+                chunk = group[i : i + batch_size]
+                for op in chunk:
+                    self.doc.apply(op)
+                    touched_topology = touched_topology or _touches_mesh_topology(op)
+                await self.broadcast({"type": "ops", "ops": [op.to_dict() for op in chunk], "from": actor})
+                self.mark_dirty()
+                batches += 1
+                await asyncio.sleep(0)
+        if any(object_groups):
+            await self.persist_async()
+            await _check_and_broadcast_mesh_validity(self, touched_topology)
+        return batches
+
 
 class RoomManager:
     def __init__(
@@ -1088,7 +1113,15 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
     if not result.ops:
         raise HTTPException(status_code=422, detail="generation produced an empty mesh (malformed geometry)")
 
-    batches = await room.commit_ops_batched(result.ops, actor=DEFAULT_ACTOR_ID, batch_size=GENERATION_OPS_BATCH_SIZE)
+    if result.object_ops is not None:
+        # Scene generation (Phase G2): force a batch boundary between
+        # objects so a "table with four chairs around it" visibly builds
+        # object by object rather than arriving as one big flush.
+        batches = await room.commit_ops_grouped_batched(
+            result.object_ops, actor=DEFAULT_ACTOR_ID, batch_size=GENERATION_OPS_BATCH_SIZE
+        )
+    else:
+        batches = await room.commit_ops_batched(result.ops, actor=DEFAULT_ACTOR_ID, batch_size=GENERATION_OPS_BATCH_SIZE)
     logger.info(
         "room mesh/%s: generated %d ops (%d vertices, %d faces) from prompt %r via %s (%s/%s), sent in %d batches",
         room_id, len(result.ops), result.vertex_count, result.face_count, req.prompt,

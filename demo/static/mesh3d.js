@@ -580,6 +580,12 @@ const genStatus = document.getElementById("genStatus");
 const AI_GENERATOR_ACTOR_ID = "ai_generator_bot";
 let generationInFlight = false;
 const generationStagesSeen = new Set();
+// Phase G2: a scene's ops carry a "scene_object" face_prop (the index of
+// the object each face belongs to) on every face, forced into its own
+// batch per object server-side (Room.commit_ops_grouped_batched) -- so
+// counting distinct values seen so far is an honest "objects placed so
+// far" progress count, not a fake timer.
+const generationSceneObjectsSeen = new Set();
 
 // House-specific staging (Phase D7): "walls"/"roof"/"floor" only make
 // sense for the house generator's own material vocabulary
@@ -611,8 +617,16 @@ function noteGenerationBatch(ops) {
       const stage = stageForMaterial(op.payload.v);
       if (stage) generationStagesSeen.add(stage);
     }
+    if (op.target === "face_prop" && op.payload.k === "scene_object") {
+      generationSceneObjectsSeen.add(op.payload.v);
+    }
   }
-  genStatus.textContent = `Building ${[...generationStagesSeen].join(", ")}...`;
+  if (generationSceneObjectsSeen.size > 0) {
+    const stages = [...generationStagesSeen].join(", ");
+    genStatus.textContent = `Placing object ${generationSceneObjectsSeen.size}${stages ? ` (${stages})` : ""}...`;
+  } else {
+    genStatus.textContent = `Building ${[...generationStagesSeen].join(", ")}...`;
+  }
 }
 
 /** ~15 degree orbit around the current camera-to-target radius while
@@ -655,6 +669,14 @@ function describeGeneratedSpec(generatorName, spec) {
   if (generatorName === "house") {
     return `${spec.bedrooms} bedroom(s), ${spec.floors} floor(s), ${escapeHtml(spec.floor_material)} floor, ${escapeHtml(spec.style)} style`;
   }
+  if (generatorName === "scene") {
+    const counts = new Map();
+    for (const obj of spec.objects || []) {
+      counts.set(obj.generator, (counts.get(obj.generator) || 0) + (obj.count || 1));
+    }
+    const parts = [...counts.entries()].map(([name, count]) => (count > 1 ? `${count}x ${escapeHtml(name)}` : escapeHtml(name)));
+    return `${(spec.objects || []).length} object group(s): ${parts.join(", ")}`;
+  }
   const dims = Object.entries(spec)
     .filter(([key, value]) => typeof value === "number" && key.endsWith("_m"))
     .slice(0, 4)
@@ -672,6 +694,7 @@ async function generateMesh() {
   genBtn.textContent = "Generating…";
   generationInFlight = true;
   generationStagesSeen.clear();
+  generationSceneObjectsSeen.clear();
   genPromptInput.classList.add("ai-thinking");
   genStatus.textContent = "Interpreting your prompt...";
   const stopOrbit = orbitCameraDuringGeneration();

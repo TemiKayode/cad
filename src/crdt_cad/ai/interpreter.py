@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from crdt_cad.ai.house_spec import HouseSpec
 from crdt_cad.ai.registry import dispatch_by_keyword, get_generator, tool_catalog
+from crdt_cad.ai.scene import SceneObjectSpec, SceneSpec
 
 logger = logging.getLogger("crdt_cad.ai.interpreter")
 
@@ -46,15 +47,113 @@ _SYSTEM_PROMPT = (
     "mentioned rather than leaving a field out. If the description doesn't "
     "clearly match any specific generator (furniture, architectural element, "
     "primitive shape), use the 'house' generator as the default -- it is the "
-    "most general fallback for an architectural request."
+    "most general fallback for an architectural request. If the description "
+    "asks for *multiple objects arranged relative to each other* (e.g. 'a "
+    "table with four chairs around it', 'a row of three shelves', 'a lamp on "
+    "the table'), use the 'scene' tool instead of a single-object generator "
+    "-- list each object with a plain-language relation ('around', "
+    "'on_top_of', 'row', 'beside', or 'none') and, for 'around'/'on_top_of'/"
+    "'beside', a target_index referencing an earlier object in the same list."
 )
+
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "a": 1, "an": 1, "a couple of": 2, "couple of": 2, "a few": 3, "few": 3,
+}
+
+_COUNT_PATTERN = r"(\d+|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")"
+
+
+def _parse_count(token: str) -> int:
+    token = token.strip().lower()
+    return int(token) if token.isdigit() else _NUMBER_WORDS[token]
+
+
+def _keyword_generator_name(word: str) -> str | None:
+    """Maps a plain noun (already singularized by the caller's regex,
+    e.g. "chair" out of "chairs") to a registry generator name via the
+    same keyword table `dispatch_by_keyword` uses, so scene parsing
+    never hardcodes its own separate noun list."""
+    entry = dispatch_by_keyword(word)
+    return entry.name if entry else None
+
+
+_SCENE_TOOL = {
+    "name": "scene",
+    "description": (
+        "Compose a scene of multiple objects arranged relative to each "
+        "other -- a table with chairs around it, a lamp on a shelf, a row "
+        "of columns. Pick generator names from the registry's own tools "
+        "(table, chair, shelf, box, house, ...); the layout solver (not "
+        "you) turns relations into actual coordinates."
+    ),
+    "input_schema": SceneSpec.model_json_schema(),
+}
 
 
 def _heuristic_interpret(prompt: str) -> tuple[str, BaseModel]:
+    scene = _heuristic_scene_interpret(prompt)
+    if scene is not None:
+        return "scene", scene
     entry = dispatch_by_keyword(prompt) or get_generator("house")
     if entry.name == "house":
         return "house", _heuristic_house_spec(prompt)
     return entry.name, entry.spec_model()
+
+
+def _heuristic_scene_interpret(prompt: str) -> SceneSpec | None:
+    """Simple counted-arrangement patterns for the no-API-key path --
+    "reduced vocabulary" (only these plain-English shapes), never a
+    silent failure: a prompt that doesn't match any pattern here just
+    falls through to single-object dispatch, same as any other prompt
+    the heuristic can't fully parse."""
+    lowered = prompt.lower()
+
+    # "a table with four chairs around it"
+    m = re.search(r"(?:a|an|the)\s+(\w+)\s+with\s+" + _COUNT_PATTERN + r"\s+(\w+)\s+around\s+it", lowered)
+    if m:
+        target_name = _keyword_generator_name(m.group(1))
+        obj_name = _keyword_generator_name(m.group(3))
+        if target_name and obj_name:
+            count = min(_parse_count(m.group(2)), 12)
+            return SceneSpec(objects=[
+                SceneObjectSpec(generator=target_name),
+                SceneObjectSpec(generator=obj_name, relation="around", target_index=0, count=count),
+            ])
+
+    # "four chairs around a/the table"
+    m = re.search(_COUNT_PATTERN + r"\s+(\w+)\s+around\s+(?:the\s+|a\s+|an\s+)?(\w+)", lowered)
+    if m:
+        obj_name = _keyword_generator_name(m.group(2))
+        target_name = _keyword_generator_name(m.group(3))
+        if obj_name and target_name:
+            count = min(_parse_count(m.group(1)), 12)
+            return SceneSpec(objects=[
+                SceneObjectSpec(generator=target_name),
+                SceneObjectSpec(generator=obj_name, relation="around", target_index=0, count=count),
+            ])
+
+    # "a lamp on the table" / "a box on top of a table"
+    m = re.search(r"(?:a|an|the)\s+(\w+)\s+on(?:\s+top\s+of)?\s+(?:the\s+|a\s+|an\s+)?(\w+)", lowered)
+    if m:
+        obj_name = _keyword_generator_name(m.group(1))
+        target_name = _keyword_generator_name(m.group(2))
+        if obj_name and target_name and obj_name != target_name:
+            return SceneSpec(objects=[
+                SceneObjectSpec(generator=target_name),
+                SceneObjectSpec(generator=obj_name, relation="on_top_of", target_index=0),
+            ])
+
+    # "a row of three shelves"
+    m = re.search(r"row\s+of\s+" + _COUNT_PATTERN + r"\s+(\w+)", lowered)
+    if m:
+        obj_name = _keyword_generator_name(m.group(2))
+        if obj_name:
+            count = min(_parse_count(m.group(1)), 12)
+            return SceneSpec(objects=[SceneObjectSpec(generator=obj_name, relation="row", count=count)])
+
+    return None
 
 
 def _heuristic_house_spec(prompt: str) -> HouseSpec:
@@ -120,7 +219,7 @@ def _llm_interpret(prompt: str) -> tuple[str, BaseModel]:
     import anthropic
 
     client = anthropic.Anthropic()  # resolves ANTHROPIC_API_KEY / an `ant auth login` profile from the environment
-    tools = tool_catalog()
+    tools = tool_catalog() + [_SCENE_TOOL]
     response = client.beta.messages.create(
         model="claude-fable-5",
         max_tokens=1024,
@@ -134,6 +233,8 @@ def _llm_interpret(prompt: str) -> tuple[str, BaseModel]:
     if response.stop_reason == "refusal":
         raise RuntimeError(f"model declined the request: {getattr(response, 'stop_details', None)}")
     tool_use = next(block for block in response.content if block.type == "tool_use")
+    if tool_use.name == "scene":
+        return "scene", SceneSpec(**tool_use.input)
     entry = get_generator(tool_use.name)
     return entry.name, entry.spec_model(**tool_use.input)
 
