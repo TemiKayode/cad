@@ -1,4 +1,6 @@
+import sys
 import time
+import types
 
 from fastapi.testclient import TestClient
 
@@ -132,6 +134,52 @@ def test_generate_endpoint_scene_batches_break_at_object_boundaries(monkeypatch)
                 if op["target"] == "face_prop" and op["payload"]["k"] == "scene_object":
                     seen_scene_objects.add(op["payload"]["v"])
         assert seen_scene_objects == {"0", "1", "2", "3", "4"}
+
+
+def test_generate_endpoint_dsl_prompt_populates_the_room(monkeypatch):
+    """End-to-end through real HTTP: a mocked LLM response routes to the
+    'dsl' tool, generator.py executes the program, and the response's
+    `spec` (a DSLProgramSpec) serializes cleanly through the same
+    `spec: dict` response field every other path uses."""
+
+    class _FakeToolUse:
+        def __init__(self, name, input_):
+            self.type = "tool_use"
+            self.name = name
+            self.input = input_
+
+    class _FakeResponse:
+        def __init__(self, name, input_):
+            self.content = [_FakeToolUse(name, input_)]
+            self.stop_reason = "tool_use"
+            self.stop_details = None
+
+    class _FakeMessages:
+        def create(self, **kwargs):
+            return _FakeResponse("dsl", {"root": {"op": "cylinder", "radius": 0.3, "height": 1.2}, "material": "metal"})
+
+    class _FakeBeta:
+        messages = _FakeMessages()
+
+    class _FakeClient:
+        beta = _FakeBeta()
+
+    fake_module = types.ModuleType("anthropic")
+    fake_module.Anthropic = lambda *a, **kw: _FakeClient()
+    monkeypatch.setitem(sys.modules, "anthropic", fake_module)
+
+    client = _client()
+    resp = client.post("/api/mesh/genroom-dsl/generate", json={"prompt": "a weird custom bracket shape"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["generator"] == "dsl"
+    assert body["interpretation_source"] == "llm"
+    assert body["spec"]["root"]["op"] == "cylinder"
+    assert body["vertex_count"] > 0
+    assert body["watertight"] is True
+
+    export = client.get("/api/mesh/genroom-dsl/export/json").json()
+    assert len(export["face_index"]["entries"]) == body["face_count"]
 
 
 def test_generate_endpoint_returns_422_on_generation_failure(monkeypatch):

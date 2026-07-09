@@ -35,7 +35,7 @@ offline to see the **Time-Travel Merge** panel.
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
-| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G2 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G3-G7 (open-vocabulary DSL, iterative editing/undo, report-card UI, eval harness, hosted ML tier) not started |
+| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G3 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G4-G7 (iterative editing/undo, report-card UI, eval harness, hosted ML tier) not started |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
@@ -841,6 +841,102 @@ tests in `test_generator.py`/`test_generation_endpoint.py` (object-op
 grouping, `scene_object` tagging, forced per-object batch boundaries
 even with an oversized batch-size ceiling) -- 500+ tests green,
 zero regressions.
+
+### Open vocabulary via a sandboxed geometry DSL (Phase G3, the step-change)
+
+Every generator so far is a *fixed* archetype -- a table is always four
+legs and a top. Phase G3 adds a genuine open-vocabulary escape hatch
+for a prompt no registry generator or scene fits ("a bracket with a
+mounting hole," an odd mechanical part, an abstract form) without
+loosening rule 1 for a moment: the model still never emits raw
+geometry, only a small **JSON program** in a closed grammar
+(`crdt_cad/ai/dsl.py`) -- never Python, never vertices.
+
+- **The grammar**: primitives `box`/`prism` (regular N-gon
+  extrusion)/`cylinder`/`extrude` (arbitrary polygon footprint, all
+  centered in X/Z and based at Y=0, the same "stands on the local
+  origin, gets moved into place afterward" convention
+  `scene_layout.py` already uses); transforms `translate`/`rotate`/
+  `scale` (each wraps one child); combinators `union`/`difference`
+  (real CSG booleans -- the exact same `trimesh`/`manifold3d` engine
+  `wall_opening.py` already uses for door/window cuts, proven, not new)
+  and `group`/`repeat` (cheap non-boolean concatenation, `repeat`
+  being a bounded loop of translated copies). Every primitive is built
+  via the *existing, already-tested* helpers in `mesh_builder.py`
+  (`add_box`/`add_cylinder`/`add_extruded_polygon`) -- this module adds
+  the JSON grammar and sandboxing around them, not new triangulation
+  code, so it inherits their correctness rather than re-risking it.
+- **Sandboxed by construction, not by a sandbox process**: the
+  interpreter is a small pure function over the JSON tree (`_validate_node`
+  then `_execute_node`, both plain recursive Python with a fixed
+  `"op"` dispatch) -- no `eval`/`exec`, no imports driven by program
+  content, no filesystem/network access, no unbounded recursion (tree
+  depth is capped and checked before any geometry is built).
+- **Hard caps, checked twice**: a validation pass first (structural
+  checks -- unknown op, wrong field types, out-of-range values, max
+  *textual* node count 48, max tree depth 16, max repeat count 24 --
+  so a malformed program fails fast with a specific message before any
+  geometry work), then live budget checks during execution (max
+  *expanded* node count 400 -- catches nested repeats multiplying out
+  past their individually-legal counts, e.g. 20×20 nested repeats each
+  under the cap of 24 but 400+ combined; max 20,000 vertices/faces,
+  tighter than `validation.py`'s general 50k scene ceiling since one
+  DSL program is a single open-vocabulary object; a 5-second wall-clock
+  budget; a 50m-per-axis bounding-box cap checked after *every* node,
+  not just at the end). Every cap raises `DSLValidationError` or
+  `DSLBudgetExceededError` (both `DSLError`) with the specific message
+  that gets fed back to the model on repair.
+- **The retry loop** (`generator.py`'s `_generate_dsl_ops`): execute →
+  validate (the same `validate_or_raise` every other path uses) → on
+  failure, one repair call (`interpreter.llm_repair_dsl_program`,
+  forced back onto the `dsl` tool via `tool_choice={"type": "tool",
+  "name": "dsl"}`, sent as a standard tool_use → tool_result turn with
+  the *exact* error text and `is_error: true`) → on a second failure,
+  fall back to the closest registry archetype by keyword match on the
+  *original* prompt (or `house` if nothing matches) rather than a bare
+  error -- a real, working object with reduced fidelity to the request
+  beats a dead end, the same "never a broken/silent result" rule every
+  other path already follows. Every attempt's outcome is recorded in
+  `GenerationResult.dsl_attempts` (`{"attempt", "outcome", "error"}`
+  each) -- not yet surfaced in the UI (that's G5's report card), but
+  already there for it to consume, and already logged via the standard
+  logger in the meantime.
+- **The heuristic (no-API-key) path never attempts DSL synthesis** --
+  stated as a rule in the brief, enforced by construction: `_heuristic_interpret`
+  has no DSL branch at all, so an unmatched prompt degrades straight to
+  the registry (`house`), exactly like every prompt the heuristic
+  couldn't fully parse before this phase existed. Confirmed by a
+  dedicated test (`test_heuristic_interpret_never_attempts_dsl_synthesis`),
+  not just by the absence of code.
+- **Not live-verified against the real API** (no `ANTHROPIC_API_KEY` in
+  this environment, same honesty rule as `meshy_adapter.py`): the
+  `dsl`/repair tool-use flow is exercised only via a mocked `anthropic`
+  client in tests. What *is* live-verified in a real browser: the
+  entire rest of the pipeline with `interpret_prompt`/`llm_repair_dsl_program`
+  monkeypatched to return real (and, for one run, deliberately invalid)
+  DSL programs -- confirming end to end that a genuinely open-vocabulary
+  shape (a box+cylinder union with a cylindrical hole cut through it,
+  62 vertices/124 faces, watertight) renders correctly after a real
+  repair-loop recovery from an oversized first attempt, and that the
+  fallback path (every repair attempt still invalid) renders a real
+  registry object (a keyword-matched `chair`, not an error) rather than
+  leaving the user with nothing. `mesh3d.js`'s `describeGeneratedSpec`
+  gained a `"dsl"` branch (program node count + top-level op + material,
+  e.g. "custom difference shape, 7 node(s), metal") instead of falling
+  through to the numeric-dimension fallback that has nothing to show
+  for a DSL spec.
+- **44 unit tests** (`tests/test_ai_dsl.py`) covering every primitive/
+  transform/combinator producing valid watertight geometry, every
+  validation error (unknown op, missing/malformed fields, out-of-range
+  values, wrong types not coerced), every hard cap (textual nodes, tree
+  depth, repeat count, expanded nodes via nested repeats, vertices/
+  faces, execution time, per-node bounding box), and adversarial shapes
+  (missing `op`, non-dict child, `bool` where an `int` count is
+  required, 1000-deep nesting) -- plus repair/fallback orchestration
+  tests in `test_generator.py` (first-try success, one-repair recovery,
+  exhausted-repairs fallback with a keyword-matched archetype, the
+  source≠"llm" defensive guard never calling the LLM) and an
+  end-to-end HTTP test in `test_generation_endpoint.py`.
 
 **3D-print preparation** (`mesh_repair.py`) is a separate, opt-in path
 -- *not* part of the CRDT-injection pipeline, per the brief's own

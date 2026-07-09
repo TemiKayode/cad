@@ -1,3 +1,4 @@
+from crdt_cad.ai.dsl import DSLProgramSpec
 from crdt_cad.ai.generator import DEFAULT_ACTOR_ID, generate_mesh_ops
 from crdt_cad.crdt.clock import LamportClock
 from crdt_cad.crdt.mesh import MeshCRDT
@@ -152,6 +153,106 @@ def test_scene_ops_apply_cleanly_and_produce_one_watertight_merged_mesh():
     assert len(doc.face_loops()) == result.face_count
     assert result.validation.watertight
     assert result.validation.manifold
+
+
+_VALID_BOX_PROGRAM = DSLProgramSpec(root={"op": "box", "size": [1.0, 1.0, 1.0]}, material="metal")
+_OVERSIZED_BOX_PROGRAM = DSLProgramSpec(root={"op": "box", "size": [500.0, 1.0, 1.0]}, material="metal")
+
+
+def test_generate_mesh_ops_dsl_succeeds_on_the_first_try(monkeypatch):
+    import crdt_cad.ai.generator as generator_module
+
+    monkeypatch.setattr(generator_module, "interpret_prompt", lambda prompt: ("dsl", _VALID_BOX_PROGRAM, "llm"))
+
+    def boom(*a, **kw):
+        raise AssertionError("repair should not be called when the first attempt succeeds")
+
+    monkeypatch.setattr(generator_module, "llm_repair_dsl_program", boom)
+
+    result = generate_mesh_ops("a weird bracket")
+    assert result.generator_name == "dsl"
+    assert result.dsl_attempts == [{"attempt": 0, "outcome": "ok", "error": None}]
+    assert result.validation.ok
+    assert result.vertex_count > 0
+
+
+def test_generate_mesh_ops_dsl_repairs_after_one_failure(monkeypatch):
+    import crdt_cad.ai.generator as generator_module
+
+    monkeypatch.setattr(generator_module, "interpret_prompt", lambda prompt: ("dsl", _OVERSIZED_BOX_PROGRAM, "llm"))
+    monkeypatch.setattr(
+        generator_module, "llm_repair_dsl_program",
+        lambda prompt, program, error: {"root": {"op": "box", "size": [1.0, 1.0, 1.0]}, "material": "metal"},
+    )
+
+    result = generate_mesh_ops("a weird bracket")
+    assert result.generator_name == "dsl"
+    assert [a["outcome"] for a in result.dsl_attempts] == ["failed", "ok"]
+    assert "exceeds" in result.dsl_attempts[0]["error"]
+    assert result.validation.ok
+
+
+def test_generate_mesh_ops_dsl_falls_back_to_registry_after_exhausting_repairs(monkeypatch):
+    import crdt_cad.ai.generator as generator_module
+
+    monkeypatch.setattr(generator_module, "interpret_prompt", lambda prompt: ("dsl", _OVERSIZED_BOX_PROGRAM, "llm"))
+    # every repair attempt returns another invalid program -- never recovers
+    monkeypatch.setattr(
+        generator_module, "llm_repair_dsl_program",
+        lambda prompt, program, error: {"root": {"op": "box", "size": [999.0, 1.0, 1.0]}, "material": "metal"},
+    )
+
+    result = generate_mesh_ops("a weird chair-like bracket")
+    assert result.generator_name != "dsl"
+    assert len(result.dsl_attempts) == generator_module.MAX_DSL_REPAIR_ATTEMPTS + 1
+    assert all(a["outcome"] == "failed" for a in result.dsl_attempts)
+    assert result.validation.ok  # the fallback mesh itself is still a real, valid object
+    assert result.vertex_count > 0
+
+
+def test_generate_mesh_ops_dsl_fallback_prefers_a_keyword_match_over_the_house_default(monkeypatch):
+    import crdt_cad.ai.generator as generator_module
+
+    monkeypatch.setattr(generator_module, "interpret_prompt", lambda prompt: ("dsl", _OVERSIZED_BOX_PROGRAM, "llm"))
+    monkeypatch.setattr(generator_module, "llm_repair_dsl_program", lambda prompt, program, error: dict(program))
+
+    result = generate_mesh_ops("a strange chair with an odd backrest")
+    assert result.generator_name == "chair"
+
+
+def test_generate_mesh_ops_dsl_never_calls_repair_when_source_is_not_llm(monkeypatch):
+    """Defensive guard: `_heuristic_interpret` never returns "dsl" (see
+    test_interpreter.py), but if generator_name somehow ends up "dsl"
+    with source != "llm", the repair loop must not attempt an LLM call
+    (there may be no credentials at all on this path)."""
+    import crdt_cad.ai.generator as generator_module
+
+    monkeypatch.setattr(generator_module, "interpret_prompt", lambda prompt: ("dsl", _OVERSIZED_BOX_PROGRAM, "heuristic"))
+
+    def boom(*a, **kw):
+        raise AssertionError("must not call the LLM repair path when source != 'llm'")
+
+    monkeypatch.setattr(generator_module, "llm_repair_dsl_program", boom)
+
+    result = generate_mesh_ops("a weird bracket")
+    assert result.generator_name != "dsl"
+    assert len(result.dsl_attempts) == 1  # no repair attempts made
+
+
+def test_dsl_generated_ops_apply_cleanly_to_a_fresh_room_document(monkeypatch):
+    import crdt_cad.ai.generator as generator_module
+
+    monkeypatch.setattr(generator_module, "interpret_prompt", lambda prompt: ("dsl", _VALID_BOX_PROGRAM, "llm"))
+    result = generate_mesh_ops("a weird bracket")
+
+    room_clock = LamportClock(actor="__server__:mesh:test-room")
+    doc = MeshCRDT(room_clock)
+    for op in result.ops:
+        doc.apply(op)
+    assert len(doc.vertex_positions()) == result.vertex_count
+    assert len(doc.face_loops()) == result.face_count
+    materials = {doc.face_props_dict(fid).get("material") for fid in doc.face_loops()}
+    assert materials == {"metal"}
 
 
 def test_ops_batch_reconstructs_the_same_mesh_as_build_house_mesh_directly():

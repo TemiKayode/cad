@@ -15,21 +15,36 @@ inherently about the live room/event loop, not about generation.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from pydantic import BaseModel
 
-from crdt_cad.ai.interpreter import interpret_prompt
+from crdt_cad.ai.dsl import DSLError, DSLProgramSpec, execute_dsl_program
+from crdt_cad.ai.interpreter import interpret_prompt, llm_repair_dsl_program
 from crdt_cad.ai.mesh_types import GeneratedMesh
 from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy, meshy_api_key
-from crdt_cad.ai.registry import get_generator
+from crdt_cad.ai.registry import dispatch_by_keyword, get_generator
 from crdt_cad.ai.scene import SceneSpec, expand_scene, merge_placed_objects
 from crdt_cad.ai.scene_layout import solve_layout
-from crdt_cad.ai.validation import ValidationReport, validate_generated_mesh, validate_or_raise
+from crdt_cad.ai.validation import (
+    GenerationValidationError,
+    ValidationReport,
+    validate_generated_mesh,
+    validate_or_raise,
+)
 from crdt_cad.crdt.clock import LamportClock
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
 
+logger = logging.getLogger("crdt_cad.ai.generator")
+
 DEFAULT_ACTOR_ID = "ai_generator_bot"
+
+# The initial attempt plus this many repair attempts (each feeding the
+# specific validation/budget error back to the model) before Phase G3
+# gives up on DSL synthesis and falls back to the closest registry
+# archetype rather than leaving the user with a bare error.
+MAX_DSL_REPAIR_ATTEMPTS = 2
 
 _MATERIAL_COLORS = {
     "wood": "#8b5a2b",
@@ -71,6 +86,12 @@ class GenerationResult:
     # as its own batch -- a scene appearing object by object rather than
     # all at once. ``None`` for an ordinary single-object generation.
     object_ops: list[list[MeshOp]] | None = None
+    # Populated only when the DSL path (Phase G3) was attempted: one
+    # entry per attempt (``{"attempt": i, "outcome": "ok"|"failed",
+    # "error": str | None}``) -- ahead of Phase G5/G6's own consumption
+    # of this as a metric/report-card input. ``None`` for every other
+    # generation path.
+    dsl_attempts: list[dict] | None = None
 
 
 def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> GenerationResult:
@@ -98,6 +119,8 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
 
     if generator_name == "scene":
         return _generate_scene_ops(spec, source, actor_id=actor_id)
+    if generator_name == "dsl":
+        return _generate_dsl_ops(prompt, spec, source, actor_id=actor_id)
 
     mesh: GeneratedMesh | None = None
     mesh_source = "procedural"
@@ -114,28 +137,9 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
     else:
         validation = validate_or_raise(mesh)
 
-    # Built against a throwaway MeshCRDT (not the live room's document) so
-    # every op is minted with a fresh, correctly-ordered OpId from one
-    # dedicated actor identity, and so the resulting op list can be handed
-    # to the room to apply+broadcast in controlled batches rather than
-    # mutating the live document eagerly and only trying to batch the
-    # broadcast after the fact.
     clock = LamportClock(actor=actor_id)
     scratch = MeshCRDT(clock)
-    ops: list[MeshOp] = []
-
-    for vertex_id, position in mesh.vertices.items():
-        ops.append(scratch.add_vertex(vertex_id, position))
-
-    for face_id, loop in mesh.faces.items():
-        ops.extend(scratch.add_face(face_id, loop))
-        material = mesh.face_materials.get(face_id, "")
-        if material:
-            ops.append(scratch.set_face_prop(face_id, "material", material))
-            ops.append(scratch.set_face_prop(face_id, "color", _color_for_material(material)))
-        for i in range(len(loop)):
-            a, b = loop[i], loop[(i + 1) % len(loop)]
-            ops.append(scratch.add_edge(a, b))
+    ops = _mint_ops_for_mesh(scratch, mesh)
 
     return GenerationResult(
         ops=ops,
@@ -148,6 +152,29 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
         triangle_count=mesh.triangle_count(),
         validation=validation,
     )
+
+
+def _mint_ops_for_mesh(scratch: MeshCRDT, mesh: GeneratedMesh) -> list[MeshOp]:
+    """Shared vertex/face/material/edge op-minting loop -- built against
+    a throwaway ``MeshCRDT`` (not the live room's document) so every op
+    gets a fresh, correctly-ordered ``OpId`` from one dedicated actor
+    identity, and the resulting op list can be handed to the room to
+    apply+broadcast in controlled batches rather than mutating the live
+    document eagerly. Shared by every generation path (single-object,
+    DSL success, DSL fallback) so they mint ops identically."""
+    ops: list[MeshOp] = []
+    for vertex_id, position in mesh.vertices.items():
+        ops.append(scratch.add_vertex(vertex_id, position))
+    for face_id, loop in mesh.faces.items():
+        ops.extend(scratch.add_face(face_id, loop))
+        material = mesh.face_materials.get(face_id, "")
+        if material:
+            ops.append(scratch.set_face_prop(face_id, "material", material))
+            ops.append(scratch.set_face_prop(face_id, "color", _color_for_material(material)))
+        for i in range(len(loop)):
+            a, b = loop[i], loop[(i + 1) % len(loop)]
+            ops.append(scratch.add_edge(a, b))
+    return ops
 
 
 def _generate_scene_ops(scene: SceneSpec, source: str, *, actor_id: str) -> GenerationResult:
@@ -201,6 +228,82 @@ def _generate_scene_ops(scene: SceneSpec, source: str, *, actor_id: str) -> Gene
         face_count=len(mesh.faces),
         triangle_count=mesh.triangle_count(),
         validation=validation,
+    )
+
+
+def _generate_dsl_ops(prompt: str, spec: DSLProgramSpec, source: str, *, actor_id: str) -> GenerationResult:
+    """Phase G3: execute the DSL program -> validate -> on failure, feed
+    the *specific* error back to the model for up to
+    ``MAX_DSL_REPAIR_ATTEMPTS`` repair attempts -> on final failure, fall
+    back to the closest registry archetype (a real, working object with
+    reduced fidelity to the request) rather than a bare error, matching
+    every other path's "never a broken/silent result" rule. Every
+    attempt's outcome is recorded in ``dsl_attempts`` regardless of
+    which branch this ends up returning through."""
+    program = {"root": spec.root, "material": spec.material}
+    attempts: list[dict] = []
+    mesh: GeneratedMesh | None = None
+    validation: ValidationReport | None = None
+
+    for attempt in range(MAX_DSL_REPAIR_ATTEMPTS + 1):
+        try:
+            mesh = execute_dsl_program(program)
+            validation = validate_or_raise(mesh)
+            attempts.append({"attempt": attempt, "outcome": "ok", "error": None})
+            break
+        except (DSLError, GenerationValidationError) as exc:
+            error_text = str(exc)
+            attempts.append({"attempt": attempt, "outcome": "failed", "error": error_text})
+            logger.info("DSL attempt %d failed for prompt %r: %s", attempt, prompt, error_text)
+            mesh = None
+            if attempt >= MAX_DSL_REPAIR_ATTEMPTS or source != "llm":
+                break
+            try:
+                program = llm_repair_dsl_program(prompt, program, error_text)
+            except Exception as repair_exc:
+                logger.info("DSL repair call failed (%s); stopping retries", repair_exc)
+                break
+
+    if mesh is not None and validation is not None:
+        clock = LamportClock(actor=actor_id)
+        scratch = MeshCRDT(clock)
+        ops = _mint_ops_for_mesh(scratch, mesh)
+        return GenerationResult(
+            ops=ops,
+            generator_name="dsl",
+            spec=spec,
+            interpretation_source=source,
+            mesh_source="procedural",
+            vertex_count=len(mesh.vertices),
+            face_count=len(mesh.faces),
+            triangle_count=mesh.triangle_count(),
+            validation=validation,
+            dsl_attempts=attempts,
+        )
+
+    logger.warning("DSL synthesis exhausted all attempts for prompt %r; falling back to the registry", prompt)
+    fallback_entry = dispatch_by_keyword(prompt) or get_generator("house")
+    fallback_spec = fallback_entry.spec_model()
+    fallback_mesh = fallback_entry.build(fallback_spec)
+    relax = fallback_entry.name in _RELAXED_VALIDATION_GENERATORS
+    fallback_validation = (
+        validate_generated_mesh(fallback_mesh, require_watertight=False, require_consistent_winding=False)
+        if relax else validate_or_raise(fallback_mesh)
+    )
+    clock = LamportClock(actor=actor_id)
+    scratch = MeshCRDT(clock)
+    ops = _mint_ops_for_mesh(scratch, fallback_mesh)
+    return GenerationResult(
+        ops=ops,
+        generator_name=fallback_entry.name,
+        spec=fallback_spec,
+        interpretation_source=source,
+        mesh_source="procedural",
+        vertex_count=len(fallback_mesh.vertices),
+        face_count=len(fallback_mesh.faces),
+        triangle_count=fallback_mesh.triangle_count(),
+        validation=fallback_validation,
+        dsl_attempts=attempts,
     )
 
 

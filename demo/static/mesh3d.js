@@ -677,6 +677,22 @@ function describeGeneratedSpec(generatorName, spec) {
     const parts = [...counts.entries()].map(([name, count]) => (count > 1 ? `${count}x ${escapeHtml(name)}` : escapeHtml(name)));
     return `${(spec.objects || []).length} object group(s): ${parts.join(", ")}`;
   }
+  if (generatorName === "dsl") {
+    // Phase G3: an open-vocabulary shape, not a registry generator --
+    // describe it by its program shape (node count, top-level op),
+    // since there are no dimension fields to fall back on.
+    const countNodes = (node) => {
+      if (!node || typeof node !== "object") return 0;
+      let n = 1;
+      if (node.child) n += countNodes(node.child);
+      if (Array.isArray(node.children)) n += node.children.reduce((sum, c) => sum + countNodes(c), 0);
+      return n;
+    };
+    const nodeCount = countNodes(spec.root);
+    const rootOp = spec.root && spec.root.op ? escapeHtml(spec.root.op) : "shape";
+    const materialPart = spec.material ? `, ${escapeHtml(spec.material)}` : "";
+    return `custom ${rootOp} shape, ${nodeCount} node(s)${materialPart}`;
+  }
   const dims = Object.entries(spec)
     .filter(([key, value]) => typeof value === "number" && key.endsWith("_m"))
     .slice(0, 4)

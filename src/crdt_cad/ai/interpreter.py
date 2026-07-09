@@ -34,6 +34,7 @@ import re
 
 from pydantic import BaseModel
 
+from crdt_cad.ai.dsl import DSL_JSON_SCHEMA, DSLProgramSpec
 from crdt_cad.ai.house_spec import HouseSpec
 from crdt_cad.ai.registry import dispatch_by_keyword, get_generator, tool_catalog
 from crdt_cad.ai.scene import SceneObjectSpec, SceneSpec
@@ -53,7 +54,21 @@ _SYSTEM_PROMPT = (
     "the table'), use the 'scene' tool instead of a single-object generator "
     "-- list each object with a plain-language relation ('around', "
     "'on_top_of', 'row', 'beside', or 'none') and, for 'around'/'on_top_of'/"
-    "'beside', a target_index referencing an earlier object in the same list."
+    "'beside', a target_index referencing an earlier object in the same list. "
+    "If the description is a genuinely novel shape that doesn't match any "
+    "registry generator or scene of them (e.g. an odd bracket, a custom "
+    "mechanical part, an abstract sculptural form), use the 'dsl' tool: write "
+    "a small JSON program (box/prism/cylinder/extrude primitives, translate/"
+    "rotate/scale transforms, union/difference/group/repeat combinators) that "
+    "builds it -- prefer a registry generator or scene whenever one "
+    "reasonably fits; the dsl tool is for the genuine open-vocabulary case."
+)
+
+_DSL_REPAIR_SYSTEM_PROMPT = (
+    "The DSL program you just wrote failed validation. Read the specific "
+    "error, fix exactly that problem, and call the 'dsl' tool again with a "
+    "corrected program for the same original request. Keep every part of "
+    "the program that wasn't implicated by the error."
 )
 
 _NUMBER_WORDS = {
@@ -89,6 +104,23 @@ _SCENE_TOOL = {
         "you) turns relations into actual coordinates."
     ),
     "input_schema": SceneSpec.model_json_schema(),
+}
+
+_DSL_TOOL = {
+    "name": "dsl",
+    "description": (
+        "Build a genuinely novel shape no registry generator covers, as a "
+        "small JSON geometry program -- never as raw vertices. Primitives: "
+        "box, prism (regular N-gon extrusion), cylinder, extrude (arbitrary "
+        "polygon footprint). Transforms: translate, rotate, scale, each "
+        "wrapping one child. Combinators: union/difference (real CSG "
+        "booleans), group (cheap concatenation of disjoint parts), repeat "
+        "(a bounded loop of translated copies). Every primitive is centered "
+        "in X/Z and based at Y=0. Hard caps apply (node count, vertex/face "
+        "count, bounding box, execution time) -- a failure returns a "
+        "specific error to fix and resubmit."
+    ),
+    "input_schema": DSL_JSON_SCHEMA,
 }
 
 
@@ -219,7 +251,7 @@ def _llm_interpret(prompt: str) -> tuple[str, BaseModel]:
     import anthropic
 
     client = anthropic.Anthropic()  # resolves ANTHROPIC_API_KEY / an `ant auth login` profile from the environment
-    tools = tool_catalog() + [_SCENE_TOOL]
+    tools = tool_catalog() + [_SCENE_TOOL, _DSL_TOOL]
     response = client.beta.messages.create(
         model="claude-fable-5",
         max_tokens=1024,
@@ -235,8 +267,51 @@ def _llm_interpret(prompt: str) -> tuple[str, BaseModel]:
     tool_use = next(block for block in response.content if block.type == "tool_use")
     if tool_use.name == "scene":
         return "scene", SceneSpec(**tool_use.input)
+    if tool_use.name == "dsl":
+        return "dsl", DSLProgramSpec(**tool_use.input)
     entry = get_generator(tool_use.name)
     return entry.name, entry.spec_model(**tool_use.input)
+
+
+def llm_repair_dsl_program(original_prompt: str, program: dict, error: str) -> dict:
+    """One repair turn (Phase G3's retry loop, called from
+    ``generator.py``): re-calls Claude with the *specific* validation/
+    budget error from the failed attempt, forced back onto the 'dsl'
+    tool (``tool_choice={"type": "tool", "name": "dsl"}`` -- not free to
+    switch to a different generator mid-repair) via the standard
+    tool_use -> tool_result conversation turn. Raises on any failure,
+    same contract as ``_llm_interpret``; the caller decides how many
+    times to retry and what to do on final failure.
+
+    **Not live-verified against the real API** (no ``ANTHROPIC_API_KEY``
+    in this environment) -- the tool_use/tool_result conversation shape
+    is the Messages API's own standard multi-turn tool pattern, exercised
+    here only against a mocked client (see ``tests/test_interpreter.py``).
+    """
+    import anthropic
+
+    client = anthropic.Anthropic()
+    response = client.beta.messages.create(
+        model="claude-fable-5",
+        max_tokens=1024,
+        betas=["server-side-fallback-2026-06-01"],
+        fallbacks=[{"model": "claude-opus-4-8"}],
+        system=_DSL_REPAIR_SYSTEM_PROMPT,
+        tools=[_DSL_TOOL],
+        tool_choice={"type": "tool", "name": "dsl"},
+        messages=[
+            {"role": "user", "content": f"Original request: {original_prompt}"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "dsl_attempt", "name": "dsl", "input": program}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "dsl_attempt", "is_error": True,
+                 "content": f"This program failed: {error}. Fix it and call the dsl tool again."},
+            ]},
+        ],
+    )
+    if response.stop_reason == "refusal":
+        raise RuntimeError(f"model declined the repair request: {getattr(response, 'stop_details', None)}")
+    tool_use = next(block for block in response.content if block.type == "tool_use")
+    return tool_use.input
 
 
 def interpret_prompt(prompt: str) -> tuple[str, BaseModel, str]:

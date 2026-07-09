@@ -4,8 +4,15 @@ import types
 import pytest
 
 from crdt_cad.ai import REGISTRY  # noqa: F401 -- triggers registration
+from crdt_cad.ai.dsl import DSLProgramSpec
 from crdt_cad.ai.house_spec import HouseSpec
-from crdt_cad.ai.interpreter import _heuristic_house_spec, _heuristic_interpret, _heuristic_scene_interpret, interpret_prompt
+from crdt_cad.ai.interpreter import (
+    _heuristic_house_spec,
+    _heuristic_interpret,
+    _heuristic_scene_interpret,
+    interpret_prompt,
+    llm_repair_dsl_program,
+)
 from crdt_cad.ai.scene import SceneSpec
 
 
@@ -143,6 +150,24 @@ def test_heuristic_interpret_routes_scene_prompts_through_interpret_prompt():
     assert isinstance(spec, SceneSpec)
 
 
+def test_heuristic_interpret_never_attempts_dsl_synthesis():
+    """Phase G3 rule: the heuristic (no-API-key) path does not attempt
+    DSL synthesis -- an unmatched prompt degrades to the registry
+    (house), never to a made-up geometry program."""
+    for prompt in ("a weird twisty bracket thing", "an abstract sculptural form", "xyzzy plugh qux"):
+        name, spec = _heuristic_interpret(prompt)
+        assert name != "dsl"
+
+
+def test_interpret_prompt_end_to_end_dsl_via_llm(fake_anthropic_module):
+    dsl_payload = {"root": {"op": "cylinder", "radius": 0.3, "height": 1.0}, "material": "metal"}
+    fake_anthropic_module["client"] = _FakeAnthropicClient(_FakeResponse("dsl", dsl_payload))
+    name, spec, source = interpret_prompt("a strange custom bracket")
+    assert name == "dsl"
+    assert source == "llm"
+    assert isinstance(spec, DSLProgramSpec)
+
+
 def test_interpret_prompt_end_to_end_scene_via_heuristic_fallback(monkeypatch):
     def boom(prompt):
         raise RuntimeError("no credentials configured")
@@ -270,6 +295,52 @@ def test_llm_interpret_dispatches_to_the_scene_tool(fake_anthropic_module):
     assert isinstance(spec, SceneSpec)
     assert len(spec.objects) == 2
     assert spec.objects[1].count == 4
+
+
+def test_llm_interpret_dispatches_to_the_dsl_tool(fake_anthropic_module):
+    from crdt_cad.ai.interpreter import _llm_interpret
+
+    dsl_payload = {"root": {"op": "box", "size": [1.0, 1.0, 1.0]}, "material": "metal"}
+    fake_anthropic_module["client"] = _FakeAnthropicClient(_FakeResponse("dsl", dsl_payload))
+    name, spec = _llm_interpret("a weird bracket shape no generator covers")
+    assert name == "dsl"
+    assert isinstance(spec, DSLProgramSpec)
+    assert spec.root == {"op": "box", "size": [1.0, 1.0, 1.0]}
+    assert spec.material == "metal"
+
+
+def test_llm_repair_dsl_program_returns_the_repaired_program(fake_anthropic_module):
+    repaired = {"root": {"op": "box", "size": [1.0, 1.0, 1.0]}, "material": ""}
+    fake_anthropic_module["client"] = _FakeAnthropicClient(_FakeResponse("dsl", repaired))
+
+    result = llm_repair_dsl_program(
+        "a weird bracket", {"root": {"op": "box", "size": [500, 1, 1]}}, "box.size component 500 exceeds the 50.0 limit"
+    )
+    assert result == repaired
+
+
+def test_llm_repair_dsl_program_forces_the_dsl_tool_and_reports_the_error(fake_anthropic_module):
+    client = _FakeAnthropicClient(_FakeResponse("dsl", {"root": {"op": "box", "size": [1, 1, 1]}}))
+    fake_anthropic_module["client"] = client
+
+    llm_repair_dsl_program("a weird bracket", {"root": {"op": "box", "size": [500, 1, 1]}}, "size too large")
+
+    sent = client.beta.messages._last_kwargs
+    assert sent["tool_choice"] == {"type": "tool", "name": "dsl"}
+    assert sent["tools"][0]["name"] == "dsl"
+    # the specific error must actually reach the model, not just a generic retry nudge
+    tool_result = sent["messages"][-1]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert "size too large" in tool_result["content"]
+    assert tool_result["is_error"] is True
+
+
+def test_llm_repair_dsl_program_raises_on_refusal(fake_anthropic_module):
+    fake_anthropic_module["client"] = _FakeAnthropicClient(
+        _FakeResponse("dsl", {"root": {"op": "box", "size": [1, 1, 1]}}, stop_reason="refusal")
+    )
+    with pytest.raises(RuntimeError):
+        llm_repair_dsl_program("a weird bracket", {"root": {"op": "box", "size": [500, 1, 1]}}, "too large")
 
 
 def test_llm_interpret_raises_on_refusal(fake_anthropic_module):
