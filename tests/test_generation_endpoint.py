@@ -268,7 +268,7 @@ def test_generate_endpoint_edit_does_not_disturb_other_generations_in_the_room()
 
 
 def test_generate_endpoint_returns_422_on_generation_failure(monkeypatch):
-    def boom(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
+    def boom(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot", **kwargs):
         raise ValueError("simulated malformed geometry")
 
     monkeypatch.setattr(app_module, "generate_ops_from_interpretation", boom)
@@ -279,7 +279,7 @@ def test_generate_endpoint_returns_422_on_generation_failure(monkeypatch):
 
 
 def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
-    def slow(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
+    def slow(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot", **kwargs):
         time.sleep(0.3)
         return GenerationResult(
             ops=[], generator_name="house", spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
@@ -294,7 +294,7 @@ def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
 
 
 def test_generate_endpoint_returns_422_on_empty_mesh(monkeypatch):
-    def empty(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
+    def empty(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot", **kwargs):
         return GenerationResult(
             ops=[], generator_name="house", spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
             vertex_count=0, face_count=0, triangle_count=0, validation=_EMPTY_VALIDATION,
@@ -357,7 +357,7 @@ def test_generate_endpoint_increments_latency_histogram():
 
 
 def test_generate_endpoint_increments_failure_metric_on_validation_error(monkeypatch):
-    def boom(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
+    def boom(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot", **kwargs):
         raise ValueError("simulated failure")
 
     monkeypatch.setattr(app_module, "generate_ops_from_interpretation", boom)
@@ -392,3 +392,105 @@ def test_generate_budget_endpoint_does_not_itself_spend_budget():
     a = client.get("/api/mesh/genroom-budget2/generate/budget").json()
     b = client.get("/api/mesh/genroom-budget2/generate/budget").json()
     assert a["remaining"] == pytest.approx(b["remaining"], abs=0.01)
+
+
+# -- Phase G7: matured Meshy path -- progress broadcast, budget, fallback ----------
+
+
+def _fake_box_mesh():
+    from crdt_cad.ai.mesh_builder import MeshBuilder, add_box
+
+    b = MeshBuilder()
+    add_box(b, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), "metal")
+    return b.mesh
+
+
+def test_generate_endpoint_uses_meshy_and_broadcasts_progress(monkeypatch):
+    async def fake_meshy_async(prompt, *, api_key=None, on_progress=None, face_budget=None):
+        if on_progress:
+            await on_progress({"stage": "queued", "task_id": "fake-1"})
+            await on_progress({"stage": "in_progress", "status": "SUCCEEDED", "progress": 100})
+            await on_progress({"stage": "downloading"})
+            await on_progress({"stage": "done"})
+        return _fake_box_mesh()
+
+    monkeypatch.setattr(app_module, "generate_mesh_via_meshy_async", fake_meshy_async)
+    monkeypatch.setattr(app_module, "meshy_api_key", lambda: "fake-key")
+
+    client = _client()
+    with client.websocket_connect("/ws/mesh/genroom-meshy1") as ws:
+        ws.send_json({"type": "hello", "actor": "watcher"})
+        ws.receive_json()
+
+        resp = client.post("/api/mesh/genroom-meshy1/generate", json={"prompt": "a wooden table"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["mesh_source"] == "meshy"
+        assert body["path"] == "meshy"
+
+        message_types = []
+        for _ in range(10):
+            msg = ws.receive_json()
+            message_types.append(msg["type"])
+            if msg["type"] == "report_card":
+                break
+        assert message_types[0] == "generation_interpreting"
+        assert message_types.count("meshy_progress") == 4
+        assert "ops" in message_types
+        assert message_types[-1] == "report_card"
+
+
+def test_generate_endpoint_meshy_progress_messages_carry_the_real_stage_payload(monkeypatch):
+    async def fake_meshy_async(prompt, *, api_key=None, on_progress=None, face_budget=None):
+        if on_progress:
+            await on_progress({"stage": "decimating", "original_faces": 48000, "target_faces": 4000, "result_faces": 4000})
+        return _fake_box_mesh()
+
+    monkeypatch.setattr(app_module, "generate_mesh_via_meshy_async", fake_meshy_async)
+    monkeypatch.setattr(app_module, "meshy_api_key", lambda: "fake-key")
+
+    client = _client()
+    with client.websocket_connect("/ws/mesh/genroom-meshy2") as ws:
+        ws.send_json({"type": "hello", "actor": "watcher"})
+        ws.receive_json()
+        client.post("/api/mesh/genroom-meshy2/generate", json={"prompt": "a wooden table"})
+
+        ws.receive_json()  # generation_interpreting
+        progress = ws.receive_json()
+        assert progress["type"] == "meshy_progress"
+        assert progress["stage"] == "decimating"
+        assert progress["original_faces"] == 48000
+        assert progress["target_faces"] == 4000
+
+
+def test_generate_endpoint_falls_back_to_procedural_when_meshy_returns_none(monkeypatch):
+    async def fake_meshy_async(prompt, *, api_key=None, on_progress=None, face_budget=None):
+        if on_progress:
+            await on_progress({"stage": "failed", "error": "simulated Meshy failure"})
+        return None
+
+    monkeypatch.setattr(app_module, "generate_mesh_via_meshy_async", fake_meshy_async)
+    monkeypatch.setattr(app_module, "meshy_api_key", lambda: "fake-key")
+
+    client = _client()
+    resp = client.post("/api/mesh/genroom-meshy3/generate", json={"prompt": "a wooden table"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["mesh_source"] == "procedural"
+    assert body["path"] == "registry"
+    assert body["vertex_count"] > 0
+
+
+def test_generate_endpoint_does_not_attempt_meshy_for_scenes(monkeypatch):
+    """A scene has no single "the hosted mesh" to substitute in for --
+    the Meshy path must not even be attempted."""
+    def boom(prompt, **kwargs):
+        raise AssertionError("must not attempt Meshy for a scene generation")
+
+    monkeypatch.setattr(app_module, "generate_mesh_via_meshy_async", boom)
+    monkeypatch.setattr(app_module, "meshy_api_key", lambda: "fake-key")
+
+    client = _client()
+    resp = client.post("/api/mesh/genroom-meshy4/generate", json={"prompt": "a table with four chairs around it"})
+    assert resp.status_code == 200
+    assert resp.json()["path"] == "scene"

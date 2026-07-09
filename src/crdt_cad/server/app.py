@@ -92,6 +92,7 @@ from crdt_cad.ai.generator import (
     interpretation_chips,
 )
 from crdt_cad.ai.interpreter import interpret_edit, interpret_prompt
+from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy_async, meshy_api_key
 from crdt_cad.ai.validation import GenerationValidationError
 from crdt_cad.crdt.clock import LamportClock, VectorClock
 from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
@@ -1143,8 +1144,27 @@ async def _interpret_and_generate(room: "Room", req: "GenerateMeshRequest") -> t
         "chips": interpretation_chips(generator_name, spec),
         "generator": generator_name, "path": generator_name, "interpretation_source": source,
     })
+
+    # Phase G7: the matured async Meshy path -- submit/poll/decimate with
+    # real progress broadcast to the room -- runs *before* the ordinary
+    # build phase, only for a plain single-object dispatch (a scene or a
+    # DSL program has no single "the hosted mesh" to substitute in for).
+    # meshy_attempted=True either way tells generate_ops_from_interpretation
+    # not to redundantly retry Meshy itself when this already tried
+    # (successfully or not).
+    meshy_mesh = None
+    meshy_attempted = False
+    if generator_name not in ("scene", "dsl") and meshy_api_key():
+        meshy_attempted = True
+
+        async def _on_meshy_progress(payload: dict) -> None:
+            await room.broadcast({"type": "meshy_progress", **payload})
+
+        meshy_mesh = await generate_mesh_via_meshy_async(req.prompt, on_progress=_on_meshy_progress)
+
     result = await asyncio.to_thread(
         generate_ops_from_interpretation, req.prompt, generator_name, spec, source, actor_id=DEFAULT_ACTOR_ID,
+        meshy_mesh=meshy_mesh, meshy_attempted=meshy_attempted,
     )
     path = generator_name if generator_name in ("scene", "dsl") else ("meshy" if result.mesh_source == "meshy" else "registry")
     return result, path, _generation_outcome(result)

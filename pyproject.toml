@@ -66,6 +66,10 @@ step = [
 ]
 meshy = [
     "requests>=2.31",
+    # Phase G7: the mesh-budget pipeline decimates an imported diffusion
+    # mesh down to a configurable face count before CRDT injection --
+    # trimesh.Trimesh.simplify_quadric_decimation needs this backend.
+    "fast_simplification>=0.1.7",
 ]
 dev = [
     "pytest>=8.0",
@@ -78,6 +82,7 @@ dev = [
     "asyncpg>=0.29",
     "redis>=5.0",
     "requests>=2.31",
+    "fast_simplification>=0.1.7",
 ]
 
 [tool.pytest.ini_options]

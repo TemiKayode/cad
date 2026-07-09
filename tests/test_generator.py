@@ -530,3 +530,83 @@ def test_generate_edit_ops_reports_a_nonzero_elapsed_time():
     faces, vertices, edges, start_counter = _edit_args_for(doc, r1.generation_id)
     r2 = generate_edit_ops("make it taller", r1.generation_id, prior_record, faces, vertices, edges, start_counter)
     assert r2.elapsed_seconds > 0.0
+
+
+# -- Phase G7: pre-fetched meshy_mesh / meshy_attempted (avoids a double Meshy call) --
+
+
+def test_generate_ops_from_interpretation_uses_a_prefetched_meshy_mesh(monkeypatch):
+    """When the caller (the endpoint) already ran the async Meshy path
+    itself and passes the result in, this function must use it directly
+    rather than trying Meshy again."""
+    import crdt_cad.ai.generator as generator_module
+    from crdt_cad.ai.generators.furniture import ChairSpec
+    from crdt_cad.ai.procedural_house import GeneratedMesh
+
+    fake_mesh = GeneratedMesh(
+        vertices={"a": (0.0, 0.0, 0.0), "b": (1.0, 0.0, 0.0), "c": (0.0, 1.0, 0.0)},
+        faces={"f1": ["a", "b", "c"]},
+    )
+
+    def boom(prompt):
+        raise AssertionError("must not call generate_mesh_via_meshy when a pre-fetched mesh was already provided")
+
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key")
+    monkeypatch.setattr(generator_module, "generate_mesh_via_meshy", boom)
+
+    result = generator_module.generate_ops_from_interpretation(
+        "a small wooden chair", "chair", ChairSpec(), "heuristic",
+        meshy_mesh=fake_mesh, meshy_attempted=True,
+    )
+    assert result.mesh_source == "meshy"
+    assert result.vertex_count == 3
+    assert result.face_count == 1
+
+
+def test_generate_ops_from_interpretation_skips_meshy_retry_when_already_attempted_and_failed(monkeypatch):
+    """meshy_attempted=True with meshy_mesh=None means "I already tried
+    Meshy myself and it failed" -- this function must fall straight to
+    the procedural generator, not spend a second (redundant, and in
+    this test, forbidden) attempt."""
+    import crdt_cad.ai.generator as generator_module
+    from crdt_cad.ai.generators.furniture import ChairSpec
+
+    def boom(prompt):
+        raise AssertionError("must not retry Meshy when the caller already attempted and failed")
+
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key")
+    monkeypatch.setattr(generator_module, "generate_mesh_via_meshy", boom)
+
+    result = generator_module.generate_ops_from_interpretation(
+        "a small wooden chair", "chair", ChairSpec(), "heuristic",
+        meshy_mesh=None, meshy_attempted=True,
+    )
+    assert result.mesh_source == "procedural"
+    assert result.vertex_count > 0
+
+
+def test_generate_ops_from_interpretation_default_params_still_try_meshy_itself(monkeypatch):
+    """Backward compatibility: a caller that doesn't pass meshy_mesh/
+    meshy_attempted at all (every pre-G7 call site, including direct
+    test/script callers) gets the original behavior unchanged."""
+    import crdt_cad.ai.generator as generator_module
+    from crdt_cad.ai.procedural_house import GeneratedMesh
+
+    fake_mesh = GeneratedMesh(
+        vertices={"a": (0.0, 0.0, 0.0), "b": (1.0, 0.0, 0.0), "c": (0.0, 1.0, 0.0)},
+        faces={"f1": ["a", "b", "c"]},
+    )
+    calls = []
+
+    def fake_meshy(prompt):
+        calls.append(prompt)
+        return fake_mesh
+
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key")
+    monkeypatch.setattr(generator_module, "generate_mesh_via_meshy", fake_meshy)
+
+    from crdt_cad.ai.generators.furniture import ChairSpec
+
+    result = generator_module.generate_ops_from_interpretation("a chair", "chair", ChairSpec(), "heuristic")
+    assert calls == ["a chair"]
+    assert result.mesh_source == "meshy"

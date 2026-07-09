@@ -945,7 +945,7 @@ class RelayConnection {
     actorId,
     {
       onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onValidityWarning, onMergePreview, onRole,
-      onGenerationInterpreting, onReportCard,
+      onGenerationInterpreting, onReportCard, onMeshyProgress,
       token, kind, room, initialOutbox,
     },
   ) {
@@ -973,6 +973,10 @@ class RelayConnection {
     // sees the same success-visibility info the brief asks for.
     this.onGenerationInterpreting = onGenerationInterpreting || (() => {});
     this.onReportCard = onReportCard || (() => {});
+    // Phase G7: real progress from the matured async Meshy job flow
+    // (queued/in_progress/downloading/decimating/done/failed), room-wide
+    // for the same reason as the two callbacks above.
+    this.onMeshyProgress = onMeshyProgress || (() => {});
     // Phase 17 read-only share links: "editor" (full access, same as
     // every room before this existed) or "viewer" -- learned from the
     // server's own snapshot/delta reply (see app.py's WS protocol
@@ -1091,6 +1095,8 @@ class RelayConnection {
       this.onGenerationInterpreting(msg);
     } else if (msg.type === "report_card") {
       this.onReportCard(msg);
+    } else if (msg.type === "meshy_progress") {
+      this.onMeshyProgress(msg);
     }
   }
 

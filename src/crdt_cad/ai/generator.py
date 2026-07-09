@@ -150,21 +150,36 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
 
 def generate_ops_from_interpretation(
     prompt: str, generator_name: str, spec: BaseModel, source: str, *, actor_id: str = DEFAULT_ACTOR_ID,
+    meshy_mesh: GeneratedMesh | None = None, meshy_attempted: bool = False,
 ) -> GenerationResult:
     """The rest of the pipeline once ``(generator_name, spec, source)``
     is already known -- split out from :func:`generate_mesh_ops` so the
     server (Phase G5) can call ``interpret_prompt`` itself, broadcast
     "understood: ..." chips to the room *before* geometry lands, and
     only then run this (slower) half as its own worker-thread call,
-    without interpreting the prompt twice."""
+    without interpreting the prompt twice.
+
+    ``meshy_mesh``/``meshy_attempted`` (Phase G7): a caller with its own
+    room to stream progress to (the endpoint) uses the matured async
+    Meshy path (``meshy_adapter.generate_mesh_via_meshy_async``)
+    *before* calling this function, and passes whatever it got --
+    including ``None`` on failure -- so this function's own (always
+    synchronous) Meshy attempt below is skipped either way rather than
+    redundantly retrying an already-failed call. Callers with no room
+    (direct calls, tests) leave both at their defaults and get the
+    original behavior: this function tries Meshy itself, synchronously,
+    exactly as it always has.
+    """
     if generator_name == "scene":
         return _generate_scene_ops(prompt, spec, source, actor_id=actor_id)
     if generator_name == "dsl":
         return _generate_dsl_ops(prompt, spec, source, actor_id=actor_id)
 
-    mesh: GeneratedMesh | None = None
+    mesh: GeneratedMesh | None = meshy_mesh
     mesh_source = "procedural"
-    if meshy_api_key():
+    if mesh is not None:
+        mesh_source = "meshy"
+    elif not meshy_attempted and meshy_api_key():
         mesh = generate_mesh_via_meshy(prompt)
         if mesh is not None:
             mesh_source = "meshy"

@@ -69,7 +69,7 @@ offline to see the **Time-Travel Merge** panel.
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
-| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G6 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), **provenance + spec persistence + follow-up edits + one-unit undo** (select/edit/undo a whole generation, not vertex by vertex), a **report card + Prometheus metrics + a real cancel button + budget guardrails** (success measured, not asserted), a **66-case golden eval harness wired into CI** (100% score, see "AI quality" below), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G7 (hosted ML tier, optional) not started |
+| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G7 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), **provenance + spec persistence + follow-up edits + one-unit undo** (select/edit/undo a whole generation, not vertex by vertex), a **report card + Prometheus metrics + a real cancel button + budget guardrails** (success measured, not asserted), a **66-case golden eval harness wired into CI** (100% score, see "AI quality" below), an **optional hosted-ML tier matured into a real async job flow** with progress streaming and a mesh-budget decimation pipeline (not live-verified -- no API key available), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; every Part 5 phase (G1-G7) now implemented |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
@@ -1309,6 +1309,76 @@ surfaced in the AI Generate panel's status line so it's never ambiguous
 which one actually produced what's on screen. `requests` (the `meshy`
 extra) is a light dependency, included in `dev` alongside `asyncpg`/
 `redis`; `trimesh` needs nothing extra since it's already core.
+
+### Matured: async job flow, progress streaming, mesh-budget pipeline (Phase G7, optional)
+
+The optional hosted-ML tier, taken from a synchronous stub to a real
+job flow -- **still not verified against the live API** (same honesty
+rule as Fly.io in Part 4 and everywhere else in this section: no
+`MESHY_API_KEY` was ever available while building this).
+
+- **A typed error hierarchy** (`MeshyError` and four subclasses --
+  `MeshyTaskFailedError`, `MeshyTimeoutError`, `MeshyResponseShapeError`,
+  `MeshyBudgetExceededError`) replaces the old bare `RuntimeError`/
+  `TimeoutError`. Both entry points still catch broadly and return
+  `None` on any failure -- the typed hierarchy is for tests and logging
+  to distinguish failure modes precisely, not a change to the "never
+  raises to the generation pipeline" contract every other path in this
+  project already follows.
+- **A real async job flow with progress streaming**:
+  `generate_mesh_via_meshy_async` (alongside the original synchronous
+  `generate_mesh_via_meshy`, kept unchanged for direct/non-endpoint
+  callers -- e.g. `tests/test_generator.py`'s existing Meshy tests still
+  pass untouched) runs each individual HTTP call in a worker thread
+  (`asyncio.to_thread` -- no new async HTTP dependency needed, `requests`
+  stays the only one) but does the *wait* between polls and every
+  progress notification on the event loop, so the `/generate` endpoint
+  can broadcast real `meshy_progress` WS messages (`queued` ->
+  `in_progress` with the API's own reported percentage -> `downloading`
+  -> `decimating` -> `done`, or `failed` with the specific error) to the
+  *whole room* while a potentially minutes-long generation is in
+  flight -- not leave the room silent until it's done. `mesh3d.js`
+  renders each stage as a real status-line update, including the
+  brief's own example phrasing verbatim: "Meshy: simplified 48,000 →
+  4,000 faces for collaborative editing...".
+- **Mesh-budget pipeline** (`decimate_to_budget`, `CRDT_CAD_MESHY_FACE_BUDGET`,
+  default 4,000 faces): a hosted diffusion model can easily return tens
+  of thousands of triangles, far more than this project's per-face
+  property panel and clickable face list are built for. Real quadric-
+  error decimation via `trimesh`'s `fast_simplification` backend (a new
+  `meshy`-extra dependency, confirmed to hit an exact target face count
+  against a real high-poly mesh -- `trimesh.creation.icosphere` down to
+  200 faces, watertight preserved) runs before CRDT injection, stating
+  the tradeoff in both the progress broadcast and a `report_card`
+  field. **Refuses clearly** (`MeshyBudgetExceededError`, caught the
+  same way any other Meshy failure is -- falls back to the procedural
+  pipeline, never silently injects an over-budget mesh) if decimation
+  can't reach within 50% of the target.
+- **The endpoint avoids a double Meshy call**: `generate_ops_from_interpretation`
+  gained optional `meshy_mesh`/`meshy_attempted` parameters (both
+  default to the original behavior for every existing caller) -- the
+  endpoint runs the async path itself first (the only way to get
+  progress broadcasts, which need the event loop) and passes whatever
+  it got, success or `None`, so the underlying single-object build
+  phase never redundantly retries an already-attempted call. Not
+  attempted at all for a scene or a DSL program -- neither has a single
+  "the hosted mesh" to substitute in for.
+- **Same provenance/report-card/eval treatment as every other path**:
+  a Meshy-sourced generation gets a `generation_id`, appears in the AI
+  Generations panel, and its report card correctly shows `path: "meshy"`
+  -- this fell out of Phase G4/G5's already-generic design with no
+  further changes needed, confirmed by a dedicated end-to-end test.
+- **20 new tests** (`tests/test_meshy_adapter.py`: typed errors,
+  decimation on a real trimesh-built high-poly mesh including the
+  refuse-clearly path, the full async flow's progress-event ordering,
+  timeout/failure handling, the no-callback case; `tests/test_generator.py`:
+  the `meshy_mesh`/`meshy_attempted` parameter contract, including a
+  test that would fail loudly (an `AssertionError` inside the
+  monkeypatched Meshy call itself) if a double-call regression were
+  ever introduced; `tests/test_generation_endpoint.py`: progress
+  broadcast ordering and payload shape, budget-decimation notification,
+  graceful fallback, and confirmation Meshy is never attempted for
+  scenes).
 
 ## WebRTC P2P (`demo/static/common.js: P2PManager`)
 

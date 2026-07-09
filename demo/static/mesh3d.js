@@ -430,6 +430,7 @@ let conn, p2p;
     // messages back over its own WS connection too, same as ops batches.
     onGenerationInterpreting: (msg) => renderInterpretationChips(msg),
     onReportCard: (msg) => renderReportCard(msg),
+    onMeshyProgress: (msg) => renderMeshyProgress(msg),
     onRole: (role) => {
       viewerMode = applyViewerModeUI(role);
       // Phase D6: unlike the 2D demo (which sends presence continuously
@@ -838,6 +839,29 @@ function renderReportCard(msg) {
   if (msg.errors && msg.errors.length) {
     el.innerHTML += `<div class="empty-hint" style="color:var(--danger)">${msg.errors.map(escapeHtml).join("; ")}</div>`;
   }
+}
+
+// -- Phase G7: matured hosted-ML (Meshy) progress, streamed while a job is in flight --
+
+function renderMeshyProgress(msg) {
+  if (!generationInFlight) return; // a stray/late message after this tab moved on
+  let text;
+  if (msg.stage === "queued") {
+    text = "Meshy: queued...";
+  } else if (msg.stage === "in_progress") {
+    text = `Meshy: in progress${typeof msg.progress === "number" ? ` (${msg.progress}%)` : ""}...`;
+  } else if (msg.stage === "downloading") {
+    text = "Meshy: downloading model...";
+  } else if (msg.stage === "decimating") {
+    text = `Meshy: simplified ${msg.original_faces.toLocaleString()} → ${msg.target_faces.toLocaleString()} faces for collaborative editing...`;
+  } else if (msg.stage === "done") {
+    text = "Meshy: model ready, building...";
+  } else if (msg.stage === "failed") {
+    text = `Meshy: ${msg.error || "failed"} -- falling back to the procedural builder...`;
+  } else {
+    return;
+  }
+  genStatus.textContent = text;
 }
 
 // -- Phase G5: cost guardrails -- remaining generation budget, peeked (never spent) ---

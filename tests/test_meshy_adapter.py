@@ -17,9 +17,20 @@ import sys
 import pytest
 
 trimesh = pytest.importorskip("trimesh")
+pytest.importorskip("fast_simplification")
 
 from crdt_cad.ai import meshy_adapter  # noqa: E402
-from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy, mesh_bytes_to_generated_mesh  # noqa: E402
+from crdt_cad.ai.meshy_adapter import (  # noqa: E402
+    MeshyBudgetExceededError,
+    MeshyResponseShapeError,
+    MeshyTaskFailedError,
+    MeshyTimeoutError,
+    decimate_to_budget,
+    generate_mesh_via_meshy,
+    generate_mesh_via_meshy_async,
+    mesh_bytes_to_generated_mesh,
+)
+from crdt_cad.ai.mesh_builder import MeshBuilder, add_box, from_trimesh  # noqa: E402
 
 
 def _box_glb_bytes() -> bytes:
@@ -138,3 +149,197 @@ def test_meshy_api_key_reads_env_var(monkeypatch):
     assert meshy_adapter.meshy_api_key() is None
     monkeypatch.setenv("MESHY_API_KEY", "abc123")
     assert meshy_adapter.meshy_api_key() == "abc123"
+
+
+# -- Phase G7: typed error hierarchy ------------------------------------------------
+
+
+def test_typed_errors_carry_their_own_context():
+    task_failed = MeshyTaskFailedError("task-1", "FAILED")
+    assert task_failed.task_id == "task-1" and task_failed.status == "FAILED"
+    assert "FAILED" in str(task_failed)
+
+    timeout = MeshyTimeoutError("task-2", 300.0)
+    assert timeout.task_id == "task-2"
+    assert "300" in str(timeout)
+
+    shape_error = MeshyResponseShapeError("missing field 'x'")
+    assert "missing field" in str(shape_error)
+
+    budget = MeshyBudgetExceededError(original_faces=48000, target_faces=4000, reached_faces=9000)
+    assert budget.original_faces == 48000 and budget.target_faces == 4000 and budget.reached_faces == 9000
+    assert "48000" in str(budget) and "4000" in str(budget)
+
+
+def test_task_failed_status_raises_the_typed_error_internally(monkeypatch):
+    """The public entry point still returns None (unchanged contract),
+    but the internal poll helper raises the specific typed error -- this
+    is what the docstring's "typed errors" claim is actually about."""
+    from crdt_cad.ai.meshy_adapter import _poll_until_done
+
+    fake_requests = _FakeRequestsModule([_FakeResponse(json_data={"status": "FAILED"})])
+    with pytest.raises(MeshyTaskFailedError):
+        _poll_until_done("task-x", "key", fake_requests)
+
+
+def test_missing_model_url_raises_response_shape_error(monkeypatch):
+    from crdt_cad.ai.meshy_adapter import _poll_until_done
+
+    fake_requests = _FakeRequestsModule([_FakeResponse(json_data={"status": "SUCCEEDED"})])  # no model_urls
+    with pytest.raises(MeshyResponseShapeError):
+        _poll_until_done("task-x", "key", fake_requests)
+
+
+# -- Phase G7: mesh-budget pipeline (decimation) -------------------------------------
+
+
+def _high_poly_mesh(subdivisions=4):
+    sphere = trimesh.creation.icosphere(subdivisions=subdivisions)
+    return from_trimesh(sphere, "metal")
+
+
+def test_decimate_to_budget_leaves_an_under_budget_mesh_untouched():
+    b = MeshBuilder()
+    add_box(b, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), "wood")
+    result, was_decimated, original = decimate_to_budget(b.mesh, max_faces=500)
+    assert was_decimated is False
+    assert result is b.mesh
+    assert original == b.mesh.triangle_count()
+
+
+def test_decimate_to_budget_simplifies_an_over_budget_mesh():
+    mesh = _high_poly_mesh()
+    original_count = mesh.triangle_count()
+    assert original_count > 1000
+    result, was_decimated, original = decimate_to_budget(mesh, max_faces=200)
+    assert was_decimated is True
+    assert original == original_count
+    assert result.triangle_count() <= 200 * 1.5
+    assert result.triangle_count() < original_count
+
+
+def test_decimate_to_budget_result_is_a_real_valid_mesh():
+    from crdt_cad.ai.validation import validate_generated_mesh
+
+    mesh = _high_poly_mesh()
+    result, _, _ = decimate_to_budget(mesh, max_faces=300)
+    report = validate_generated_mesh(result)
+    assert report.ok, report.errors
+
+
+def test_decimate_to_budget_refuses_clearly_when_decimation_cannot_reach_the_target(monkeypatch):
+    """Phase G7's "refuse clearly" requirement: never silently inject an
+    over-budget mesh. Simulates decimation landing far short of the
+    target by monkeypatching trimesh's own method."""
+    mesh = _high_poly_mesh()
+
+    class _StubSimplified:
+        faces = list(range(9000))  # way over any reasonable target
+
+    def _stub_decimate(self, face_count):
+        return _StubSimplified()
+
+    monkeypatch.setattr(trimesh.Trimesh, "simplify_quadric_decimation", _stub_decimate)
+    with pytest.raises(MeshyBudgetExceededError) as excinfo:
+        decimate_to_budget(mesh, max_faces=200)
+    assert excinfo.value.target_faces == 200
+    assert excinfo.value.reached_faces == 9000
+
+
+# -- Phase G7: async job flow with progress streaming --------------------------------
+
+
+class _AsyncFakeResponse(_FakeResponse):
+    pass
+
+
+def _install_fake_requests(monkeypatch, responses):
+    fake_requests = _FakeRequestsModule(responses)
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+    return fake_requests
+
+
+async def test_async_meshy_returns_none_without_an_api_key(monkeypatch):
+    monkeypatch.delenv("MESHY_API_KEY", raising=False)
+    result = await generate_mesh_via_meshy_async("a chair")
+    assert result is None
+
+
+async def test_async_meshy_full_flow_notifies_progress_in_order(monkeypatch):
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key")
+    glb_bytes = _box_glb_bytes()
+    _install_fake_requests(monkeypatch, [
+        _FakeResponse(json_data={"result": "task-123"}),
+        _FakeResponse(json_data={"status": "IN_PROGRESS", "progress": 40}),
+        _FakeResponse(json_data={"status": "SUCCEEDED", "model_urls": {"glb": "https://example/model.glb"}}),
+        _FakeResponse(content=glb_bytes),
+    ])
+
+    events = []
+
+    async def on_progress(payload):
+        events.append(payload)
+
+    mesh = await generate_mesh_via_meshy_async("a small wooden chair", on_progress=on_progress, face_budget=10_000)
+    assert mesh is not None
+    assert len(mesh.vertices) >= 8
+
+    stages = [e["stage"] for e in events]
+    assert stages == ["queued", "in_progress", "in_progress", "downloading", "done"]
+
+
+async def test_async_meshy_applies_the_face_budget_and_notifies_decimation(monkeypatch):
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key")
+    sphere = trimesh.creation.icosphere(subdivisions=4)
+    glb_bytes = sphere.export(file_type="glb")
+    _install_fake_requests(monkeypatch, [
+        _FakeResponse(json_data={"result": "task-123"}),
+        _FakeResponse(json_data={"status": "SUCCEEDED", "model_urls": {"glb": "https://example/model.glb"}}),
+        _FakeResponse(content=glb_bytes),
+    ])
+
+    events = []
+
+    async def on_progress(payload):
+        events.append(payload)
+
+    mesh = await generate_mesh_via_meshy_async("a decorative sphere", on_progress=on_progress, face_budget=100)
+    assert mesh is not None
+    assert mesh.triangle_count() <= 150
+
+    decimating_events = [e for e in events if e["stage"] == "decimating"]
+    assert len(decimating_events) == 1
+    assert decimating_events[0]["target_faces"] == 100
+    assert decimating_events[0]["original_faces"] > 100
+
+
+async def test_async_meshy_task_failure_notifies_failed_stage_and_returns_none(monkeypatch):
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key")
+    _install_fake_requests(monkeypatch, [
+        _FakeResponse(json_data={"result": "task-123"}),
+        _FakeResponse(json_data={"status": "FAILED"}),
+    ])
+
+    events = []
+
+    async def on_progress(payload):
+        events.append(payload)
+
+    mesh = await generate_mesh_via_meshy_async("anything", on_progress=on_progress)
+    assert mesh is None
+    assert events[-1]["stage"] == "failed"
+
+
+async def test_async_meshy_timeout_returns_none(monkeypatch):
+    monkeypatch.setenv("MESHY_API_KEY", "fake-key")
+    monkeypatch.setattr(meshy_adapter, "_MAX_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(meshy_adapter, "_POLL_INTERVAL_SECONDS", 0.0)
+    _install_fake_requests(monkeypatch, [_FakeResponse(json_data={"result": "task-123"})])
+    result = await generate_mesh_via_meshy_async("anything")
+    assert result is None
+
+
+async def test_async_meshy_works_without_a_progress_callback():
+    """`on_progress` is optional -- must not raise if omitted."""
+    result = await generate_mesh_via_meshy_async("anything", api_key=None)
+    assert result is None  # no key resolved, returns cleanly with no callback at all
