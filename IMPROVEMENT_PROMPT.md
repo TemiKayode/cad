@@ -1,6 +1,6 @@
 # Improvement brief: take crdt-cad from verified prototype to production-grade
 
-This is **Part 1 of a four-part plan**: it hardens the platform — security,
+This is **Part 1 of a five-part plan**: it hardens the platform — security,
 CI, durability, scaling, correctness (phases 1–9 below). **Part 2 lives in
 `FEATURE_IMPROVEMENT_PROMPT.md`** (phases 10–17): the product features that
 make the tool genuinely usable by engineers, designers, and casual users.
@@ -8,13 +8,17 @@ make the tool genuinely usable by engineers, designers, and casual users.
 system and interaction feel. **Part 4 lives in `DEPLOYMENT_PROMPT.md`**
 (phases 18–19): live Kubernetes validation of the Phase 7 scaling work,
 plus the production deployment/ops story (TLS, backups, monitoring,
-published image).
+published image). **Part 5 lives in `AI_GENERATION_PROMPT.md`** (phases
+G1–G7): the AI text-to-3D pipeline taken from one honest archetype to a
+world-class standard — generator registry, scene composition, sandboxed
+geometry DSL, iterative editing, and a measured eval harness.
 
-**Status (2026-07-05): Parts 1 and 2 are fully implemented and committed**
-(see git log, phases 1–17). Part 3 is in progress (D1 uncommitted). Part 4
-is not started. An agent picking this up should audit `git log` first and
-work only on what remains — Parts 3 and 4 — keeping the phase-by-phase
-commit discipline.
+**Status (2026-07-09): Parts 1–3 are fully implemented and committed**
+(see git log — phases 1–17 and D1–D8). Part 4 is nearly done: Phase 18 is
+committed; Phase 19's work (19.1–19.6) exists in the working tree but is
+not yet fully verified/committed. Part 5 is not started. An agent picking
+this up should audit `git log` and `git status` first and work only on
+what remains, keeping the phase-by-phase commit discipline.
 
 ## Context
 
