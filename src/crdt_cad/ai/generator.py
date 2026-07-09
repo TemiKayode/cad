@@ -21,10 +21,10 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from crdt_cad.ai.dsl import DSLError, DSLProgramSpec, execute_dsl_program
-from crdt_cad.ai.interpreter import interpret_prompt, llm_repair_dsl_program
+from crdt_cad.ai.interpreter import interpret_edit, interpret_prompt, llm_repair_dsl_program
 from crdt_cad.ai.mesh_types import GeneratedMesh
 from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy, meshy_api_key
-from crdt_cad.ai.registry import dispatch_by_keyword, get_generator
+from crdt_cad.ai.registry import REGISTRY, dispatch_by_keyword, get_generator
 from crdt_cad.ai.scene import SceneSpec, expand_scene, merge_placed_objects
 from crdt_cad.ai.scene_layout import solve_layout
 from crdt_cad.ai.validation import (
@@ -34,11 +34,22 @@ from crdt_cad.ai.validation import (
     validate_or_raise,
 )
 from crdt_cad.crdt.clock import LamportClock
-from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
+from crdt_cad.crdt.mesh import MeshCRDT, MeshOp, new_id
 
 logger = logging.getLogger("crdt_cad.ai.generator")
 
 DEFAULT_ACTOR_ID = "ai_generator_bot"
+
+
+class EditNotSupportedError(Exception):
+    """Raised by :func:`generate_edit_ops` for a generation whose
+    ``generator_name`` isn't a plain registry entry -- editing a scene
+    (which sub-object would the edit even apply to?) or a DSL program
+    (re-running its whole retry/repair loop for an edit is meaningfully
+    more work than a single-object regenerate) isn't supported yet. A
+    documented Phase G4 scope boundary, not a silent no-op: the endpoint
+    turns this into a clear 422, the same as any other typed generation
+    error."""
 
 # The initial attempt plus this many repair attempts (each feeding the
 # specific validation/budget error back to the model) before Phase G3
@@ -92,6 +103,13 @@ class GenerationResult:
     # of this as a metric/report-card input. ``None`` for every other
     # generation path.
     dsl_attempts: list[dict] | None = None
+    # Phase G4 provenance: the id every face this generation produced was
+    # tagged with (``set_face_prop(face_id, "generation_id", ...)``), and
+    # the key ``ops`` also writes a ``set_generation`` record under in
+    # room state. Defaults to "" only so existing test doubles that
+    # construct a `GenerationResult` directly (before this field existed)
+    # don't need updating -- every real code path always sets it.
+    generation_id: str = ""
 
 
 def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> GenerationResult:
@@ -118,7 +136,7 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
     generator_name, spec, source = interpret_prompt(prompt)
 
     if generator_name == "scene":
-        return _generate_scene_ops(spec, source, actor_id=actor_id)
+        return _generate_scene_ops(prompt, spec, source, actor_id=actor_id)
     if generator_name == "dsl":
         return _generate_dsl_ops(prompt, spec, source, actor_id=actor_id)
 
@@ -137,9 +155,13 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
     else:
         validation = validate_or_raise(mesh)
 
+    generation_id = new_id("gen")
     clock = LamportClock(actor=actor_id)
     scratch = MeshCRDT(clock)
-    ops = _mint_ops_for_mesh(scratch, mesh)
+    ops = _mint_ops_for_mesh(scratch, mesh, generation_id)
+    ops.append(scratch.set_generation(generation_id, _generation_record(
+        prompt, generator_name, spec, source, mesh_source,
+    )))
 
     return GenerationResult(
         ops=ops,
@@ -151,39 +173,209 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
         face_count=len(mesh.faces),
         triangle_count=mesh.triangle_count(),
         validation=validation,
+        generation_id=generation_id,
     )
 
 
-def _mint_ops_for_mesh(scratch: MeshCRDT, mesh: GeneratedMesh) -> list[MeshOp]:
+def _generation_record(prompt: str, generator_name: str, spec: BaseModel, source: str, mesh_source: str) -> dict:
+    """The Phase G4 spec-persistence record -- the *final* spec (not a
+    history of every edit), per the brief's own "store each generation's
+    final spec" language: an edit overwrites this record wholesale
+    rather than appending to it."""
+    return {
+        "prompt": prompt,
+        "generator_name": generator_name,
+        "spec": spec.model_dump(),
+        "interpretation_source": source,
+        "mesh_source": mesh_source,
+    }
+
+
+def _fresh_ids(mesh: GeneratedMesh) -> tuple[dict[str, str], dict[str, str]]:
+    """Every generator's own ``build()`` starts a fresh ``MeshBuilder``
+    that numbers vertices/faces v1/f1/v2/f2/... from scratch -- perfectly
+    fine for one generation in isolation, but a real collision the
+    moment a *second, separate* generation lands in the same room: two
+    sequential calls to ``get_generator(name).build(spec)`` produce the
+    exact same id strings, so the second generation's ``add_vertex("v1",
+    ...)`` doesn't create a new vertex, it silently overwrites the
+    first's (an LWWMap ``set`` on an existing key is exactly that -- a
+    move, not a create). Found and confirmed empirically while building
+    Phase G4's edit path (which makes the collision immediately visible
+    as corrupted geometry), fixed here so it can never happen on *any*
+    generation path -- see the regression test in test_generator.py
+    that generates a table then a chair into the same document and
+    asserts both survive intact."""
+    vertex_ids = {old: new_id("v") for old in mesh.vertices}
+    face_ids = {old: new_id("f") for old in mesh.faces}
+    return vertex_ids, face_ids
+
+
+def _mint_ops_for_mesh(scratch: MeshCRDT, mesh: GeneratedMesh, generation_id: str) -> list[MeshOp]:
     """Shared vertex/face/material/edge op-minting loop -- built against
     a throwaway ``MeshCRDT`` (not the live room's document) so every op
     gets a fresh, correctly-ordered ``OpId`` from one dedicated actor
     identity, and the resulting op list can be handed to the room to
     apply+broadcast in controlled batches rather than mutating the live
     document eagerly. Shared by every generation path (single-object,
-    DSL success, DSL fallback) so they mint ops identically."""
+    DSL success, DSL fallback) so they mint ops identically.
+
+    Every id is remapped to a globally-fresh one first (see
+    :func:`_fresh_ids`), and every face is tagged with ``generation_id``
+    (Phase G4 provenance) via the same ``face_props`` LWWMap-per-face
+    mechanism already used for "material"/"color"/"scene_object" -- it
+    merges cleanly across replicas (each face's prop bag resolves
+    independently) and needs no new CRDT machinery, just one more key on
+    a bag that already exists."""
+    vertex_ids, face_ids = _fresh_ids(mesh)
     ops: list[MeshOp] = []
-    for vertex_id, position in mesh.vertices.items():
-        ops.append(scratch.add_vertex(vertex_id, position))
-    for face_id, loop in mesh.faces.items():
-        ops.extend(scratch.add_face(face_id, loop))
-        material = mesh.face_materials.get(face_id, "")
+    for old_vertex_id, position in mesh.vertices.items():
+        ops.append(scratch.add_vertex(vertex_ids[old_vertex_id], position))
+    for old_face_id, loop in mesh.faces.items():
+        new_face_id = face_ids[old_face_id]
+        remapped_loop = [vertex_ids[v] for v in loop]
+        ops.extend(scratch.add_face(new_face_id, remapped_loop))
+        material = mesh.face_materials.get(old_face_id, "")
         if material:
-            ops.append(scratch.set_face_prop(face_id, "material", material))
-            ops.append(scratch.set_face_prop(face_id, "color", _color_for_material(material)))
-        for i in range(len(loop)):
-            a, b = loop[i], loop[(i + 1) % len(loop)]
+            ops.append(scratch.set_face_prop(new_face_id, "material", material))
+            ops.append(scratch.set_face_prop(new_face_id, "color", _color_for_material(material)))
+        ops.append(scratch.set_face_prop(new_face_id, "generation_id", generation_id))
+        for i in range(len(remapped_loop)):
+            a, b = remapped_loop[i], remapped_loop[(i + 1) % len(remapped_loop)]
             ops.append(scratch.add_edge(a, b))
     return ops
 
 
-def _generate_scene_ops(scene: SceneSpec, source: str, *, actor_id: str) -> GenerationResult:
+def generation_geometry(
+    face_loops: dict[str, list[str]], face_props_by_id: dict[str, dict], generation_id: str,
+) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """Pure lookup (no live doc access, easy to test in isolation): which
+    faces/vertices/edges in a document currently belong to
+    `generation_id`, for :func:`generate_edit_ops` to remove. A vertex
+    is only included if *no other, differently-provenanced* face still
+    references it -- an AI generation's own vertices are never shared
+    with anything outside it in practice, but this is a real safety
+    check, not an assumption, so a hypothetical future edit can never
+    delete a vertex something else still depends on."""
+    old_face_ids = [fid for fid in face_loops if face_props_by_id.get(fid, {}).get("generation_id") == generation_id]
+    old_face_id_set = set(old_face_ids)
+
+    used_elsewhere: set[str] = set()
+    candidate_vertices: set[str] = set()
+    for fid, loop in face_loops.items():
+        if fid in old_face_id_set:
+            candidate_vertices.update(loop)
+        else:
+            used_elsewhere.update(loop)
+    old_vertex_ids = [v for v in candidate_vertices if v not in used_elsewhere]
+
+    old_edges: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for fid in old_face_ids:
+        loop = face_loops[fid]
+        for i in range(len(loop)):
+            a, b = loop[i], loop[(i + 1) % len(loop)]
+            key = (a, b) if a <= b else (b, a)
+            if key not in seen:
+                seen.add(key)
+                old_edges.append((a, b))
+
+    return old_face_ids, old_vertex_ids, old_edges
+
+
+def generate_edit_ops(
+    edit_prompt: str,
+    generation_id: str,
+    prior_record: dict,
+    old_face_ids: list[str],
+    old_vertex_ids: list[str],
+    old_edges: list[tuple[str, str]],
+    start_counter: int,
+    *,
+    actor_id: str = DEFAULT_ACTOR_ID,
+) -> GenerationResult:
+    """Phase G4 follow-up edits: regenerates the *same* generation's
+    mesh from an edited spec and applies the delta as ordinary CRDT ops
+    -- remove the old generation's geometry, add the new geometry under
+    the same generation id (an edit refines a generation, it doesn't
+    start a new one). A pure function like :func:`generate_mesh_ops`
+    (safe for a worker thread): the caller does the live-document
+    reads (which faces/vertices/edges belong to `generation_id`, what
+    Lamport counter this actor has already reached) on the event loop
+    *before* calling this, and applies the returned ops back on the
+    event loop afterward -- this function itself never touches the
+    live room document.
+
+    Scoped to single-object (registry) generations only: editing a
+    scene or a DSL program raises :class:`EditNotSupportedError` rather
+    than a half-implemented, likely-wrong result -- a documented,
+    honest scope boundary for this phase.
+
+    `start_counter` seeds this call's throwaway ``LamportClock`` so its
+    *removal* ops out-rank the room's already-applied *creation* ops
+    from this same actor identity. A brand-new ``LamportClock(actor=...)``
+    always starts at counter 0, which is harmless for the fresh ids
+    every other generation path mints (nothing to race against yet) but
+    not for *removing* an id an earlier, separate call already wrote at
+    a possibly much higher counter: ``LWWMap.apply`` rejects any op
+    whose ``op_id <= existing.op_id``, so an unseeded clock's removal
+    ops here would silently no-op, leaving the "removed" geometry still
+    live. Pass ``room.doc.frontier().get(actor_id)``.
+    """
+    generator_name = prior_record["generator_name"]
+    if generator_name not in REGISTRY:
+        raise EditNotSupportedError(
+            f"editing a {generator_name!r} generation isn't supported yet -- "
+            "only single-object registry generations (not scenes or custom DSL shapes) can be edited"
+        )
+
+    new_generator_name, new_spec, source = interpret_edit(edit_prompt, prior_record)
+    mesh = get_generator(new_generator_name).build(new_spec)
+    relax = new_generator_name in _RELAXED_VALIDATION_GENERATORS
+    validation = (
+        validate_generated_mesh(mesh, require_watertight=False, require_consistent_winding=False)
+        if relax else validate_or_raise(mesh)
+    )
+
+    clock = LamportClock(actor=actor_id, counter=start_counter)
+    scratch = MeshCRDT(clock)
+    ops: list[MeshOp] = []
+    for a, b in old_edges:
+        ops.append(scratch.remove_edge(a, b))
+    for face_id in old_face_ids:
+        ops.append(scratch.remove_face(face_id))
+    for vertex_id in old_vertex_ids:
+        ops.append(scratch.remove_vertex(vertex_id))
+    ops.extend(_mint_ops_for_mesh(scratch, mesh, generation_id))
+    ops.append(scratch.set_generation(
+        generation_id, _generation_record(edit_prompt, new_generator_name, new_spec, source, "procedural"),
+    ))
+
+    return GenerationResult(
+        ops=ops,
+        generator_name=new_generator_name,
+        spec=new_spec,
+        interpretation_source=source,
+        mesh_source="procedural",
+        vertex_count=len(mesh.vertices),
+        face_count=len(mesh.faces),
+        triangle_count=mesh.triangle_count(),
+        validation=validation,
+        generation_id=generation_id,
+    )
+
+
+def _generate_scene_ops(prompt: str, scene: SceneSpec, source: str, *, actor_id: str) -> GenerationResult:
     """Phase G2 scene path: build every object's own mesh, position them
     with the deterministic layout solver (never the LLM), merge into one
     globally-id-unique mesh, then mint ops *grouped by object* -- both
     ``ops`` (the flat list, for callers that don't care) and
     ``object_ops`` (one sub-list per object, for the server to commit as
-    separate batches so the scene appears object by object)."""
+    separate batches so the scene appears object by object). A whole
+    scene is *one* Phase G4 generation (one id, one spec-persistence
+    record for the composing prompt) -- undoing it removes every object
+    at once, matching "the scene" being the unit the user actually asked
+    for, not its individual objects."""
     expanded = expand_scene(scene)
     translations = solve_layout(expanded)
     mesh, per_object_ids = merge_placed_objects(expanded, translations)
@@ -194,28 +386,44 @@ def _generate_scene_ops(scene: SceneSpec, source: str, *, actor_id: str) -> Gene
     else:
         validation = validate_or_raise(mesh)
 
+    generation_id = new_id("gen")
     clock = LamportClock(actor=actor_id)
     scratch = MeshCRDT(clock)
     ops: list[MeshOp] = []
     object_ops: list[list[MeshOp]] = []
 
+    # Same collision fix as `_mint_ops_for_mesh` (see its docstring):
+    # `merge_placed_objects` already guarantees ids are unique *within*
+    # this one scene, but its shared MeshBuilder still numbers from
+    # v1/f1 every call, so a *second, separate* generation (scene or
+    # not) in the same room would otherwise collide with this one.
+    fresh_vertex_ids = {old: new_id("v") for old in mesh.vertices}
+    fresh_face_ids = {old: new_id("f") for old in mesh.faces}
+
     for obj_index, (vertex_ids, face_ids) in enumerate(per_object_ids):
         this_object_ops: list[MeshOp] = []
         for vertex_id in vertex_ids:
-            this_object_ops.append(scratch.add_vertex(vertex_id, mesh.vertices[vertex_id]))
+            this_object_ops.append(scratch.add_vertex(fresh_vertex_ids[vertex_id], mesh.vertices[vertex_id]))
         for face_id in face_ids:
             loop = mesh.faces[face_id]
-            this_object_ops.extend(scratch.add_face(face_id, loop))
+            new_face_id = fresh_face_ids[face_id]
+            remapped_loop = [fresh_vertex_ids[v] for v in loop]
+            this_object_ops.extend(scratch.add_face(new_face_id, remapped_loop))
             material = mesh.face_materials.get(face_id, "")
             if material:
-                this_object_ops.append(scratch.set_face_prop(face_id, "material", material))
-                this_object_ops.append(scratch.set_face_prop(face_id, "color", _color_for_material(material)))
-            this_object_ops.append(scratch.set_face_prop(face_id, "scene_object", str(obj_index)))
-            for i in range(len(loop)):
-                a, b = loop[i], loop[(i + 1) % len(loop)]
+                this_object_ops.append(scratch.set_face_prop(new_face_id, "material", material))
+                this_object_ops.append(scratch.set_face_prop(new_face_id, "color", _color_for_material(material)))
+            this_object_ops.append(scratch.set_face_prop(new_face_id, "scene_object", str(obj_index)))
+            this_object_ops.append(scratch.set_face_prop(new_face_id, "generation_id", generation_id))
+            for i in range(len(remapped_loop)):
+                a, b = remapped_loop[i], remapped_loop[(i + 1) % len(remapped_loop)]
                 this_object_ops.append(scratch.add_edge(a, b))
         object_ops.append(this_object_ops)
         ops.extend(this_object_ops)
+
+    generation_op = scratch.set_generation(generation_id, _generation_record(prompt, "scene", scene, source, "procedural"))
+    ops.append(generation_op)
+    object_ops[-1].append(generation_op)
 
     return GenerationResult(
         ops=ops,
@@ -228,6 +436,7 @@ def _generate_scene_ops(scene: SceneSpec, source: str, *, actor_id: str) -> Gene
         face_count=len(mesh.faces),
         triangle_count=mesh.triangle_count(),
         validation=validation,
+        generation_id=generation_id,
     )
 
 
@@ -265,9 +474,11 @@ def _generate_dsl_ops(prompt: str, spec: DSLProgramSpec, source: str, *, actor_i
                 break
 
     if mesh is not None and validation is not None:
+        generation_id = new_id("gen")
         clock = LamportClock(actor=actor_id)
         scratch = MeshCRDT(clock)
-        ops = _mint_ops_for_mesh(scratch, mesh)
+        ops = _mint_ops_for_mesh(scratch, mesh, generation_id)
+        ops.append(scratch.set_generation(generation_id, _generation_record(prompt, "dsl", spec, source, "procedural")))
         return GenerationResult(
             ops=ops,
             generator_name="dsl",
@@ -279,6 +490,7 @@ def _generate_dsl_ops(prompt: str, spec: DSLProgramSpec, source: str, *, actor_i
             triangle_count=mesh.triangle_count(),
             validation=validation,
             dsl_attempts=attempts,
+            generation_id=generation_id,
         )
 
     logger.warning("DSL synthesis exhausted all attempts for prompt %r; falling back to the registry", prompt)
@@ -290,9 +502,13 @@ def _generate_dsl_ops(prompt: str, spec: DSLProgramSpec, source: str, *, actor_i
         validate_generated_mesh(fallback_mesh, require_watertight=False, require_consistent_winding=False)
         if relax else validate_or_raise(fallback_mesh)
     )
+    generation_id = new_id("gen")
     clock = LamportClock(actor=actor_id)
     scratch = MeshCRDT(clock)
-    ops = _mint_ops_for_mesh(scratch, fallback_mesh)
+    ops = _mint_ops_for_mesh(scratch, fallback_mesh, generation_id)
+    ops.append(scratch.set_generation(
+        generation_id, _generation_record(prompt, fallback_entry.name, fallback_spec, source, "procedural"),
+    ))
     return GenerationResult(
         ops=ops,
         generator_name=fallback_entry.name,
@@ -304,6 +520,7 @@ def _generate_dsl_ops(prompt: str, spec: DSLProgramSpec, source: str, *, actor_i
         triangle_count=fallback_mesh.triangle_count(),
         validation=fallback_validation,
         dsl_attempts=attempts,
+        generation_id=generation_id,
     )
 
 

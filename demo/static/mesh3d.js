@@ -41,9 +41,18 @@ const state = {
   faceProps: new Map(),     // faceId -> {material, color, ...}
   presence: new Map(),
   invalidFaces: new Set(),  // face ids currently flagged by a validity_warning (see syncScene)
+  generations: new Map(),   // generationId -> {prompt, generator_name, spec, ...} (Phase G4)
 };
 
-const ui = { tool: "vertex", selectedFace: null, opsCount: 0 };
+const ui = {
+  tool: "vertex", selectedFace: null, opsCount: 0,
+  // Phase G4: which generation (if any) a "Select" click highlighted, and
+  // which one an "Edit" click armed the Generate button to edit -- two
+  // independent pieces of state (you can highlight one generation while
+  // editing a different one, or highlight without editing at all).
+  highlightedGenerationId: null,
+  editingGenerationId: null,
+};
 let pendingFaceLoop = [];
 
 // -- parametric primitives (Phase 16) -- typed dimensions, then click to place ----
@@ -109,6 +118,7 @@ function observeSnapshotCounters(doc) {
   }
   for (const m of Object.values(doc.face_props || {})) scanEntries(m);
   scanEntries(doc.presence);
+  scanEntries(doc.generations);
   clock.observe(maxCounter);
 }
 
@@ -130,6 +140,8 @@ function loadSnapshot(doc) {
   }
   state.presence.clear();
   if (doc.presence) for (const e of doc.presence.entries) if (!e.d) state.presence.set(e.k, e.v);
+  state.generations.clear();
+  if (doc.generations) for (const e of doc.generations.entries) if (!e.d) state.generations.set(e.k, e.v);
   syncScene();
 }
 
@@ -157,6 +169,8 @@ function applyOp(op) {
     } else {
       state.presence.delete(p.k);
     }
+  } else if (op.target === "generation") {
+    if (!p.d) state.generations.set(p.k, p.v); else state.generations.delete(p.k);
   }
 }
 
@@ -196,6 +210,12 @@ function setFacePropOp(faceId, key, value) {
 function removeFacePropOp(faceId, key) {
   return { target: "face_prop", face_id: faceId, payload: lwwOp(clock.tick(), key, null, true) };
 }
+function setGenerationOp(generationId, record) {
+  return { target: "generation", payload: lwwOp(clock.tick(), generationId, record, false) };
+}
+function removeGenerationOp(generationId) {
+  return { target: "generation", payload: lwwOp(clock.tick(), generationId, null, true) };
+}
 
 // -- undo / redo: fresh inverted ops each time, not snapshots ---------------------
 // Mirrors crdt_cad.crdt.mesh.MeshCRDT's undo/redo (same entry "kind"s, same
@@ -234,6 +254,8 @@ function applyInverse(entry) {
     op = addFaceIndexOnlyOp(entry.faceId); // re-flips membership only -- the RGA boundary was never touched by remove
   } else if (entry.kind === "face_prop_set") {
     op = entry.hadPrevious ? setFacePropOp(entry.faceId, entry.key, entry.previous) : removeFacePropOp(entry.faceId, entry.key);
+  } else if (entry.kind === "generation_set") {
+    op = entry.hadPrevious ? setGenerationOp(entry.generationId, entry.previous) : removeGenerationOp(entry.generationId);
   }
   applyOp(op);
   return [op];
@@ -262,10 +284,63 @@ function applyForward(entry) {
     op = removeFaceOp(entry.faceId);
   } else if (entry.kind === "face_prop_set") {
     op = setFacePropOp(entry.faceId, entry.key, entry.forwardValue);
+  } else if (entry.kind === "generation_set") {
+    op = setGenerationOp(entry.generationId, entry.forwardValue);
   }
   applyOp(op);
   return [op];
 }
+
+// -- AI-generation undo entries (Phase G4): one composite entry per generation ----
+// Converts a raw incoming op (wire format) into the same undo-entry "kind"
+// shape a local mutation would push, using PRE-apply state to capture
+// "previous"/"hadPrevious" -- must run *before* applyOp(op), not after,
+// or "previous" would already reflect this very op. face_geom/presence ops
+// return null (not undo-tracked): undoing "face_add" already hides a face
+// via face_index membership alone, mirroring MeshCRDT.undo's own
+// face_remove/face_add handling, which never touches the RGA boundary
+// either -- see that module's docstring.
+function undoEntryForIncomingOp(op) {
+  const p = op.payload;
+  if (op.target === "vertex") {
+    if (p.d) return { kind: "vertex_remove", vertexId: p.k, previous: state.vertices.get(p.k) };
+    if (state.vertices.has(p.k)) return { kind: "vertex_move", vertexId: p.k, previous: state.vertices.get(p.k), forward: p.v };
+    return { kind: "vertex_create", vertexId: p.k, position: p.v };
+  }
+  if (op.target === "edge") {
+    const [a, b] = decodeEdge(p.k);
+    return p.d ? { kind: "edge_remove", v1: a, v2: b } : { kind: "edge_add", v1: a, v2: b };
+  }
+  if (op.target === "face_index") {
+    return p.d ? { kind: "face_remove", faceId: p.k } : { kind: "face_add", faceId: p.k };
+  }
+  if (op.target === "face_prop") {
+    const props = state.faceProps.get(op.face_id) || {};
+    const hadPrevious = Object.prototype.hasOwnProperty.call(props, p.k);
+    return {
+      kind: "face_prop_set", faceId: op.face_id, key: p.k,
+      hadPrevious, previous: hadPrevious ? props[p.k] : null, forwardValue: p.v,
+    };
+  }
+  if (op.target === "generation") {
+    const hadPrevious = state.generations.has(p.k);
+    return {
+      kind: "generation_set", generationId: p.k,
+      hadPrevious, previous: hadPrevious ? state.generations.get(p.k) : null, forwardValue: p.v,
+    };
+  }
+  return null;
+}
+
+// Accumulated while *this* client's own in-flight generation/edit request
+// streams its ops back over the WS relay (generationInFlight, set by
+// generateMesh()) -- pushed as one composite undo entry when the request
+// completes, so undoing an AI generation (or an edit of one) removes it
+// as a single step, never one vertex at a time. Scoped to the requesting
+// client only: a collaborator just watching this generation arrive does
+// NOT get it pushed onto *their* own undo stack (generationInFlight is
+// only ever true on the tab that actually clicked Generate/Apply edit).
+let pendingGenerationUndoEntries = [];
 
 function undo() {
   const entry = undoStack.pop();
@@ -288,7 +363,17 @@ function redo() {
 // -- relay connection -----------------------------------------------------------
 
 function applyIncomingOps(ops, fromActor) {
-  for (const op of ops) applyOp(op);
+  // Phase G4: undo entries must be computed from *pre*-apply state, so
+  // this happens inline per-op rather than in a separate pass after the
+  // loop below (which would only ever see already-mutated state).
+  const trackGenerationUndo = fromActor === AI_GENERATOR_ACTOR_ID && generationInFlight;
+  for (const op of ops) {
+    if (trackGenerationUndo) {
+      const entry = undoEntryForIncomingOp(op);
+      if (entry) pendingGenerationUndoEntries.push(entry);
+    }
+    applyOp(op);
+  }
   ui.opsCount += ops.length;
   syncScene();
   // Phase D7: drives the AI-generation progress line off the same real
@@ -706,19 +791,21 @@ async function generateMesh() {
     showToast("Describe what to generate first", "error");
     return;
   }
+  const editOf = ui.editingGenerationId; // captured now -- Cancel edit mid-flight must not retarget an in-flight request
   genBtn.disabled = true;
-  genBtn.textContent = "Generating…";
+  genBtn.textContent = editOf ? "Applying edit…" : "Generating…";
   generationInFlight = true;
   generationStagesSeen.clear();
   generationSceneObjectsSeen.clear();
+  pendingGenerationUndoEntries = [];
   genPromptInput.classList.add("ai-thinking");
-  genStatus.textContent = "Interpreting your prompt...";
+  genStatus.textContent = editOf ? "Interpreting your edit..." : "Interpreting your prompt...";
   const stopOrbit = orbitCameraDuringGeneration();
   try {
     const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/generate`, "mesh", room), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify(editOf ? { prompt, edit_of: editOf } : { prompt }),
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
@@ -746,8 +833,17 @@ async function generateMesh() {
     const validity = result.watertight && result.manifold ? "watertight" : "not fully watertight (see below)";
     showToast(`Built by ${result.actor} -- ${result.vertex_count} vertices, ${result.face_count} faces`, "success");
     genStatus.textContent =
-      `Last generation: ${escapeHtml(result.generator)} (${describeGeneratedSpec(result.generator, result.spec)}), ` +
+      `${editOf ? "Edited" : "Last generation"}: ${escapeHtml(result.generator)} (${describeGeneratedSpec(result.generator, result.spec)}), ` +
       `${validity}, interpreted via ${via}, mesh via ${meshVia}, ${result.batches} batch(es).`;
+    // Phase G4: one-unit undo -- every op this request's own ops batches
+    // streamed back (captured op-by-op in applyIncomingOps, since this
+    // client is the one with generationInFlight set) becomes one
+    // composite entry, so Ctrl+Z removes the whole generation/edit, not
+    // one vertex at a time.
+    if (pendingGenerationUndoEntries.length) {
+      pushUndo({ kind: "composite", entries: pendingGenerationUndoEntries });
+    }
+    if (editOf) genPromptInput.value = ""; // an applied edit consumes the prompt; a fresh Generate call keeps it (existing behavior)
   } catch (err) {
     // Danger toast with the server's own reason, an inline Retry (the
     // prompt box is never cleared on failure, so Retry just re-submits
@@ -756,7 +852,7 @@ async function generateMesh() {
     genStatus.textContent = `Generation failed: ${err.message}`;
   } finally {
     genBtn.disabled = false;
-    genBtn.textContent = "Generate";
+    genBtn.textContent = ui.editingGenerationId ? "Apply edit" : "Generate";
     generationInFlight = false;
     genPromptInput.classList.remove("ai-thinking");
     stopOrbit();
@@ -1154,8 +1250,16 @@ function flashRemoteEdit(id, cssColor) {
   setTimeout(() => { remoteEditFlashes.delete(id); syncScene(); }, 600);
 }
 
+const GENERATION_HIGHLIGHT_COLOR = 0x2ee6a6;
+
 function faceColor(faceId) {
   if (remoteEditFlashes.has(faceId)) return remoteEditFlashes.get(faceId);
+  // Phase G4 "Select" on a generation row -- a temporary highlight, same
+  // override precedence as a remote-edit flash, cleared by clicking
+  // "Select" again or selecting a different generation.
+  if (ui.highlightedGenerationId && state.faceProps.get(faceId)?.generation_id === ui.highlightedGenerationId) {
+    return GENERATION_HIGHLIGHT_COLOR;
+  }
   const props = state.faceProps.get(faceId);
   if (props && typeof props.color === "string" && /^#[0-9a-fA-F]{6}$/.test(props.color)) {
     return parseInt(props.color.slice(1), 16);
@@ -1678,6 +1782,7 @@ function renderPanels() {
   renderVertexList();
   renderFaceList();
   renderPresenceList();
+  renderGenerationList();
 }
 
 function renderToolHint() {
@@ -1787,6 +1892,57 @@ function renderFaceList() {
       renderPanels();
     });
     row.querySelector('[data-act="del"]').onclick = () => removeFace(id);
+    list.appendChild(row);
+  }
+}
+
+// -- AI generations (Phase G4): provenance, "select everything from this
+// generation," and arming the Generate button to edit one in place -------------
+
+function setEditingGeneration(id) {
+  ui.editingGenerationId = id;
+  genPromptInput.value = "";
+  genPromptInput.placeholder = id
+    ? "Describe your change, e.g. \"make it taller\" or \"5 bedrooms instead\""
+    : "e.g. a wooden table, or a 4 bedroom house with a gable roof";
+  genBtn.textContent = id ? "Apply edit" : "Generate";
+  if (id) genPromptInput.focus();
+  renderPanels();
+}
+
+function renderGenerationList() {
+  const list = document.getElementById("generationList");
+  if (!list) return;
+  document.getElementById("generationCount").textContent = state.generations.size;
+  list.innerHTML = "";
+  if (state.generations.size === 0) {
+    list.innerHTML = '<div class="empty-hint">Generations you create will show up here -- select one to highlight its geometry, or edit it in place with a follow-up prompt.</div>';
+    return;
+  }
+  // Most-recently-created first: generation ids are minted in creation
+  // order (`new_id("gen")` -- monotonically-assigned, not sortable
+  // lexically), so this reads the underlying LWWMap insertion order,
+  // which for a freshly-loaded room matches wire arrival order (the
+  // order the snapshot's own `entries` array lists them in).
+  const rows = [...state.generations.entries()].reverse();
+  for (const [id, record] of rows) {
+    const prompt = record.prompt || "";
+    const truncated = prompt.length > 44 ? `${prompt.slice(0, 44)}…` : prompt;
+    const row = document.createElement("div");
+    row.className = "path-row" + (id === ui.editingGenerationId ? " active" : "");
+    row.innerHTML = `
+      <span class="path-swatch" style="background:${id === ui.highlightedGenerationId ? "#2ee6a6" : "#d7dbe0"}"></span>
+      <span class="name" title="${escapeHtml(prompt)}"><strong>${escapeHtml(record.generator_name || "?")}</strong>: ${escapeHtml(truncated)}</span>
+      <button class="ghost-btn" data-act="select" title="Select this generation's faces" aria-label="Select">${iconHtml("eye")}</button>
+      <button class="ghost-btn" data-act="edit" title="Edit this generation" aria-label="Edit">${iconHtml("pen")}</button>
+    `;
+    row.querySelector('[data-act="select"]').onclick = () => {
+      ui.highlightedGenerationId = ui.highlightedGenerationId === id ? null : id;
+      syncScene();
+    };
+    row.querySelector('[data-act="edit"]').onclick = () => {
+      setEditingGeneration(ui.editingGenerationId === id ? null : id);
+    };
     list.appendChild(row);
   }
 }

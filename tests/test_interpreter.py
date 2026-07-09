@@ -7,9 +7,11 @@ from crdt_cad.ai import REGISTRY  # noqa: F401 -- triggers registration
 from crdt_cad.ai.dsl import DSLProgramSpec
 from crdt_cad.ai.house_spec import HouseSpec
 from crdt_cad.ai.interpreter import (
+    _heuristic_edit,
     _heuristic_house_spec,
     _heuristic_interpret,
     _heuristic_scene_interpret,
+    interpret_edit,
     interpret_prompt,
     llm_repair_dsl_program,
 )
@@ -362,3 +364,107 @@ def test_interpret_prompt_falls_back_end_to_end_on_refusal(fake_anthropic_module
     assert name == "house"
     assert spec.bedrooms == 3
     assert spec.floor_material == "wood"
+
+
+# -- follow-up edits (Phase G4) -----------------------------------------------------
+
+
+_TABLE_RECORD = {
+    "generator_name": "table",
+    "spec": {"width_m": 1.4, "depth_m": 0.8, "height_m": 0.75, "top_thickness_m": 0.04, "material": "wood"},
+}
+_HOUSE_RECORD = {
+    "generator_name": "house",
+    "spec": {
+        "bedrooms": 2, "floors": 1, "floor_material": "concrete", "style": "modern", "wall_height_m": 2.7,
+        "garage": False, "roof_type": "flat", "floor_area_sq_m": None, "wall_material": "concrete",
+        "roof_material": "concrete", "front_door": True, "front_windows": 2, "bedrooms_per_floor": None,
+    },
+}
+
+
+def test_heuristic_edit_scales_the_hinted_axis_only():
+    spec = _heuristic_edit("table", _TABLE_RECORD["spec"], "make it taller")
+    assert spec.height_m > _TABLE_RECORD["spec"]["height_m"]
+    assert spec.width_m == _TABLE_RECORD["spec"]["width_m"]
+    assert spec.depth_m == _TABLE_RECORD["spec"]["depth_m"]
+
+
+def test_heuristic_edit_shrinks_on_a_shrink_keyword():
+    spec = _heuristic_edit("table", _TABLE_RECORD["spec"], "make it shorter")
+    assert spec.height_m < _TABLE_RECORD["spec"]["height_m"]
+
+
+def test_heuristic_edit_scales_every_dimension_without_an_axis_hint():
+    spec = _heuristic_edit("table", _TABLE_RECORD["spec"], "make it bigger")
+    assert spec.height_m > _TABLE_RECORD["spec"]["height_m"]
+    assert spec.width_m > _TABLE_RECORD["spec"]["width_m"]
+    assert spec.depth_m > _TABLE_RECORD["spec"]["depth_m"]
+
+
+def test_heuristic_edit_leaves_unmentioned_fields_untouched():
+    spec = _heuristic_edit("table", _TABLE_RECORD["spec"], "make it taller")
+    assert spec.material == "wood"
+    assert spec.top_thickness_m == _TABLE_RECORD["spec"]["top_thickness_m"]
+
+
+def test_heuristic_edit_house_bedroom_override():
+    spec = _heuristic_edit("house", _HOUSE_RECORD["spec"], "5 bedrooms instead")
+    assert spec.bedrooms == 5
+    assert spec.floors == _HOUSE_RECORD["spec"]["floors"]
+    assert spec.floor_material == _HOUSE_RECORD["spec"]["floor_material"]
+
+
+def test_heuristic_edit_house_roof_and_material_overrides():
+    spec = _heuristic_edit("house", _HOUSE_RECORD["spec"], "give it a gable roof and a wood floor")
+    assert spec.roof_type == "gable"
+    assert spec.floor_material == "wood"
+    assert spec.bedrooms == _HOUSE_RECORD["spec"]["bedrooms"]  # untouched
+
+
+def test_heuristic_edit_house_garage_add_and_remove():
+    added = _heuristic_edit("house", _HOUSE_RECORD["spec"], "add a garage")
+    assert added.garage is True
+    removed = _heuristic_edit("house", {**_HOUSE_RECORD["spec"], "garage": True}, "remove the garage")
+    assert removed.garage is False
+
+
+def test_interpret_edit_falls_back_to_heuristic_without_credentials():
+    name, spec, source = interpret_edit("make it taller", _TABLE_RECORD)
+    assert name == "table"
+    assert source == "heuristic"
+    assert spec.height_m > _TABLE_RECORD["spec"]["height_m"]
+
+
+def test_llm_edit_sends_current_spec_and_forces_the_same_generator_tool(fake_anthropic_module):
+    from crdt_cad.ai.interpreter import _llm_edit
+
+    updated_payload = {**_TABLE_RECORD["spec"], "height_m": 1.0}
+    client = _FakeAnthropicClient(_FakeResponse("table", updated_payload))
+    fake_anthropic_module["client"] = client
+
+    spec = _llm_edit("make it taller", "table", _TABLE_RECORD["spec"])
+    assert spec.height_m == 1.0
+
+    sent = client.beta.messages._last_kwargs
+    assert sent["tool_choice"] == {"type": "tool", "name": "table"}
+    assert sent["tools"][0]["name"] == "table"
+    assert "height_m" in sent["messages"][0]["content"]  # the current spec JSON was actually sent
+
+
+def test_llm_edit_raises_on_refusal(fake_anthropic_module):
+    from crdt_cad.ai.interpreter import _llm_edit
+
+    fake_anthropic_module["client"] = _FakeAnthropicClient(
+        _FakeResponse("table", _TABLE_RECORD["spec"], stop_reason="refusal")
+    )
+    with pytest.raises(RuntimeError):
+        _llm_edit("make it taller", "table", _TABLE_RECORD["spec"])
+
+
+def test_interpret_edit_uses_llm_result_when_available(fake_anthropic_module):
+    updated_payload = {**_TABLE_RECORD["spec"], "height_m": 1.0}
+    fake_anthropic_module["client"] = _FakeAnthropicClient(_FakeResponse("table", updated_payload))
+    name, spec, source = interpret_edit("make it taller", _TABLE_RECORD)
+    assert source == "llm"
+    assert spec.height_m == 1.0

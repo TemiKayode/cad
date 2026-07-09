@@ -182,6 +182,69 @@ def test_generate_endpoint_dsl_prompt_populates_the_room(monkeypatch):
     assert len(export["face_index"]["entries"]) == body["face_count"]
 
 
+def test_generate_endpoint_response_includes_generation_id():
+    client = _client()
+    resp = client.post("/api/mesh/genroom-provenance/generate", json={"prompt": "a wooden chair"})
+    body = resp.json()
+    assert body["generation_id"]
+
+
+def test_generate_endpoint_edit_of_regenerates_under_the_same_generation_id():
+    client = _client()
+    first = client.post("/api/mesh/genroom-edit/generate", json={"prompt": "a wooden table"}).json()
+
+    edited = client.post(
+        "/api/mesh/genroom-edit/generate",
+        json={"prompt": "make it taller", "edit_of": first["generation_id"]},
+    ).json()
+    assert edited["generation_id"] == first["generation_id"]
+    assert edited["generator"] == "table"
+    assert edited["spec"]["height_m"] > first["spec"]["height_m"]
+
+    # the room now has exactly one generation's worth of live geometry --
+    # the old faces/vertices were removed, not left behind as duplicates
+    export = client.get("/api/mesh/genroom-edit/export/json").json()
+    live_faces = [e for e in export["face_index"]["entries"] if not e.get("d")]
+    assert len(live_faces) == edited["face_count"]
+
+
+def test_generate_endpoint_edit_of_unknown_generation_returns_422():
+    client = _client()
+    resp = client.post(
+        "/api/mesh/genroom-edit2/generate", json={"prompt": "taller", "edit_of": "nonexistent_gen_id"},
+    )
+    assert resp.status_code == 422
+    assert "nonexistent_gen_id" in resp.json()["detail"]
+
+
+def test_generate_endpoint_edit_of_a_scene_generation_returns_422():
+    client = _client()
+    first = client.post(
+        "/api/mesh/genroom-edit3/generate", json={"prompt": "a table with four chairs around it"},
+    ).json()
+    resp = client.post(
+        "/api/mesh/genroom-edit3/generate",
+        json={"prompt": "make the table bigger", "edit_of": first["generation_id"]},
+    )
+    assert resp.status_code == 422
+    assert "scene" in resp.json()["detail"].lower()
+
+
+def test_generate_endpoint_edit_does_not_disturb_other_generations_in_the_room():
+    client = _client()
+    table = client.post("/api/mesh/genroom-edit4/generate", json={"prompt": "a wooden table"}).json()
+    chair = client.post("/api/mesh/genroom-edit4/generate", json={"prompt": "a wooden chair"}).json()
+
+    client.post(
+        "/api/mesh/genroom-edit4/generate",
+        json={"prompt": "make it taller", "edit_of": table["generation_id"]},
+    )
+
+    export = client.get("/api/mesh/genroom-edit4/export/json").json()
+    live_faces = [e for e in export["face_index"]["entries"] if not e.get("d")]
+    assert len(live_faces) == table["face_count"] + chair["face_count"]
+
+
 def test_generate_endpoint_returns_422_on_generation_failure(monkeypatch):
     def boom(prompt, *, actor_id="ai_generator_bot"):
         raise ValueError("simulated malformed geometry")

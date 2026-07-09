@@ -82,7 +82,13 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from crdt_cad.ai.generator import DEFAULT_ACTOR_ID, generate_mesh_ops
+from crdt_cad.ai.generator import (
+    DEFAULT_ACTOR_ID,
+    EditNotSupportedError,
+    generate_edit_ops,
+    generate_mesh_ops,
+    generation_geometry,
+)
 from crdt_cad.ai.validation import GenerationValidationError
 from crdt_cad.crdt.clock import LamportClock, VectorClock
 from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
@@ -1032,6 +1038,10 @@ async def export_mesh_step(room_id: str) -> Response:
 
 class GenerateMeshRequest(BaseModel):
     prompt: str
+    # Phase G4 follow-up edits: set while a generation is selected in the
+    # UI to send `prompt` to the pipeline as "edit this spec" instead of
+    # a fresh dispatch -- see `generate_edit_ops`.
+    edit_of: Optional[str] = None
 
 
 class GenerateMeshResult(BaseModel):
@@ -1047,6 +1057,7 @@ class GenerateMeshResult(BaseModel):
     batches: int
     watertight: bool
     manifold: bool
+    generation_id: str  # Phase G4 provenance: select/edit this generation later by this id
 
 
 @app.post(
@@ -1080,16 +1091,41 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
 
     room = await mesh_room_manager.get_or_create(room_id)
 
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(generate_mesh_ops, req.prompt),
-            timeout=GENERATION_TIMEOUT_SECONDS,
+    # Phase G4 follow-up edits: reads the live document (which faces/
+    # vertices/edges belong to the selected generation, this actor's
+    # current Lamport counter) on the event loop, *before* dispatching
+    # to the worker thread -- generate_edit_ops itself never touches
+    # `room.doc`, so there's no cross-thread mutation risk (see its own
+    # docstring for the full reasoning).
+    edit_args: tuple = ()
+    if req.edit_of:
+        prior_record = room.doc.generation(req.edit_of)
+        if prior_record is None:
+            raise HTTPException(status_code=422, detail=f"no generation with id {req.edit_of!r} in this room")
+        old_face_ids, old_vertex_ids, old_edges = generation_geometry(
+            room.doc.face_loops(), {fid: room.doc.face_props_dict(fid) for fid in room.doc.face_loops()}, req.edit_of,
         )
+        start_counter = room.doc.frontier().get(DEFAULT_ACTOR_ID)
+        edit_args = (req.edit_of, prior_record, old_face_ids, old_vertex_ids, old_edges, start_counter)
+
+    try:
+        if edit_args:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(generate_edit_ops, req.prompt, *edit_args),
+                timeout=GENERATION_TIMEOUT_SECONDS,
+            )
+        else:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(generate_mesh_ops, req.prompt),
+                timeout=GENERATION_TIMEOUT_SECONDS,
+            )
     except asyncio.TimeoutError as exc:
         raise HTTPException(
             status_code=504,
             detail=f"mesh generation exceeded the {GENERATION_TIMEOUT_SECONDS:.0f}s timeout",
         ) from exc
+    except EditNotSupportedError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GenerationValidationError as exc:
         # Rule 1 (AI_GENERATION_PROMPT.md): a validation failure is a
         # visible, typed error -- never a silently-injected broken mesh.
@@ -1141,6 +1177,7 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
         batches=batches,
         watertight=result.validation.watertight,
         manifold=result.validation.manifold,
+        generation_id=result.generation_id,
     )
 
 

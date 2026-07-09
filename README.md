@@ -35,7 +35,7 @@ offline to see the **Time-Travel Merge** panel.
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
-| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G3 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G4-G7 (iterative editing/undo, report-card UI, eval harness, hosted ML tier) not started |
+| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G4 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), **provenance + spec persistence + follow-up edits + one-unit undo** (select/edit/undo a whole generation, not vertex by vertex), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G5-G7 (report-card UI, eval harness, hosted ML tier) not started |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
@@ -937,6 +937,135 @@ geometry, only a small **JSON program** in a closed grammar
   exhausted-repairs fallback with a keyword-matched archetype, the
   source≠"llm" defensive guard never calling the LLM) and an
   end-to-end HTTP test in `test_generation_endpoint.py`.
+
+### Provenance, follow-up edits, and one-unit undo (Phase G4)
+
+Every generation up through G3 was a one-shot, anonymous drop into the
+room -- no way to select "everything that AI generation built," no way
+to say "make it taller" without retyping the whole prompt, no way to
+undo a hundred-face generation except vertex by vertex. Phase G4 adds
+all three without inventing new CRDT machinery: it reuses the exact
+per-face property bag and undo/redo primitives every other phase
+already built on.
+
+- **Provenance**: every generation mints a `generation_id`
+  (`crdt.mesh.new_id("gen")`) and tags *every face it produces* with it
+  via `set_face_prop(face_id, "generation_id", generation_id)` -- the
+  same `face_props` LWWMap-per-face mechanism already carrying
+  "material"/"color"/"scene_object", now with one more key. A whole
+  scene (Phase G2) is one generation, one id -- undoing it removes
+  every object at once, matching what the user actually asked for. The
+  AI Generate panel gained an **AI Generations** list (`mesh3d.js`'s
+  `renderGenerationList`): each row's eye button toggles a highlight
+  (a distinct color override in `faceColor()`, same precedence tier as
+  the existing remote-edit flash) over every face tagged with that
+  generation -- "select everything from this generation," live-
+  verified to persist correctly across a regenerate (the highlight
+  survives an edit because the new geometry is tagged with the *same*
+  id).
+- **Spec persistence**: a new top-level `MeshCRDT.generations: LWWMap[str, dict]`
+  (a new `"generation"` `MeshOp` target, wired through `apply`/`merge`/
+  `frontier`/`ops_since`/`to_dict`/`from_dict` exactly like every
+  existing sub-CRDT) stores each generation's *final* prompt/generator/
+  spec as one record, overwritten wholesale on edit rather than
+  appended to -- "final spec," not a history, per the brief's own
+  wording. Whole-record LWW (not per-field, unlike `face_props`) is the
+  right granularity here: an edit always replaces the entire record at
+  once, there's no scenario where two fields of the same generation's
+  spec need to merge independently.
+- **Follow-up edits**: clicking a generation's pencil button arms the
+  Generate button as "Apply edit" (`ui.editingGenerationId`, toggled
+  off by clicking the same pencil again); the next prompt goes to
+  `interpret_edit` (`interpreter.py`) as *edit this spec*, not a fresh
+  dispatch -- the generator never changes (a table stays a table). The
+  LLM path sends the current spec JSON plus the edit instruction,
+  forced back onto the *same* generator's tool
+  (`tool_choice={"type":"tool","name":entry.name}`), asking for the
+  complete updated spec. The heuristic (no-API-key) path
+  (`_heuristic_edit`) covers the brief's own examples directly: generic
+  scale keywords ("taller"/"wider"/"bigger"/...) adjust only the
+  `_m`-suffixed field(s) a keyword hints at (or every one, for an
+  axis-agnostic "bigger"/"smaller"), and house-specific overrides
+  ("5 bedrooms instead", "give it a gable roof") reuse
+  `_heuristic_house_spec`'s own extraction regexes, applied as
+  overrides on top of the prior spec rather than a fresh default-filled
+  one -- every field the edit text doesn't mention survives untouched.
+  `generate_edit_ops` regenerates the mesh from the new spec and
+  applies the delta as ordinary CRDT ops: remove the old generation's
+  geometry, add the new geometry under the *same* generation id.
+  **Scoped to single-object (registry) generations only** for this
+  phase -- editing a scene or a DSL program raises
+  `EditNotSupportedError` (a clear 422, never a silent no-op or a
+  wrong result) rather than a half-implemented "which sub-object?"
+  guess; a documented scope boundary, revisit if a future phase needs
+  it.
+- **A real, pre-existing bug found and fixed while building this**:
+  every generator's own `build()` restarts vertex/face ids at v1/f1,
+  which is harmless in isolation but means two *separate* generations
+  landing in the same room used to silently collide -- a second
+  generation's `add_vertex("v1", ...)` doesn't create a new vertex, it
+  overwrites the first's (an LWWMap `set` on an existing key is a move,
+  not a create), corrupting the earlier generation's geometry. This
+  predates G4 (confirmed against G1/G2 code) but only became obvious
+  while reasoning through the edit path's own id-collision risk against
+  a live room document. Fixed once, centrally, in `_mint_ops_for_mesh`'s
+  new `_fresh_ids` remap (every generation path -- single-object, scene,
+  DSL, DSL-fallback -- routes through it), with a dedicated regression
+  test (`test_two_separate_generations_in_the_same_room_do_not_collide`)
+  generating a table then a chair into one document and asserting both
+  survive at their full vertex/face counts.
+- **A second correctness subtlety, also caught before it shipped**: an
+  edit's *removal* ops need to out-rank the room's already-applied
+  *creation* ops from the same `ai_generator_bot` actor identity, but a
+  brand-new `LamportClock(actor=...)` always starts at counter 0 --
+  fine for the fresh ids every other path mints (nothing to race
+  against yet), but a removal op with a low counter silently loses the
+  LWW comparison against a much-higher-counter original creation,
+  leaving "removed" geometry still live. `generate_edit_ops` seeds its
+  clock from `room.doc.frontier().get(actor_id)`; a dedicated
+  regression test deliberately passes an *unseeded* counter (0) and
+  confirms the old geometry incorrectly survives, proving the seeded
+  path is the one that actually matters, not just a defensive-looking
+  no-op.
+- **One-unit undo**: extends the existing client-side undo/redo
+  reimplementation (`mesh3d.js`, mirroring `MeshCRDT.undo`/`redo`'s own
+  `{"kind": "composite", "entries": [...]}` grouping already used for
+  extrude/primitive placement) rather than inventing new undo
+  machinery. `undoEntryForIncomingOp` converts each raw op arriving
+  during *this client's own* in-flight generation/edit request
+  (`generationInFlight`, computed from **pre**-apply state -- undo
+  entries are built inline in `applyIncomingOps`'s loop, one op ahead
+  of `applyOp`, not in a separate pass afterward that would only ever
+  see already-mutated state) into the same entry shapes a local
+  mutation already produces, pushed as one composite entry when the
+  request completes. Scoped to the requesting client only -- a
+  collaborator just watching a generation arrive never gets it pushed
+  onto *their* undo stack, since `generationInFlight` is only ever true
+  on the tab that clicked Generate/Apply edit. Because an edit is
+  "remove old ops + add new ops + overwrite the generation record,"
+  all three fall out of the *same* conversion mechanism automatically
+  -- undoing an edit restores the old geometry **and** the old spec-
+  persistence record (prompt included) in the same single step, with
+  no separate code path needed for that combination.
+- **Live-verified in a real browser**, screenshot-confirmed at every
+  step: generate a table (0.75m tall) → the AI Generations panel shows
+  one entry → click Select (table renders in the highlight color) →
+  click Edit (button becomes "Apply edit", placeholder changes) → type
+  "make it taller" → Apply edit (table visibly taller, 0.975m, still in
+  the highlight color since the new geometry inherited the same
+  generation id, panel entry updates to "table: make it taller",
+  generation count stays at 1, not 2) → **Ctrl+Z** → table reverts to
+  its original height (0.75m, confirmed via the vertex list's own Y
+  values) *and* the panel entry reverts to "table: a wooden table" --
+  one undo, both the geometry and the record. A dedicated e2e test
+  (`tests/e2e/test_ai_generation_e2e.py`) pins this exact round trip in
+  CI. 23 new unit/integration tests across `test_mesh.py` (the
+  `generations` CRDT itself: set/read/merge/serialize/undo/redo),
+  `test_generator.py` (provenance tagging on every path, the collision
+  regression, `generate_edit_ops` success/rejection/seeded-counter
+  cases), `test_interpreter.py` (heuristic and mocked-LLM edit
+  interpretation), and `test_generation_endpoint.py` (the `/generate`
+  endpoint's new `edit_of` parameter end to end).
 
 **3D-print preparation** (`mesh_repair.py`) is a separate, opt-in path
 -- *not* part of the CRDT-injection pipeline, per the brief's own

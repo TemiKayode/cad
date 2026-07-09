@@ -29,6 +29,7 @@ generation feature should be "slightly less clever," never "broken."
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
@@ -325,3 +326,139 @@ def interpret_prompt(prompt: str) -> tuple[str, BaseModel, str]:
         logger.info("LLM prompt interpretation unavailable (%s); using the heuristic dispatcher", exc)
         name, spec = _heuristic_interpret(prompt)
         return name, spec, "heuristic"
+
+
+# -- follow-up edits (Phase G4): "edit this spec", not a fresh dispatch -----------
+
+_EDIT_SYSTEM_PROMPT = (
+    "You are given an existing object's current specification as JSON and a "
+    "plain-English edit request. Call the provided tool with the COMPLETE "
+    "updated specification -- copy every field from the current spec "
+    "unchanged except the ones the edit request actually asks to change. "
+    "Never invent a change the request doesn't mention."
+)
+
+_SCALE_UP_KEYWORDS = ("taller", "bigger", "larger", "wider", "deeper", "longer", "higher")
+_SCALE_DOWN_KEYWORDS = ("shorter", "smaller", "narrower", "lower")
+# Which "_m"-suffixed field name fragments a scale keyword targets --
+# empty tuple means "no specific axis, scale every _m field" (e.g.
+# "bigger"/"smaller" don't say which dimension).
+_SCALE_AXIS_HINTS: dict[str, tuple[str, ...]] = {
+    "taller": ("height",), "higher": ("height",), "shorter": ("height",), "lower": ("height",),
+    "wider": ("width",), "narrower": ("width",),
+    "deeper": ("depth",), "longer": ("width", "depth"),
+}
+
+
+def interpret_edit(edit_prompt: str, prior_record: dict) -> tuple[str, BaseModel, str]:
+    """Phase G4 follow-up edits: a prompt entered while a generation is
+    selected goes to Claude as *edit this spec*, not a fresh dispatch --
+    the generator never changes (a table stays a table; only its
+    spec's fields do). Same LLM-first, heuristic-fallback-on-any-
+    failure shape as :func:`interpret_prompt`. ``prior_record`` is a
+    Phase G4 spec-persistence record (``{"generator_name", "spec",
+    ...}``) as stored in ``MeshCRDT.generations``."""
+    generator_name = prior_record["generator_name"]
+    try:
+        new_spec = _llm_edit(edit_prompt, generator_name, prior_record["spec"])
+        return generator_name, new_spec, "llm"
+    except Exception as exc:
+        logger.info("LLM edit interpretation unavailable (%s); using the heuristic editor", exc)
+        new_spec = _heuristic_edit(generator_name, prior_record["spec"], edit_prompt)
+        return generator_name, new_spec, "heuristic"
+
+
+def _llm_edit(edit_prompt: str, generator_name: str, prior_spec: dict) -> BaseModel:
+    """Raises on any failure, same contract as ``_llm_interpret``. Not
+    live-verified against the real API (no ``ANTHROPIC_API_KEY`` in this
+    environment, same honesty rule as the DSL repair call) -- exercised
+    only via a mocked client in tests."""
+    import anthropic
+
+    entry = get_generator(generator_name)
+    client = anthropic.Anthropic()
+    response = client.beta.messages.create(
+        model="claude-fable-5",
+        max_tokens=1024,
+        betas=["server-side-fallback-2026-06-01"],
+        fallbacks=[{"model": "claude-opus-4-8"}],
+        system=_EDIT_SYSTEM_PROMPT,
+        tools=[{"name": entry.name, "description": entry.description, "input_schema": entry.spec_model.model_json_schema()}],
+        tool_choice={"type": "tool", "name": entry.name},
+        messages=[{"role": "user", "content": f"Current spec: {json.dumps(prior_spec)}\n\nEdit request: {edit_prompt}"}],
+    )
+    if response.stop_reason == "refusal":
+        raise RuntimeError(f"model declined the edit request: {getattr(response, 'stop_details', None)}")
+    tool_use = next(block for block in response.content if block.type == "tool_use")
+    return entry.spec_model(**tool_use.input)
+
+
+def _heuristic_edit(generator_name: str, prior_spec: dict, edit_prompt: str) -> BaseModel:
+    """No-API-key parameter edits ("taller", "5 bedrooms instead") --
+    only overrides fields the edit text actually mentions, leaving
+    everything else exactly as the prior spec had it (unlike a fresh
+    heuristic dispatch, which only ever fills in defaults)."""
+    entry = get_generator(generator_name)
+    updated = dict(prior_spec)
+    lowered = edit_prompt.lower()
+
+    if generator_name == "house":
+        _apply_house_edit_overrides(updated, lowered)
+
+    factor = None
+    axis_hint: tuple[str, ...] = ()
+    for keyword in _SCALE_UP_KEYWORDS:
+        if keyword in lowered:
+            factor = 1.3
+            axis_hint = _SCALE_AXIS_HINTS.get(keyword, ())
+            break
+    if factor is None:
+        for keyword in _SCALE_DOWN_KEYWORDS:
+            if keyword in lowered:
+                factor = 0.75
+                axis_hint = _SCALE_AXIS_HINTS.get(keyword, ())
+                break
+
+    if factor is not None:
+        for key, value in list(updated.items()):
+            if not key.endswith("_m") or not isinstance(value, (int, float)):
+                continue
+            if axis_hint and not any(hint in key for hint in axis_hint):
+                continue
+            updated[key] = round(value * factor, 3)
+
+    return entry.spec_model(**updated)
+
+
+def _apply_house_edit_overrides(spec_dict: dict, lowered_edit_prompt: str) -> None:
+    """Mirrors ``_heuristic_house_spec``'s own extraction regexes, but
+    only *overrides* a field when the edit text actually matches
+    something -- everything else in `spec_dict` is left as the prior
+    generation had it."""
+    m = re.search(r"(\d+)\s*[- ]?\s*(?:bed\s*room|bedroom|br\b)", lowered_edit_prompt)
+    if m:
+        spec_dict["bedrooms"] = max(1, min(12, int(m.group(1))))
+
+    m = re.search(r"(\d+)\s*[- ]?\s*(?:stor(?:y|ey|ies)|floor)", lowered_edit_prompt)
+    if m:
+        spec_dict["floors"] = max(1, min(4, int(m.group(1))))
+
+    if "gable" in lowered_edit_prompt:
+        spec_dict["roof_type"] = "gable"
+    elif "hip roof" in lowered_edit_prompt or "hipped roof" in lowered_edit_prompt:
+        spec_dict["roof_type"] = "hip"
+    elif "flat roof" in lowered_edit_prompt:
+        spec_dict["roof_type"] = "flat"
+
+    if "garage" in lowered_edit_prompt:
+        spec_dict["garage"] = not any(
+            phrase in lowered_edit_prompt for phrase in ("no garage", "without a garage", "remove the garage")
+        )
+
+    for keyword, material in (
+        ("wooden", "wood"), ("wood", "wood"), ("timber", "wood"), ("marble", "marble"),
+        ("tiled", "tile"), ("tile", "tile"), ("carpet", "carpet"), ("concrete", "concrete"), ("stone", "stone"),
+    ):
+        if keyword in lowered_edit_prompt:
+            spec_dict["floor_material"] = material
+            break

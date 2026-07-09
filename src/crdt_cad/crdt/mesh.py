@@ -70,7 +70,7 @@ def decode_edge(key: str) -> Edge:
 class MeshOp:
     """A routable envelope around one op from one of the mesh's sub-CRDTs."""
 
-    target: str  # "vertex" | "edge" | "face_index" | "face_geom"
+    target: str  # "vertex" | "edge" | "face_index" | "face_geom" | "face_prop" | "presence" | "generation"
     payload: dict
     face_id: Optional[FaceId] = None
 
@@ -91,6 +91,16 @@ class MeshCRDT:
         self.faces: dict[FaceId, RGA[VertexId]] = {}
         self.face_props: dict[FaceId, LWWMap] = {}  # face_id -> {color, material, ...}
         self.presence: LWWMap[str, dict] = LWWMap(clock)  # actor id -> ephemeral cursor/focus payload
+        # Phase G4 (Part 5): AI-generation provenance/spec-persistence record,
+        # keyed by generation id -> {"prompt", "generator_name", "spec",
+        # "interpretation_source", "mesh_source"}. An LWWMap (not a plain
+        # dict) for the same reason every other piece of shared room state
+        # is one: it needs to merge across replicas without a hand-rolled
+        # conflict rule, and a whole-record last-writer-wins is the right
+        # granularity here (an edit always replaces the *entire* record,
+        # never patches one field of it, so there's no reason to split it
+        # into per-field entries the way face_props does).
+        self.generations: LWWMap[str, dict] = LWWMap(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -179,6 +189,28 @@ class MeshCRDT:
         self._redo.clear()
         op = props.set(key, value)
         return MeshOp("face_prop", op.to_dict(), face_id=face_id)
+
+    # -- local mutation: AI-generation provenance/spec records (Phase G4) ----
+    def set_generation(self, generation_id: str, record: dict) -> MeshOp:
+        had_previous = generation_id in self.generations
+        self._undo.append(
+            {
+                "kind": "generation_set",
+                "generation_id": generation_id,
+                "previous": self.generations.get(generation_id) if had_previous else None,
+                "had_previous": had_previous,
+                "forward_value": record,
+            }
+        )
+        self._redo.clear()
+        op = self.generations.set(generation_id, record)
+        return MeshOp("generation", op.to_dict())
+
+    def generation(self, generation_id: str) -> Optional[dict]:
+        return self.generations.get(generation_id)
+
+    def generations_dict(self) -> dict[str, dict]:
+        return dict(self.generations.items())
 
     def extrude_face(self, face_id: FaceId, height: float) -> list[MeshOp]:
         """Extrudes a face along +Y by ``height``: duplicates its boundary
@@ -289,6 +321,12 @@ class MeshCRDT:
             props = self._face_props(entry["face_id"])
             op = props.set(entry["key"], entry["previous"]) if entry["had_previous"] else props.delete(entry["key"])
             return [MeshOp("face_prop", op.to_dict(), face_id=entry["face_id"])]
+        if kind == "generation_set":
+            op = (
+                self.generations.set(entry["generation_id"], entry["previous"])
+                if entry["had_previous"] else self.generations.delete(entry["generation_id"])
+            )
+            return [MeshOp("generation", op.to_dict())]
         raise ValueError(f"unknown undo entry kind: {kind}")
 
     def _apply_forward(self, entry: dict) -> list[MeshOp]:
@@ -315,6 +353,9 @@ class MeshCRDT:
         if kind == "face_prop_set":
             op = self._face_props(entry["face_id"]).set(entry["key"], entry["forward_value"])
             return [MeshOp("face_prop", op.to_dict(), face_id=entry["face_id"])]
+        if kind == "generation_set":
+            op = self.generations.set(entry["generation_id"], entry["forward_value"])
+            return [MeshOp("generation", op.to_dict())]
         raise ValueError(f"unknown redo entry kind: {kind}")
 
     # -- local mutation: presence (ephemeral, per-actor) ----------------------
@@ -338,6 +379,8 @@ class MeshCRDT:
             return self._face_props(op.face_id).apply(LWWOp.from_dict(op.payload))
         if op.target == "presence":
             return self.presence.apply(LWWOp.from_dict(op.payload))
+        if op.target == "generation":
+            return self.generations.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown mesh op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -353,6 +396,7 @@ class MeshCRDT:
             if face_id in other.face_props:
                 changed |= self._face_props(face_id).merge(other.face_props[face_id])
         changed |= self.presence.merge(other.presence)
+        changed |= self.generations.merge(other.generations)
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -383,6 +427,7 @@ class MeshCRDT:
         for m in self.face_props.values():
             vc = vc.merge(m.frontier())
         vc = vc.merge(self.presence.frontier())
+        vc = vc.merge(self.generations.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[MeshOp]:
@@ -397,6 +442,7 @@ class MeshCRDT:
         for face_id, m in self.face_props.items():
             out += [MeshOp("face_prop", op.to_dict(), face_id=face_id) for op in m.ops_since(vc)]
         out += [MeshOp("presence", op.to_dict()) for op in self.presence.ops_since(vc)]
+        out += [MeshOp("generation", op.to_dict()) for op in self.generations.ops_since(vc)]
         return out
 
     # -- reads: presence ------------------------------------------------------
@@ -412,6 +458,7 @@ class MeshCRDT:
             "faces": {fid: rga.to_dict() for fid, rga in self.faces.items()},
             "face_props": {fid: m.to_dict() for fid, m in self.face_props.items()},
             "presence": self.presence.to_dict(),
+            "generations": self.generations.to_dict(),
         }
 
     @staticmethod
@@ -429,6 +476,8 @@ class MeshCRDT:
             }
         if "presence" in d:
             mesh.presence = LWWMap.from_dict(clock, d["presence"])
+        if "generations" in d:
+            mesh.generations = LWWMap.from_dict(clock, d["generations"])
         return mesh
 
     def to_bytes(self) -> bytes:

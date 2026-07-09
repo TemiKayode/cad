@@ -164,3 +164,69 @@ def test_face_prop_merge_and_serialization_roundtrip():
 
     restored = MeshCRDT.from_bytes(LamportClock(actor="c"), mesh.to_bytes())
     assert restored.face_props_dict("f1") == {"material": "wood"}
+
+
+# -- generation records (Phase G4: AI-generation provenance/spec persistence) ------
+
+
+def test_set_generation_and_read():
+    mesh = MeshCRDT(LamportClock(actor="bot"))
+    record = {"prompt": "a table", "generator_name": "table", "spec": {"width_m": 1.4}}
+    mesh.set_generation("gen_1", record)
+    assert mesh.generation("gen_1") == record
+    assert mesh.generations_dict() == {"gen_1": record}
+    assert mesh.generation("missing") is None
+
+
+def test_set_generation_overwrites_wholesale_on_edit():
+    mesh = MeshCRDT(LamportClock(actor="bot"))
+    mesh.set_generation("gen_1", {"prompt": "a table", "spec": {"height_m": 0.75}})
+    mesh.set_generation("gen_1", {"prompt": "make it taller", "spec": {"height_m": 0.975}})
+    assert mesh.generation("gen_1") == {"prompt": "make it taller", "spec": {"height_m": 0.975}}
+
+
+def test_generation_op_syncs_between_replicas():
+    mesh_a = MeshCRDT(LamportClock(actor="a"))
+    op = mesh_a.set_generation("gen_1", {"prompt": "a table"})
+
+    mesh_b = MeshCRDT(LamportClock(actor="b"))
+    mesh_b.apply(op)
+    assert mesh_b.generation("gen_1") == {"prompt": "a table"}
+
+
+def test_generation_merge_and_serialization_roundtrip():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    mesh.set_generation("gen_1", {"prompt": "a table"})
+
+    other = MeshCRDT(LamportClock(actor="b"))
+    other.merge(mesh)
+    assert other.generation("gen_1") == {"prompt": "a table"}
+
+    restored = MeshCRDT.from_bytes(LamportClock(actor="c"), mesh.to_bytes())
+    assert restored.generation("gen_1") == {"prompt": "a table"}
+
+
+def test_generation_undo_and_redo():
+    mesh = MeshCRDT(LamportClock(actor="bot"))
+    mesh.set_generation("gen_1", {"prompt": "a table"})
+    mesh.undo()
+    assert mesh.generation("gen_1") is None
+    mesh.redo()
+    assert mesh.generation("gen_1") == {"prompt": "a table"}
+
+
+def test_generation_undo_restores_previous_value_on_overwrite():
+    mesh = MeshCRDT(LamportClock(actor="bot"))
+    mesh.set_generation("gen_1", {"prompt": "a table"})
+    mesh.set_generation("gen_1", {"prompt": "make it taller"})
+    mesh.undo()
+    assert mesh.generation("gen_1") == {"prompt": "a table"}
+
+
+def test_generation_included_in_frontier_and_ops_since():
+    mesh = MeshCRDT(LamportClock(actor="bot"))
+    frontier_before = mesh.frontier()
+    mesh.set_generation("gen_1", {"prompt": "a table"})
+    delta = mesh.ops_since(frontier_before)
+    assert any(op.target == "generation" for op in delta)
+    assert mesh.frontier().get("bot") > frontier_before.get("bot")
