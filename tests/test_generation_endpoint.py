@@ -2,6 +2,7 @@ import sys
 import time
 import types
 
+import pytest
 from fastapi.testclient import TestClient
 
 from crdt_cad.ai.generator import GenerationResult
@@ -62,6 +63,12 @@ def test_generate_endpoint_broadcasts_ops_to_connected_clients():
         assert resp.status_code == 200
         body = resp.json()
 
+        # Phase G5: "understood: ..." chips arrive first, broadcast to the
+        # whole room before any geometry lands.
+        interpreting = ws.receive_json()
+        assert interpreting["type"] == "generation_interpreting"
+        assert interpreting["chips"]
+
         seen_vertex_ops = 0
         for _ in range(body["batches"]):
             msg = ws.receive_json()
@@ -69,6 +76,19 @@ def test_generate_endpoint_broadcasts_ops_to_connected_clients():
             assert msg["from"] == "ai_generator_bot"
             seen_vertex_ops += sum(1 for op in msg["ops"] if op["target"] == "vertex")
         assert seen_vertex_ops == body["vertex_count"]
+
+        # ... and the full report card arrives last, also room-wide -- a
+        # validity_warning may legitimately interleave first (the house
+        # generator isn't held to strict winding consistency, see
+        # validation.py), so scan forward rather than assume it's next.
+        report_card = None
+        for _ in range(3):
+            msg = ws.receive_json()
+            if msg["type"] == "report_card":
+                report_card = msg
+                break
+        assert report_card is not None
+        assert report_card["generation_id"] == body["generation_id"]
 
 
 def test_generate_endpoint_batches_large_meshes(monkeypatch):
@@ -125,6 +145,8 @@ def test_generate_endpoint_scene_batches_break_at_object_boundaries(monkeypatch)
         assert resp.status_code == 200
         body = resp.json()
         assert body["batches"] == 5
+
+        assert ws.receive_json()["type"] == "generation_interpreting"
 
         seen_scene_objects = set()
         for _ in range(body["batches"]):
@@ -246,10 +268,10 @@ def test_generate_endpoint_edit_does_not_disturb_other_generations_in_the_room()
 
 
 def test_generate_endpoint_returns_422_on_generation_failure(monkeypatch):
-    def boom(prompt, *, actor_id="ai_generator_bot"):
+    def boom(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
         raise ValueError("simulated malformed geometry")
 
-    monkeypatch.setattr(app_module, "generate_mesh_ops", boom)
+    monkeypatch.setattr(app_module, "generate_ops_from_interpretation", boom)
     client = _client()
     resp = client.post("/api/mesh/genroom5/generate", json={"prompt": "anything"})
     assert resp.status_code == 422
@@ -257,14 +279,14 @@ def test_generate_endpoint_returns_422_on_generation_failure(monkeypatch):
 
 
 def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
-    def slow(prompt, *, actor_id="ai_generator_bot"):
+    def slow(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
         time.sleep(0.3)
         return GenerationResult(
             ops=[], generator_name="house", spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
             vertex_count=0, face_count=0, triangle_count=0, validation=_EMPTY_VALIDATION,
         )
 
-    monkeypatch.setattr(app_module, "generate_mesh_ops", slow)
+    monkeypatch.setattr(app_module, "generate_ops_from_interpretation", slow)
     monkeypatch.setattr(app_module, "GENERATION_TIMEOUT_SECONDS", 0.05)
     client = _client()
     resp = client.post("/api/mesh/genroom6/generate", json={"prompt": "anything"})
@@ -272,14 +294,101 @@ def test_generate_endpoint_returns_504_on_timeout(monkeypatch):
 
 
 def test_generate_endpoint_returns_422_on_empty_mesh(monkeypatch):
-    def empty(prompt, *, actor_id="ai_generator_bot"):
+    def empty(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
         return GenerationResult(
             ops=[], generator_name="house", spec=HouseSpec(), interpretation_source="heuristic", mesh_source="procedural",
             vertex_count=0, face_count=0, triangle_count=0, validation=_EMPTY_VALIDATION,
         )
 
-    monkeypatch.setattr(app_module, "generate_mesh_ops", empty)
+    monkeypatch.setattr(app_module, "generate_ops_from_interpretation", empty)
     client = _client()
     resp = client.post("/api/mesh/genroom7/generate", json={"prompt": "anything"})
     assert resp.status_code == 422
     assert "empty mesh" in resp.json()["detail"]
+
+
+# -- Phase G5: report card fields, metrics, budget ---------------------------------
+
+
+def test_generate_endpoint_response_includes_report_card_fields():
+    client = _client()
+    resp = client.post("/api/mesh/genroom-reportcard/generate", json={"prompt": "a wooden table"})
+    body = resp.json()
+    assert body["path"] == "registry"
+    assert body["outcome"] == "success"
+    assert body["planar"] is True
+    assert body["non_planar_face_count"] == 0
+    assert body["within_bounds"] is True
+    assert len(body["bounding_box"]) == 3
+    assert body["elapsed_seconds"] > 0.0
+    assert body["interpretation_chips"]  # non-empty
+
+
+def test_generate_endpoint_scene_path_label_is_scene():
+    client = _client()
+    resp = client.post("/api/mesh/genroom-reportcard2/generate", json={"prompt": "a table with four chairs around it"})
+    assert resp.json()["path"] == "scene"
+
+
+def test_generate_endpoint_edit_path_label_is_edit():
+    client = _client()
+    first = client.post("/api/mesh/genroom-reportcard3/generate", json={"prompt": "a wooden table"}).json()
+    edited = client.post(
+        "/api/mesh/genroom-reportcard3/generate",
+        json={"prompt": "make it taller", "edit_of": first["generation_id"]},
+    ).json()
+    assert edited["path"] == "edit"
+
+
+def test_generate_endpoint_increments_success_metric():
+    before = app_module.metrics.generations_total.labels(outcome="success", path="registry")._value.get()
+    client = _client()
+    client.post("/api/mesh/genroom-metrics1/generate", json={"prompt": "a wooden chair"})
+    after = app_module.metrics.generations_total.labels(outcome="success", path="registry")._value.get()
+    assert after == before + 1
+
+
+def test_generate_endpoint_increments_latency_histogram():
+    before = app_module.metrics.generation_latency_seconds._sum.get()
+    client = _client()
+    client.post("/api/mesh/genroom-metrics2/generate", json={"prompt": "a wooden chair"})
+    after = app_module.metrics.generation_latency_seconds._sum.get()
+    assert after > before
+
+
+def test_generate_endpoint_increments_failure_metric_on_validation_error(monkeypatch):
+    def boom(prompt, generator_name, spec, source, *, actor_id="ai_generator_bot"):
+        raise ValueError("simulated failure")
+
+    monkeypatch.setattr(app_module, "generate_ops_from_interpretation", boom)
+    # the failure happens *after* interpretation but the endpoint only
+    # commits to a path label once the whole pipeline succeeds -- "unknown"
+    # is the honest label for a build-phase failure, not a guess at what
+    # the path would have been.
+    before = app_module.metrics.generations_total.labels(outcome="failure", path="unknown")._value.get()
+    client = _client()
+    resp = client.post("/api/mesh/genroom-metrics3/generate", json={"prompt": "a wooden chair"})
+    assert resp.status_code == 422
+    after = app_module.metrics.generations_total.labels(outcome="failure", path="unknown")._value.get()
+    assert after == before + 1
+
+
+def test_generate_budget_endpoint_reflects_remaining_capacity():
+    client = _client()
+    first = client.get("/api/mesh/genroom-budget/generate/budget").json()
+    assert first["remaining"] == first["capacity"]  # unused IP starts full
+    assert first["per_minute"] > 0
+
+    client.post("/api/mesh/genroom-budget/generate", json={"prompt": "a wooden table"})
+    second = client.get("/api/mesh/genroom-budget/generate/budget").json()
+    # a real POST /generate takes real wall-clock time, during which the
+    # bucket keeps continuously refilling -- allow generous slack rather
+    # than assert an exact "spent exactly 1 token" delta.
+    assert second["remaining"] < first["remaining"]
+
+
+def test_generate_budget_endpoint_does_not_itself_spend_budget():
+    client = _client()
+    a = client.get("/api/mesh/genroom-budget2/generate/budget").json()
+    b = client.get("/api/mesh/genroom-budget2/generate/budget").json()
+    assert a["remaining"] == pytest.approx(b["remaining"], abs=0.01)

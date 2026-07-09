@@ -16,6 +16,7 @@ inherently about the live room/event loop, not about generation.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from pydantic import BaseModel
@@ -110,6 +111,13 @@ class GenerationResult:
     # construct a `GenerationResult` directly (before this field existed)
     # don't need updating -- every real code path always sets it.
     generation_id: str = ""
+    # Phase G5 report card field: total wall-clock time for this call.
+    # The endpoint overwrites this with its own, more precise measurement
+    # spanning both the early-interpretation phase (broadcast as "understood:
+    # ..." chips) and the build phase, since those run as two separate
+    # to_thread calls there -- this default covers direct (non-endpoint)
+    # callers, e.g. tests, that invoke this module's functions standalone.
+    elapsed_seconds: float = 0.0
 
 
 def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> GenerationResult:
@@ -133,8 +141,22 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
     silently inject a broken mesh) -- callers (the REST endpoint) turn
     this into a typed, visible error response.
     """
+    start = time.monotonic()
     generator_name, spec, source = interpret_prompt(prompt)
+    result = generate_ops_from_interpretation(prompt, generator_name, spec, source, actor_id=actor_id)
+    result.elapsed_seconds = time.monotonic() - start
+    return result
 
+
+def generate_ops_from_interpretation(
+    prompt: str, generator_name: str, spec: BaseModel, source: str, *, actor_id: str = DEFAULT_ACTOR_ID,
+) -> GenerationResult:
+    """The rest of the pipeline once ``(generator_name, spec, source)``
+    is already known -- split out from :func:`generate_mesh_ops` so the
+    server (Phase G5) can call ``interpret_prompt`` itself, broadcast
+    "understood: ..." chips to the room *before* geometry lands, and
+    only then run this (slower) half as its own worker-thread call,
+    without interpreting the prompt twice."""
     if generator_name == "scene":
         return _generate_scene_ops(prompt, spec, source, actor_id=actor_id)
     if generator_name == "dsl":
@@ -175,6 +197,40 @@ def generate_mesh_ops(prompt: str, *, actor_id: str = DEFAULT_ACTOR_ID) -> Gener
         validation=validation,
         generation_id=generation_id,
     )
+
+
+def interpretation_chips(generator_name: str, spec: BaseModel) -> list[str]:
+    """Short "understood: ..." chips (Phase G5) summarizing what
+    interpretation produced -- broadcast to the whole room immediately
+    after ``interpret_prompt``/``interpret_edit`` returns, before any
+    geometry has been built, so collaborators see what the model or
+    heuristic understood even while the mesh is still being generated.
+    The "after" counterpart to this is ``mesh3d.js``'s own
+    ``describeGeneratedSpec``, which renders the *final* per-generation
+    summary once geometry has actually landed -- deliberately not
+    shared code, since a Python dict and a JS object need their own
+    natural idioms, but the same information."""
+    d = spec.model_dump()
+    if generator_name == "house":
+        chips = [f"{d['bedrooms']} bedroom(s)", f"{d['floors']} floor(s)", f"{d['floor_material']} floor", f"{d['style']} style"]
+        if d.get("garage"):
+            chips.append("garage")
+        if d.get("roof_type") and d["roof_type"] != "flat":
+            chips.append(f"{d['roof_type']} roof")
+        return chips
+    if generator_name == "scene":
+        counts: dict[str, int] = {}
+        for obj in d.get("objects", []):
+            counts[obj["generator"]] = counts.get(obj["generator"], 0) + obj.get("count", 1)
+        return [f"{n}x {name}" if n > 1 else name for name, n in counts.items()]
+    if generator_name == "dsl":
+        root_op = (d.get("root") or {}).get("op", "shape")
+        chips = [f"custom {root_op} shape"]
+        if d.get("material"):
+            chips.append(d["material"])
+        return chips
+    chips = [f"{k.replace('_m', '')}: {v}m" for k, v in d.items() if isinstance(v, (int, float)) and k.endswith("_m")][:4]
+    return chips or [generator_name]
 
 
 def _generation_record(prompt: str, generator_name: str, spec: BaseModel, source: str, mesh_source: str) -> dict:
@@ -322,6 +378,22 @@ def generate_edit_ops(
     ops here would silently no-op, leaving the "removed" geometry still
     live. Pass ``room.doc.frontier().get(actor_id)``.
     """
+    start = time.monotonic()
+    check_edit_supported(prior_record)
+    new_generator_name, new_spec, source = interpret_edit(edit_prompt, prior_record)
+    result = generate_edit_ops_from_interpretation(
+        edit_prompt, generation_id, new_generator_name, new_spec, source,
+        old_face_ids, old_vertex_ids, old_edges, start_counter, actor_id=actor_id,
+    )
+    result.elapsed_seconds = time.monotonic() - start
+    return result
+
+
+def check_edit_supported(prior_record: dict) -> None:
+    """Raises :class:`EditNotSupportedError` for a scene/DSL generation
+    -- split out so the server (Phase G5) can check this *before*
+    calling ``interpret_edit`` (and before broadcasting "understood:
+    ..." chips for an edit that's about to be rejected anyway)."""
     generator_name = prior_record["generator_name"]
     if generator_name not in REGISTRY:
         raise EditNotSupportedError(
@@ -329,9 +401,25 @@ def generate_edit_ops(
             "only single-object registry generations (not scenes or custom DSL shapes) can be edited"
         )
 
-    new_generator_name, new_spec, source = interpret_edit(edit_prompt, prior_record)
-    mesh = get_generator(new_generator_name).build(new_spec)
-    relax = new_generator_name in _RELAXED_VALIDATION_GENERATORS
+
+def generate_edit_ops_from_interpretation(
+    edit_prompt: str,
+    generation_id: str,
+    generator_name: str,
+    new_spec: BaseModel,
+    source: str,
+    old_face_ids: list[str],
+    old_vertex_ids: list[str],
+    old_edges: list[tuple[str, str]],
+    start_counter: int,
+    *,
+    actor_id: str = DEFAULT_ACTOR_ID,
+) -> GenerationResult:
+    """The rest of :func:`generate_edit_ops` once ``interpret_edit`` has
+    already run -- split out for the same early-chip-broadcast reason as
+    :func:`generate_ops_from_interpretation`."""
+    mesh = get_generator(generator_name).build(new_spec)
+    relax = generator_name in _RELAXED_VALIDATION_GENERATORS
     validation = (
         validate_generated_mesh(mesh, require_watertight=False, require_consistent_winding=False)
         if relax else validate_or_raise(mesh)
@@ -348,12 +436,12 @@ def generate_edit_ops(
         ops.append(scratch.remove_vertex(vertex_id))
     ops.extend(_mint_ops_for_mesh(scratch, mesh, generation_id))
     ops.append(scratch.set_generation(
-        generation_id, _generation_record(edit_prompt, new_generator_name, new_spec, source, "procedural"),
+        generation_id, _generation_record(edit_prompt, generator_name, new_spec, source, "procedural"),
     ))
 
     return GenerationResult(
         ops=ops,
-        generator_name=new_generator_name,
+        generator_name=generator_name,
         spec=new_spec,
         interpretation_source=source,
         mesh_source="procedural",

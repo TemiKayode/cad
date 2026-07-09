@@ -72,7 +72,7 @@ import os
 import socket
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -85,10 +85,13 @@ from pydantic import BaseModel
 from crdt_cad.ai.generator import (
     DEFAULT_ACTOR_ID,
     EditNotSupportedError,
-    generate_edit_ops,
-    generate_mesh_ops,
+    check_edit_supported,
+    generate_edit_ops_from_interpretation,
+    generate_ops_from_interpretation,
     generation_geometry,
+    interpretation_chips,
 )
+from crdt_cad.ai.interpreter import interpret_edit, interpret_prompt
 from crdt_cad.ai.validation import GenerationValidationError
 from crdt_cad.crdt.clock import LamportClock, VectorClock
 from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
@@ -1040,7 +1043,7 @@ class GenerateMeshRequest(BaseModel):
     prompt: str
     # Phase G4 follow-up edits: set while a generation is selected in the
     # UI to send `prompt` to the pipeline as "edit this spec" instead of
-    # a fresh dispatch -- see `generate_edit_ops`.
+    # a fresh dispatch -- see `generate_edit_ops_from_interpretation`.
     edit_of: Optional[str] = None
 
 
@@ -1058,6 +1061,134 @@ class GenerateMeshResult(BaseModel):
     watertight: bool
     manifold: bool
     generation_id: str  # Phase G4 provenance: select/edit this generation later by this id
+    # Phase G5 report card fields -- honest by construction: these are
+    # exactly what `ValidationReport` returned, never a rosier summary.
+    planar: bool
+    non_planar_face_count: int
+    within_bounds: bool
+    bounding_box: tuple[float, float, float]
+    elapsed_seconds: float
+    path: str  # "registry" | "scene" | "dsl" | "meshy" | "edit"
+    outcome: str  # "success" | "fallback" | "repair_retry"
+    interpretation_chips: list[str]
+
+
+class GenerateBudgetResult(BaseModel):
+    remaining: float
+    capacity: float
+    per_minute: float
+
+
+@app.get(
+    "/api/mesh/{room_id}/generate/budget",
+    response_model=GenerateBudgetResult,
+    dependencies=[Depends(require_room_access("mesh"))],
+)
+async def generate_budget(room_id: str, request: Request) -> GenerateBudgetResult:
+    """Phase G5 cost guardrail: lets the UI show remaining generation
+    budget *before* a surprise 429, not after. Per-IP, not per-room
+    (`room_id` is only in the URL for consistency with every other mesh
+    endpoint) -- a pure peek (`PerKeyRateLimiter.remaining`), never
+    spends a token itself, safe to poll as often as the UI wants."""
+    client_ip = security.client_ip(request)
+    return GenerateBudgetResult(
+        remaining=security.generate_rate_limiter.remaining(client_ip),
+        capacity=security.generate_rate_limiter.capacity(),
+        per_minute=security.generate_per_minute(),
+    )
+
+
+def _generation_outcome(result) -> str:
+    if result.dsl_attempts:
+        if result.dsl_attempts[-1]["outcome"] == "failed":
+            return "fallback"
+        if len(result.dsl_attempts) > 1:
+            return "repair_retry"
+    return "success"
+
+
+async def _interpret_and_generate(room: "Room", req: "GenerateMeshRequest") -> tuple:
+    """Runs interpretation, broadcasts "understood: ..." chips to the
+    *whole room* (Phase G5: shown before geometry lands, not just to the
+    requester), then runs the (slower) build phase. Both phases run in a
+    worker thread (`asyncio.to_thread`) since both can do real network/
+    CPU work; this coroutine itself does no blocking work of its own, so
+    it's safe to run inside `_run_cancellable`. Returns
+    ``(GenerationResult, path_label, outcome)``.
+    """
+    if req.edit_of:
+        prior_record = room.doc.generation(req.edit_of)
+        if prior_record is None:
+            raise HTTPException(status_code=422, detail=f"no generation with id {req.edit_of!r} in this room")
+        check_edit_supported(prior_record)
+        old_face_ids, old_vertex_ids, old_edges = generation_geometry(
+            room.doc.face_loops(), {fid: room.doc.face_props_dict(fid) for fid in room.doc.face_loops()}, req.edit_of,
+        )
+        start_counter = room.doc.frontier().get(DEFAULT_ACTOR_ID)
+        generator_name, spec, source = await asyncio.to_thread(interpret_edit, req.prompt, prior_record)
+        await room.broadcast({
+            "type": "generation_interpreting",
+            "chips": interpretation_chips(generator_name, spec),
+            "generator": generator_name, "path": "edit", "interpretation_source": source,
+        })
+        result = await asyncio.to_thread(
+            generate_edit_ops_from_interpretation, req.prompt, req.edit_of, generator_name, spec, source,
+            old_face_ids, old_vertex_ids, old_edges, start_counter, actor_id=DEFAULT_ACTOR_ID,
+        )
+        return result, "edit", _generation_outcome(result)
+
+    generator_name, spec, source = await asyncio.to_thread(interpret_prompt, req.prompt)
+    await room.broadcast({
+        "type": "generation_interpreting",
+        "chips": interpretation_chips(generator_name, spec),
+        "generator": generator_name, "path": generator_name, "interpretation_source": source,
+    })
+    result = await asyncio.to_thread(
+        generate_ops_from_interpretation, req.prompt, generator_name, spec, source, actor_id=DEFAULT_ACTOR_ID,
+    )
+    path = generator_name if generator_name in ("scene", "dsl") else ("meshy" if result.mesh_source == "meshy" else "registry")
+    return result, path, _generation_outcome(result)
+
+
+class GenerationCancelledError(Exception):
+    """Raised by :func:`_run_cancellable` when the client disconnects
+    (an aborted ``fetch`` -- Phase G5's cancel button) before the
+    generation finished."""
+
+
+async def _run_cancellable(coro, request: Request, *, poll_interval: float = 0.5):
+    """Runs `coro` as a background task, polling `request.is_disconnected()`
+    (Starlette's real ASGI-level disconnect signal, which fires when the
+    client's connection actually drops -- e.g. an `AbortController`-driven
+    fetch abort) and cancelling the task the moment that's observed.
+
+    Honesty note, not glossed over: `asyncio.to_thread` (used inside
+    `coro`) schedules work on a real OS thread, and Python cannot forcibly
+    kill a running thread. Cancelling *this* task stops the server from
+    committing/broadcasting a result and returns control to the caller
+    immediately -- a thread-pool worker already mid-build keeps running in
+    the background regardless, its result simply discarded when it
+    finishes. That's still a real, meaningful cancellation from the
+    user's point of view (no ops land in the room, no response is sent,
+    the room is never touched by the cancelled attempt), just not a
+    literal OS-level kill -- the same limitation every Python web
+    framework built on a thread pool has.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            if await request.is_disconnected():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+                raise GenerationCancelledError()
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=poll_interval)
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 @app.post(
@@ -1066,21 +1197,25 @@ class GenerateMeshResult(BaseModel):
     dependencies=[Depends(require_editor_access("mesh"))],
 )
 async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request) -> GenerateMeshResult:
-    """Text -> 3D: interprets ``req.prompt`` into a :class:`HouseSpec`
-    (Claude Fable 5 if available, a regex heuristic otherwise), builds a
-    deterministic procedural mesh from it, mints a chronological batch of
-    CRDT ops for it under the ``ai_generator_bot`` actor identity, and
-    commits them into the room in bounded-size chunks.
+    """Text -> 3D: interprets ``req.prompt`` (Claude Fable 5 if
+    available, a regex heuristic otherwise), broadcasts "understood:
+    ..." chips to the whole room (Phase G5, before geometry lands),
+    builds a deterministic procedural mesh, mints a chronological batch
+    of CRDT ops for it under the ``ai_generator_bot`` actor identity,
+    commits them into the room in bounded-size chunks, and broadcasts a
+    full report card.
 
-    The heavy work (LLM call + geometry construction) runs in a worker
-    thread via ``asyncio.to_thread`` so it never blocks this room's (or
-    any other room's) WebSocket loop, and is wrapped in a timeout so a
-    hung LLM call can't tie up a thread-pool slot forever. Rate-limited
-    per client IP (``CRDT_CAD_GENERATE_PER_MINUTE``, default 6/min) since
-    each call burns real LLM spend and/or CPU time -- unlike the other
-    endpoints in this module, this limit applies unconditionally, even
-    when room auth is off, because the resource cost is real regardless
-    of whether the deployment cares about access control.
+    The heavy work runs in worker threads via ``asyncio.to_thread`` so
+    it never blocks this room's (or any other room's) WebSocket loop,
+    wrapped in both a timeout (a hung LLM call can't tie up a thread-pool
+    slot forever) and a real cancellation path (Phase G5: an aborted
+    client request actually stops the request, see `_run_cancellable`).
+    Rate-limited per client IP (``CRDT_CAD_GENERATE_PER_MINUTE``, default
+    6/min, remaining budget peekable via ``GET .../generate/budget``)
+    since each call burns real LLM spend and/or CPU time -- unlike the
+    other endpoints in this module, this limit applies unconditionally,
+    even when room auth is off, because the resource cost is real
+    regardless of whether the deployment cares about access control.
     """
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt must not be empty")
@@ -1090,47 +1225,37 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
         raise HTTPException(status_code=429, detail="generation rate limit exceeded -- try again shortly")
 
     room = await mesh_room_manager.get_or_create(room_id)
-
-    # Phase G4 follow-up edits: reads the live document (which faces/
-    # vertices/edges belong to the selected generation, this actor's
-    # current Lamport counter) on the event loop, *before* dispatching
-    # to the worker thread -- generate_edit_ops itself never touches
-    # `room.doc`, so there's no cross-thread mutation risk (see its own
-    # docstring for the full reasoning).
-    edit_args: tuple = ()
-    if req.edit_of:
-        prior_record = room.doc.generation(req.edit_of)
-        if prior_record is None:
-            raise HTTPException(status_code=422, detail=f"no generation with id {req.edit_of!r} in this room")
-        old_face_ids, old_vertex_ids, old_edges = generation_geometry(
-            room.doc.face_loops(), {fid: room.doc.face_props_dict(fid) for fid in room.doc.face_loops()}, req.edit_of,
-        )
-        start_counter = room.doc.frontier().get(DEFAULT_ACTOR_ID)
-        edit_args = (req.edit_of, prior_record, old_face_ids, old_vertex_ids, old_edges, start_counter)
+    request_start = time.monotonic()
+    path_for_metrics = "edit" if req.edit_of else "unknown"
 
     try:
-        if edit_args:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(generate_edit_ops, req.prompt, *edit_args),
-                timeout=GENERATION_TIMEOUT_SECONDS,
-            )
-        else:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(generate_mesh_ops, req.prompt),
-                timeout=GENERATION_TIMEOUT_SECONDS,
-            )
+        result, path, outcome = await asyncio.wait_for(
+            _run_cancellable(_interpret_and_generate(room, req), request),
+            timeout=GENERATION_TIMEOUT_SECONDS,
+        )
+        path_for_metrics = path
     except asyncio.TimeoutError as exc:
+        metrics.generations_total.labels(outcome="failure", path=path_for_metrics).inc()
+        metrics.generation_latency_seconds.observe(time.monotonic() - request_start)
         raise HTTPException(
             status_code=504,
             detail=f"mesh generation exceeded the {GENERATION_TIMEOUT_SECONDS:.0f}s timeout",
         ) from exc
+    except GenerationCancelledError as exc:
+        metrics.generations_total.labels(outcome="cancelled", path=path_for_metrics).inc()
+        metrics.generation_latency_seconds.observe(time.monotonic() - request_start)
+        raise HTTPException(status_code=499, detail="generation cancelled by client") from exc
     except EditNotSupportedError as exc:
+        metrics.generations_total.labels(outcome="failure", path=path_for_metrics).inc()
+        metrics.generation_latency_seconds.observe(time.monotonic() - request_start)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GenerationValidationError as exc:
         # Rule 1 (AI_GENERATION_PROMPT.md): a validation failure is a
         # visible, typed error -- never a silently-injected broken mesh.
         # The report's own fields (not just a joined string) are surfaced
         # so a client can render exactly what failed, not just "it failed".
+        metrics.generations_total.labels(outcome="failure", path=path_for_metrics).inc()
+        metrics.generation_latency_seconds.observe(time.monotonic() - request_start)
         logger.warning("room %s: generation failed validation for prompt %r: %s", room_id, req.prompt, exc.report.errors)
         raise HTTPException(
             status_code=422,
@@ -1142,11 +1267,19 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
                 "within_bounds": exc.report.within_bounds,
             },
         ) from exc
+    except HTTPException:
+        metrics.generations_total.labels(outcome="failure", path=path_for_metrics).inc()
+        metrics.generation_latency_seconds.observe(time.monotonic() - request_start)
+        raise
     except Exception as exc:
+        metrics.generations_total.labels(outcome="failure", path=path_for_metrics).inc()
+        metrics.generation_latency_seconds.observe(time.monotonic() - request_start)
         logger.exception("room %s: mesh generation failed for prompt %r", room_id, req.prompt)
         raise HTTPException(status_code=422, detail=f"could not generate mesh: {exc}") from exc
 
     if not result.ops:
+        metrics.generations_total.labels(outcome="failure", path=path).inc()
+        metrics.generation_latency_seconds.observe(time.monotonic() - request_start)
         raise HTTPException(status_code=422, detail="generation produced an empty mesh (malformed geometry)")
 
     if result.object_ops is not None:
@@ -1158,11 +1291,38 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
         )
     else:
         batches = await room.commit_ops_batched(result.ops, actor=DEFAULT_ACTOR_ID, batch_size=GENERATION_OPS_BATCH_SIZE)
+
+    elapsed = time.monotonic() - request_start
+    metrics.generations_total.labels(outcome=outcome, path=path).inc()
+    metrics.generation_latency_seconds.observe(elapsed)
     logger.info(
         "room mesh/%s: generated %d ops (%d vertices, %d faces) from prompt %r via %s (%s/%s), sent in %d batches",
         room_id, len(result.ops), result.vertex_count, result.face_count, req.prompt,
         result.generator_name, result.interpretation_source, result.mesh_source, batches,
     )
+
+    report_card = {
+        "type": "report_card",
+        "generation_id": result.generation_id,
+        "generator": result.generator_name,
+        "path": path,
+        "outcome": outcome,
+        "interpretation_source": result.interpretation_source,
+        "mesh_source": result.mesh_source,
+        "watertight": result.validation.watertight,
+        "manifold": result.validation.manifold,
+        "planar": result.validation.planar,
+        "non_planar_face_count": result.validation.non_planar_face_count,
+        "within_bounds": result.validation.within_bounds,
+        "vertex_count": result.vertex_count,
+        "face_count": result.face_count,
+        "triangle_count": result.triangle_count,
+        "bounding_box": result.validation.bounding_box,
+        "elapsed_seconds": elapsed,
+        "dsl_attempts": result.dsl_attempts,
+        "errors": result.validation.errors,
+    }
+    await room.broadcast(report_card)
 
     return GenerateMeshResult(
         actor=DEFAULT_ACTOR_ID,
@@ -1178,6 +1338,14 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
         watertight=result.validation.watertight,
         manifold=result.validation.manifold,
         generation_id=result.generation_id,
+        planar=result.validation.planar,
+        non_planar_face_count=result.validation.non_planar_face_count,
+        within_bounds=result.validation.within_bounds,
+        bounding_box=result.validation.bounding_box,
+        elapsed_seconds=elapsed,
+        path=path,
+        outcome=outcome,
+        interpretation_chips=interpretation_chips(result.generator_name, result.spec),
     )
 
 

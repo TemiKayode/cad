@@ -35,7 +35,7 @@ offline to see the **Time-Travel Merge** panel.
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
-| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G4 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), **provenance + spec persistence + follow-up edits + one-unit undo** (select/edit/undo a whole generation, not vertex by vertex), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G5-G7 (report-card UI, eval harness, hosted ML tier) not started |
+| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G5 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), **provenance + spec persistence + follow-up edits + one-unit undo** (select/edit/undo a whole generation, not vertex by vertex), a **report card + Prometheus metrics + a real cancel button + budget guardrails** (success measured, not asserted), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G6-G7 (eval harness, hosted ML tier) not started |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
@@ -1066,6 +1066,103 @@ already built on.
   cases), `test_interpreter.py` (heuristic and mocked-LLM edit
   interpretation), and `test_generation_endpoint.py` (the `/generate`
   endpoint's new `edit_of` parameter end to end).
+
+### Report cards, metrics, cancel, and budget guardrails (Phase G5)
+
+"Shows success" measured, not asserted, per the brief's own framing of
+this phase: every generation now produces a structured, honest report
+card (not just a prose status line), the server exposes real Prometheus
+counters/histograms/an alert rule for it, a Cancel button actually stops
+an in-flight request, and the UI surfaces remaining rate-limit budget
+before a surprise 429 rather than after.
+
+- **Interpretation chips before geometry lands**: `generator.py` was
+  split into `interpret_prompt`/`interpret_edit` (unchanged) plus a new
+  `generate_ops_from_interpretation`/`generate_edit_ops_from_interpretation`
+  half that assumes interpretation already happened -- the endpoint now
+  calls interpretation *itself*, broadcasts a `generation_interpreting`
+  WS message (`interpretation_chips()`, e.g. "4 bedroom(s) · wood floor
+  · gable roof" for a house, "table · 4x chair" for a scene, "custom
+  box shape · metal" for a DSL program) to the *whole room*, and only
+  then runs the slower build phase as its own `asyncio.to_thread` call.
+  No prompt is ever interpreted twice.
+- **Report card**: broadcast as a `report_card` WS message once a
+  generation completes -- watertight/manifold/**planar** (a genuinely
+  new check, `validation._check_planarity`, testing each face's
+  *original* polygon loop against a fitted plane; informational only,
+  since no existing generator has ever produced a non-planar face and
+  promoting it to a hard gate would be an untested new failure mode),
+  within-bounds, vertex/face counts, bounding-box dimensions, which
+  path produced it (`registry`/`scene`/`dsl`/`meshy`/`edit`) and via
+  which interpretation source, the outcome (`success`/`fallback`/
+  `repair_retry`), elapsed wall-clock time, and DSL retry-attempt
+  detail when relevant. Rendered as a real structured "Report Card"
+  panel (`renderReportCard`, `mesh3d.js`) -- honest by construction,
+  since it renders exactly what `ValidationReport` returned, never a
+  rosier summary. Broadcasting rather than only returning it in the
+  HTTP response means every collaborator in the room sees the same
+  card the requester does, not just whoever clicked Generate.
+- **Metrics**: `crdt_cad_generations_total{outcome,path}` (a labeled
+  Counter) and `crdt_cad_generation_latency_seconds` (this module's
+  first real `Histogram` -- every other timing metric here is a
+  `Summary`, which can't be aggregated correctly across multiple
+  processes the way a `Histogram`'s bucketed counts can) are
+  incremented at every exit path of `/generate`, success or failure,
+  with a `path="unknown"` label for the honest case where a failure
+  happened before the pipeline knew which path it was on. A new
+  Grafana dashboard row (`monitoring/grafana-dashboard.json`, panels
+  8-9: generations-by-outcome rate, p50/p95 latency) and one alert
+  rule (`CrdtCadGenerationFailureRateHigh`, `monitoring/alerts.yml` --
+  fires when >30% of generations fail/cancel over a 10-minute window).
+- **Cancel, actually cancelling**: the Cancel button
+  (`AbortController` + `fetch(..., {signal})`) aborts the client's own
+  connection; server-side, `_run_cancellable` polls Starlette's real
+  `request.is_disconnected()` (the genuine ASGI-level disconnect
+  signal an aborted fetch triggers) and cancels the in-flight task the
+  moment that's observed. **Honesty note, not glossed over**: the
+  actual geometry-building work runs via `asyncio.to_thread` on a real
+  OS thread, which Python cannot forcibly kill -- cancelling stops the
+  server from committing/broadcasting a result and returns control to
+  the client immediately (confirmed live: a cancelled request commits
+  *zero* ops, logs no success line), but an already-dispatched thread
+  pool worker keeps running in the background regardless, its result
+  simply discarded once it finishes. Still a real, meaningful
+  cancellation from the user's point of view, just not a literal
+  OS-level kill -- the same limitation every thread-pool-based Python
+  web framework has. 5 dedicated unit tests
+  (`tests/test_generation_cancel.py`) exercise `_run_cancellable`
+  directly against a fake disconnect-after-N-polls request, including
+  a regression guard for the realistic-yield subtlety that surfaced
+  while writing them (an `async def` fake with no internal `await`
+  doesn't actually yield to the event loop, which could cancel a task
+  before its body ever runs a single line -- fixed in the fake, not
+  production code, but worth documenting since it's a genuine asyncio
+  gotcha).
+- **Budget guardrails**: `TokenBucket`/`PerKeyRateLimiter` gained a
+  `remaining()` peek method (the same continuous-refill formula
+  `allow()` uses, computed fresh each call, never spending a token) and
+  a new `GET /api/mesh/{room_id}/generate/budget` endpoint the UI polls
+  after every generation attempt and on page load, rendering "N/3
+  generation(s) left this minute" (dimmed red at zero) instead of
+  letting a user hit a surprise 429 with no warning.
+- **Live-verified in a real browser**: budget shown correctly on page
+  load (3/3), a table generation showing the chips pills appear before
+  the mesh lands, the report card populating with all fields correct
+  (watertight/manifold/planar all "Yes", 40 vertices/30 faces, correct
+  dimensions, path "registry · heuristic", elapsed time), and budget
+  correctly decrementing to 2/3 afterward -- then a *second* run against
+  a server with `generate_ops_from_interpretation` monkeypatched to
+  sleep 8 seconds, clicking Cancel mid-flight and confirming both the
+  UI (status "Generation cancelled", cancel button hidden again, zero
+  vertices in the document) and the server log (no exception, no
+  "generated N ops" success line -- the request was genuinely never
+  completed, not just abandoned client-side) agree nothing was
+  committed.
+- Text-only `Yes`/`No` (not `✓`/`✗`) in the report card -- this
+  project's own `test_no_emoji_glyphs_anywhere_in_frontend_source`
+  kill-list check classifies Unicode check/cross marks as symbol
+  glyphs, caught immediately by running the full suite rather than
+  discovered later.
 
 **3D-print preparation** (`mesh_repair.py`) is a separate, opt-in path
 -- *not* part of the CRDT-injection pipeline, per the brief's own

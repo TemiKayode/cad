@@ -98,5 +98,36 @@ def test_validate_or_raise_raises_generation_validation_error_with_the_report():
     assert "not watertight" in str(exc_info.value) or exc_info.value.report.errors
 
 
+def test_planar_quad_faces_pass_the_planarity_check():
+    report = validate_generated_mesh(_watertight_box())
+    assert report.planar
+    assert report.non_planar_face_count == 0
+
+
+def test_triangle_only_mesh_is_trivially_planar():
+    b = MeshBuilder()
+    v1 = b.vertex((0.0, 0.0, 0.0))
+    v2 = b.vertex((1.0, 0.0, 0.0))
+    v3 = b.vertex((0.0, 1.0, 0.3))  # a lone triangle can never be non-planar
+    b.face([v1, v2, v3], "wood")
+    report = validate_generated_mesh(b.mesh, require_watertight=False, require_consistent_winding=False)
+    assert report.planar
+    assert report.non_planar_face_count == 0
+
+
+def test_a_genuinely_non_planar_quad_is_detected():
+    b = MeshBuilder()
+    v1 = b.vertex((0.0, 0.0, 0.0))
+    v2 = b.vertex((1.0, 0.0, 0.0))
+    v3 = b.vertex((1.0, 1.0, 0.0))
+    v4 = b.vertex((0.0, 1.0, 0.5))  # pushed out of the plane the other three define
+    b.face([v1, v2, v3, v4], "wood")
+    report = validate_generated_mesh(b.mesh, require_watertight=False, require_consistent_winding=False)
+    assert not report.planar
+    assert report.non_planar_face_count == 1
+    # informational only -- does not fail the mesh (see validation.py's own docstring on this)
+    assert report.ok
+
+
 def test_validate_or_raise_does_not_raise_for_a_good_mesh():
     validate_or_raise(_watertight_box())  # must not raise

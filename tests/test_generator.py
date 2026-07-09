@@ -7,7 +7,10 @@ from crdt_cad.ai.generator import (
     generate_edit_ops,
     generate_mesh_ops,
     generation_geometry,
+    interpretation_chips,
 )
+from crdt_cad.ai.house_spec import HouseSpec
+from crdt_cad.ai.interpreter import _heuristic_interpret
 from crdt_cad.crdt.clock import LamportClock
 from crdt_cad.crdt.mesh import MeshCRDT
 
@@ -473,3 +476,57 @@ def test_generate_edit_ops_seeded_counter_actually_removes_old_geometry():
         doc.apply(op)
     # the old table's faces are still live -- the low-counter removal lost
     assert len(doc.face_loops()) > r_broken.face_count
+
+
+# -- Phase G5: interpretation_chips + elapsed_seconds -------------------------------
+
+
+def test_interpretation_chips_for_house():
+    spec = HouseSpec(bedrooms=4, floors=1, floor_material="wood", style="modern", roof_type="gable")
+    chips = interpretation_chips("house", spec)
+    assert "4 bedroom(s)" in chips
+    assert "wood floor" in chips
+    assert "gable roof" in chips
+
+
+def test_interpretation_chips_for_house_omits_flat_roof_and_no_garage():
+    spec = HouseSpec(bedrooms=2, floors=1, floor_material="concrete", style="modern", roof_type="flat", garage=False)
+    chips = interpretation_chips("house", spec)
+    assert not any("roof" in c for c in chips)
+    assert not any("garage" in c for c in chips)
+
+
+def test_interpretation_chips_for_table_uses_dimension_fields():
+    name, spec = _heuristic_interpret("a wooden table")
+    chips = interpretation_chips(name, spec)
+    assert any("width" in c for c in chips)
+    assert any("m" in c for c in chips)
+
+
+def test_interpretation_chips_for_scene_summarizes_object_counts():
+    name, spec = _heuristic_interpret("a table with four chairs around it")
+    assert name == "scene"
+    chips = interpretation_chips(name, spec)
+    assert "table" in chips
+    assert "4x chair" in chips
+
+
+def test_interpretation_chips_for_dsl_mentions_the_shape_and_material():
+    spec = DSLProgramSpec(root={"op": "box", "size": [1.0, 1.0, 1.0]}, material="metal")
+    chips = interpretation_chips("dsl", spec)
+    assert any("box" in c for c in chips)
+    assert "metal" in chips
+
+
+def test_generate_mesh_ops_reports_a_nonzero_elapsed_time():
+    result = generate_mesh_ops("a wooden table")
+    assert result.elapsed_seconds > 0.0
+
+
+def test_generate_edit_ops_reports_a_nonzero_elapsed_time():
+    doc = MeshCRDT(LamportClock(actor="__server__:mesh:test-room"))
+    r1 = _generate_and_apply("a wooden table", doc)
+    prior_record = doc.generation(r1.generation_id)
+    faces, vertices, edges, start_counter = _edit_args_for(doc, r1.generation_id)
+    r2 = generate_edit_ops("make it taller", r1.generation_id, prior_record, faces, vertices, edges, start_counter)
+    assert r2.elapsed_seconds > 0.0

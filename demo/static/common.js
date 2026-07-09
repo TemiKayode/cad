@@ -945,6 +945,7 @@ class RelayConnection {
     actorId,
     {
       onSnapshot, onDelta, onOps, onStatus, onRejected, onSignal, onSaved, onValidityWarning, onMergePreview, onRole,
+      onGenerationInterpreting, onReportCard,
       token, kind, room, initialOutbox,
     },
   ) {
@@ -965,6 +966,13 @@ class RelayConnection {
     this.onSaved = onSaved || (() => {});
     this.onValidityWarning = onValidityWarning || (() => {});
     this.onMergePreview = onMergePreview || null;
+    // Phase G5: "understood: ..." chips broadcast right after prompt
+    // interpretation finishes (before any geometry ops arrive) and the
+    // full report card broadcast after generation completes -- both sent
+    // to the *whole room*, not just the requester, so every collaborator
+    // sees the same success-visibility info the brief asks for.
+    this.onGenerationInterpreting = onGenerationInterpreting || (() => {});
+    this.onReportCard = onReportCard || (() => {});
     // Phase 17 read-only share links: "editor" (full access, same as
     // every room before this existed) or "viewer" -- learned from the
     // server's own snapshot/delta reply (see app.py's WS protocol
@@ -1079,6 +1087,10 @@ class RelayConnection {
       this.onSaved(msg.at);
     } else if (msg.type === "validity_warning") {
       this.onValidityWarning(msg.faces, msg.problems);
+    } else if (msg.type === "generation_interpreting") {
+      this.onGenerationInterpreting(msg);
+    } else if (msg.type === "report_card") {
+      this.onReportCard(msg);
     }
   }
 

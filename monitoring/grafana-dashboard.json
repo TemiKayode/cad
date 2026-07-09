@@ -106,6 +106,41 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 8,
+      "title": "AI generations by outcome (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "description": "Phase G5: success/fallback/repair_retry/failure/cancelled -- a rising failure or fallback share is the signal the alert rule below watches.",
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(crdt_cad_generations_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "AI generation latency (p50 / p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(crdt_cad_generation_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(crdt_cad_generation_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ]
     }
   ]
 }

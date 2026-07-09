@@ -139,6 +139,38 @@ def test_per_key_rate_limiter_tracks_keys_independently():
     assert limiter.allow("2.2.2.2") is True  # different key, untouched bucket
 
 
+# -- Phase G5 cost guardrails: peeking remaining budget without spending ----------
+
+
+def test_token_bucket_remaining_does_not_spend():
+    bucket = security.TokenBucket(rate=0.0, capacity=3.0)
+    assert bucket.remaining() == 3.0
+    assert bucket.remaining() == 3.0  # calling it repeatedly never decrements
+    assert bucket.allow(1.0) is True
+    assert bucket.remaining() == 2.0
+
+
+def test_token_bucket_remaining_reflects_continuous_refill():
+    bucket = security.TokenBucket(rate=100.0, capacity=2.0)
+    assert bucket.allow(2.0) is True
+    assert bucket.remaining() < 2.0
+    time.sleep(0.02)
+    assert bucket.remaining() > 0.5  # refilled some, capped at capacity
+
+
+def test_per_key_rate_limiter_remaining_for_unused_key_is_full_capacity():
+    limiter = security.PerKeyRateLimiter(rate=0.0, capacity=3.0)
+    assert limiter.remaining("never-used") == 3.0
+    assert limiter.capacity() == 3.0
+
+
+def test_per_key_rate_limiter_remaining_tracks_spending_per_key():
+    limiter = security.PerKeyRateLimiter(rate=0.0, capacity=3.0)
+    limiter.allow("1.1.1.1")
+    assert limiter.remaining("1.1.1.1") == 2.0
+    assert limiter.remaining("2.2.2.2") == 3.0  # untouched key stays full
+
+
 # -- no-secret default: today's behavior is unchanged ----------------------------
 
 

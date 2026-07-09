@@ -32,3 +32,27 @@ groups:
             validity gate over the last 5 minutes -- likely either a
             client-side bug submitting malformed ops, or a legitimate
             geometry rule change that needs the client updated to match.
+
+      # Phase G5 (Part 5): "shows success" measured, not asserted -- this
+      # is the metrics-side half of the report card/success-visibility
+      # requirement. A failure ratio this high across 10 minutes of real
+      # traffic (not a single unlucky request) means either the LLM/heuristic
+      # path is broken, a generator regressed, or a deployment issue (e.g.
+      # ANTHROPIC_API_KEY misconfigured) is silently degrading every request.
+      - alert: CrdtCadGenerationFailureRateHigh
+        expr: |
+          (
+            sum(rate(crdt_cad_generations_total{outcome=~"failure|cancelled"}[10m]))
+            /
+            clamp_min(sum(rate(crdt_cad_generations_total[10m])), 1e-9)
+          ) > 0.30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "crdt-cad AI generation failure rate is abnormally high"
+          description: >-
+            More than 30% of /generate requests failed or were cancelled
+            over the last 10 minutes -- check recent deployments, the
+            configured LLM credentials, and the eval harness's own latest
+            run (see evals/RESULTS.md) for a regression.

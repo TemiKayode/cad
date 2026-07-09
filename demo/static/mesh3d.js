@@ -425,6 +425,11 @@ let conn, p2p;
     onSaved: (at) => { setSaveState("saved", at); showToast("Saved", "success"); },
     onMergePreview: (mine, theirs, proceed) => showMergePreviewModal(mine, theirs, describeMeshOps, proceed),
     onValidityWarning: (faces, problems) => applyValidityWarning(faces, problems),
+    // Phase G5: room-wide, not requester-only -- broadcast() has no
+    // `exclude`, so the tab that clicked Generate gets these same two
+    // messages back over its own WS connection too, same as ops batches.
+    onGenerationInterpreting: (msg) => renderInterpretationChips(msg),
+    onReportCard: (msg) => renderReportCard(msg),
     onRole: (role) => {
       viewerMode = applyViewerModeUI(role);
       // Phase D6: unlike the 2D demo (which sends presence continuously
@@ -641,6 +646,7 @@ docNameBtn.onclick = async () => {
 // normal onOps -> applyIncomingOps -> syncScene path with no special-case client code.
 
 const genBtn = document.getElementById("genBtn");
+const genCancelBtn = document.getElementById("genCancelBtn");
 const genPromptInput = document.getElementById("genPromptInput");
 const genStatus = document.getElementById("genStatus");
 
@@ -785,6 +791,75 @@ function describeGeneratedSpec(generatorName, spec) {
   return dims.length ? dims.join(", ") : "default dimensions";
 }
 
+// -- Phase G5: interpretation chips + report card (broadcast to the whole room) ---
+
+function renderInterpretationChips(msg) {
+  const el = document.getElementById("genChips");
+  if (!msg.chips || !msg.chips.length) {
+    el.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+  el.style.display = "";
+  const pill = (text) =>
+    `<span style="display:inline-block;background:var(--bg-raised);color:var(--text-secondary);` +
+    `border-radius:var(--r-sm);padding:2px 8px;margin:2px 4px 2px 0;font-size:11px">${escapeHtml(text)}</span>`;
+  el.innerHTML = `<span style="font-size:11px;color:var(--text-secondary)">Understood:</span> ` + msg.chips.map(pill).join("");
+}
+
+function clearInterpretationChips() {
+  const el = document.getElementById("genChips");
+  el.style.display = "none";
+  el.innerHTML = "";
+}
+
+function renderReportCard(msg) {
+  const el = document.getElementById("reportCard");
+  const mark = (ok) => (ok ? "Yes" : "No");
+  const dims = (msg.bounding_box || []).map((v) => v.toFixed(2)).join(" × ");
+  const rows = [
+    ["Watertight", mark(msg.watertight)],
+    ["Manifold", mark(msg.manifold)],
+    ["Planar", msg.non_planar_face_count ? `No (${msg.non_planar_face_count} face(s))` : "Yes"],
+    ["Within bounds", mark(msg.within_bounds)],
+    ["Vertices / faces", `${msg.vertex_count} / ${msg.face_count}`],
+    ["Dimensions (m)", dims || "—"],
+    ["Path", `${escapeHtml(msg.path)} · ${escapeHtml(msg.interpretation_source)}`],
+    ["Outcome", escapeHtml(msg.outcome)],
+    ["Elapsed", `${msg.elapsed_seconds.toFixed(1)}s`],
+  ];
+  if (msg.dsl_attempts && msg.dsl_attempts.length > 1) {
+    const ok = msg.dsl_attempts.filter((a) => a.outcome === "ok").length;
+    rows.push(["DSL attempts", `${msg.dsl_attempts.length} (${ok} ok)`]);
+  }
+  el.innerHTML = rows
+    .map(([label, value]) => `<div class="field-row"><label>${escapeHtml(label)}</label><span>${value}</span></div>`)
+    .join("");
+  if (msg.errors && msg.errors.length) {
+    el.innerHTML += `<div class="empty-hint" style="color:var(--danger)">${msg.errors.map(escapeHtml).join("; ")}</div>`;
+  }
+}
+
+// -- Phase G5: cost guardrails -- remaining generation budget, peeked (never spent) ---
+
+async function refreshGenerationBudget() {
+  try {
+    const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/generate/budget`, "mesh", room));
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const remaining = Math.floor(data.remaining);
+    const capacity = Math.floor(data.capacity);
+    const el = document.getElementById("genBudget");
+    el.textContent = `${remaining}/${capacity} generation(s) left this minute (refills ${data.per_minute}/min)`;
+    el.style.color = remaining === 0 ? "var(--danger)" : "";
+  } catch {
+    // best-effort -- an informational display, never blocks generation itself
+  }
+}
+refreshGenerationBudget();
+
+let genAbortController = null;
+
 async function generateMesh() {
   const prompt = genPromptInput.value.trim();
   if (!prompt) {
@@ -792,20 +867,24 @@ async function generateMesh() {
     return;
   }
   const editOf = ui.editingGenerationId; // captured now -- Cancel edit mid-flight must not retarget an in-flight request
+  genAbortController = new AbortController();
   genBtn.disabled = true;
   genBtn.textContent = editOf ? "Applying edit…" : "Generating…";
+  genCancelBtn.style.display = "";
   generationInFlight = true;
   generationStagesSeen.clear();
   generationSceneObjectsSeen.clear();
   pendingGenerationUndoEntries = [];
   genPromptInput.classList.add("ai-thinking");
   genStatus.textContent = editOf ? "Interpreting your edit..." : "Interpreting your prompt...";
+  clearInterpretationChips();
   const stopOrbit = orbitCameraDuringGeneration();
   try {
     const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/generate`, "mesh", room), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(editOf ? { prompt, edit_of: editOf } : { prompt }),
+      signal: genAbortController.signal,
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
@@ -845,15 +924,28 @@ async function generateMesh() {
     }
     if (editOf) genPromptInput.value = ""; // an applied edit consumes the prompt; a fresh Generate call keeps it (existing behavior)
   } catch (err) {
-    // Danger toast with the server's own reason, an inline Retry (the
-    // prompt box is never cleared on failure, so Retry just re-submits
-    // exactly what's already there), per the brief.
-    showToast(`Generation failed: ${err.message}`, "error", { actionLabel: "Retry", onAction: () => generateMesh() });
-    genStatus.textContent = `Generation failed: ${err.message}`;
+    if (err.name === "AbortError") {
+      // Phase G5 cancel button: a deliberate user action, not a failure --
+      // no danger toast/Retry, and the server-side task is genuinely
+      // cancelled too (see `_run_cancellable`'s own docstring for exactly
+      // what "cancelled" means when the build already reached a worker
+      // thread).
+      showToast("Generation cancelled", "info");
+      genStatus.textContent = "Generation cancelled.";
+    } else {
+      // Danger toast with the server's own reason, an inline Retry (the
+      // prompt box is never cleared on failure, so Retry just re-submits
+      // exactly what's already there), per the brief.
+      showToast(`Generation failed: ${err.message}`, "error", { actionLabel: "Retry", onAction: () => generateMesh() });
+      genStatus.textContent = `Generation failed: ${err.message}`;
+    }
   } finally {
     genBtn.disabled = false;
     genBtn.textContent = ui.editingGenerationId ? "Apply edit" : "Generate";
+    genCancelBtn.style.display = "none";
+    genAbortController = null;
     generationInFlight = false;
+    refreshGenerationBudget();
     genPromptInput.classList.remove("ai-thinking");
     stopOrbit();
   }
@@ -862,6 +954,9 @@ genBtn.onclick = generateMesh;
 genPromptInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") generateMesh();
 });
+genCancelBtn.onclick = () => {
+  if (genAbortController) genAbortController.abort();
+};
 
 // -- high-level mutations ---------------------------------------------------------
 

@@ -192,6 +192,16 @@ class TokenBucket:
             return True
         return False
 
+    def remaining(self) -> float:
+        """Peeks at the current token count *without* spending -- applies
+        the same continuous-refill formula :meth:`allow` uses, computed
+        fresh from ``now`` each call, so it's accurate as of "right now"
+        without mutating ``self.tokens``/``self._last`` (a pure read, safe
+        to call as often as the UI wants -- e.g. every keystroke -- with
+        no side effect on the actual budget)."""
+        elapsed = time.monotonic() - self._last
+        return min(self.capacity, self.tokens + elapsed * self.rate)
+
 
 class PerKeyRateLimiter:
     """A :class:`TokenBucket` per arbitrary string key (e.g. client IP),
@@ -209,6 +219,15 @@ class PerKeyRateLimiter:
             bucket = TokenBucket(rate=self._rate, capacity=self._capacity)
             self._buckets[key] = bucket
         return bucket.allow(cost)
+
+    def remaining(self, key: str) -> float:
+        """Peeks at `key`'s current budget without spending -- a key with
+        no bucket yet has never made a request, so it's at full capacity."""
+        bucket = self._buckets.get(key)
+        return bucket.remaining() if bucket is not None else self._capacity
+
+    def capacity(self) -> float:
+        return self._capacity
 
 
 def ws_ops_per_second() -> float:

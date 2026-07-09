@@ -45,6 +45,16 @@ class ValidationReport:
     triangle_count: int
     bounding_box: tuple[float, float, float]
     errors: list[str] = field(default_factory=list)
+    # Phase G5 report card field. Checked against each face's *original*
+    # polygon loop (a triangle is trivially always planar; this only
+    # means something for a quad+ face). Informational, not a hard gate
+    # on `ok` -- no generator in this registry has ever produced a
+    # non-planar face (every one is simple parametric geometry), so
+    # promoting this to a failure condition alongside watertight/manifold
+    # would be an untested new failure mode; report it honestly, don't
+    # gate on it yet.
+    planar: bool = True
+    non_planar_face_count: int = 0
 
 
 class GenerationValidationError(Exception):
@@ -56,6 +66,34 @@ class GenerationValidationError(Exception):
     def __init__(self, report: ValidationReport) -> None:
         self.report = report
         super().__init__("; ".join(report.errors) or "generated mesh failed validation")
+
+
+def _check_planarity(mesh: GeneratedMesh, tolerance: float = 1e-4) -> tuple[bool, int]:
+    """Checks each face's *original* polygon loop (not the post-
+    triangulation triangles, which are trivially planar always) lies
+    within `tolerance` of a single plane fit through its own vertices.
+    Returns ``(all_planar, non_planar_face_count)``."""
+    non_planar = 0
+    for loop in mesh.faces.values():
+        pts = [mesh.vertices[v] for v in loop if v in mesh.vertices]
+        if len(pts) < 4:
+            continue  # a triangle (or degenerate loop) is always planar
+        arr = np.array(pts, dtype=np.float64)
+        origin = arr[0]
+        edge1 = arr[1] - origin
+        normal = None
+        for i in range(2, len(arr)):
+            candidate = np.cross(edge1, arr[i] - origin)
+            length = np.linalg.norm(candidate)
+            if length > 1e-9:
+                normal = candidate / length
+                break
+        if normal is None:
+            continue  # collinear/degenerate loop -- not this check's concern
+        deviation = np.abs((arr - origin) @ normal).max()
+        if deviation > tolerance:
+            non_planar += 1
+    return non_planar == 0, non_planar
 
 
 def _triangulate(mesh: GeneratedMesh) -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -148,6 +186,8 @@ def validate_generated_mesh(
         n_bad = int((~degenerate_ok).sum())
         errors.append(f"{n_bad} degenerate (zero-area) triangle(s)")
 
+    planar, non_planar_face_count = _check_planarity(mesh)
+
     ok = not errors
     return ValidationReport(
         ok=ok,
@@ -159,6 +199,8 @@ def validate_generated_mesh(
         triangle_count=len(triangles),
         bounding_box=bbox,
         errors=errors,
+        planar=planar,
+        non_planar_face_count=non_planar_face_count,
     )
 
 

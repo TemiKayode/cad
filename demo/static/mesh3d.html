@@ -108,7 +108,9 @@
         </div>
         <div class="tool-row" style="margin-top:6px">
           <button id="genBtn" style="flex:1">Generate</button>
+          <button id="genCancelBtn" class="danger" style="flex:0 0 auto;display:none">Cancel</button>
         </div>
+        <div id="genChips" style="display:none;margin-top:6px"></div>
         <div class="empty-hint" id="genStatus">
           Describe a house, a piece of furniture (table/chair/shelf), an
           architectural element (stairs/column/arch/fence/door/window), or
@@ -118,6 +120,10 @@
           no API key is configured — then built into a real watertight
           mesh and synced as CRDT ops, just like any other edit.
         </div>
+        <div id="genBudget" class="empty-hint" style="font-size:11px;opacity:0.75"></div>
+
+        <div class="section-title">Report Card</div>
+        <div id="reportCard"><div class="empty-hint">Generate something to see its watertight/manifold/planarity report here.</div></div>
 
         <div class="section-title">AI Generations (<span id="generationCount">0</span>)</div>
         <div id="generationList" style="max-height:160px;overflow:auto"></div>
