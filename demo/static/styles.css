@@ -260,7 +260,18 @@ input:disabled, select:disabled, textarea:disabled {
    again (only the `\` shortcut would still work). Both live in the top
    bar instead, which never collapses. */
 .panel-collapse-btn { padding: 5px; }
-.panel-collapse-btn.active { color: var(--accent); }
+/* Must also reset background/border here: the generic `button.active`
+   rule paints a filled accent pill, and overriding only `color` left
+   the chevron accent-on-accent -- an invisible glyph (visible in every
+   audit screenshot since D2; caught in the README/UX review pass).
+   These are ghost buttons: "active" = panel open = accent chevron on a
+   transparent background, not a filled button. */
+.panel-collapse-btn.active {
+  background: none;
+  border-color: transparent;
+  color: var(--accent);
+  font-weight: 400;
+}
 
 /* -- tool rail --------------------------------------------------------- */
 
