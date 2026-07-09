@@ -128,6 +128,41 @@ def cors_origins() -> list[str]:
     return [] if auth_enabled() else ["*"]
 
 
+# -- client IP resolution ------------------------------------------------------
+
+
+def trust_proxy_headers() -> bool:
+    """Off by default: trusting ``X-Forwarded-For`` when the process is
+    *not* actually behind a reverse proxy lets any client bypass the
+    per-IP rate limiter below just by sending a different fake header
+    value on every request. Set ``CRDT_CAD_TRUST_PROXY_HEADERS=1`` only
+    when a reverse proxy you control (Caddy -- see docker-compose.prod.yml
+    -- or the Kubernetes ingress) is the *sole* way to reach this process,
+    so every connection's ``X-Forwarded-For`` is proxy-set, not
+    client-supplied."""
+    return os.environ.get("CRDT_CAD_TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
+
+
+def client_ip(request) -> str:
+    """The address the per-IP rate limiter (``/generate``, see app.py)
+    should charge. Behind a reverse proxy, ``request.client.host`` is
+    always the *proxy's* address -- every real client would share one
+    rate-limit bucket, letting a single abusive client exhaust the whole
+    deployment's quota. When trusted (see :func:`trust_proxy_headers`),
+    take the last hop of ``X-Forwarded-For``: Caddy/nginx/ingress-nginx
+    all *append* the real connecting peer's address as the final entry
+    rather than trusting whatever a client already put there, so the
+    last entry is the one this process's immediate (trusted) proxy hop
+    actually observed."""
+    if trust_proxy_headers():
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            last_hop = forwarded.split(",")[-1].strip()
+            if last_hop:
+                return last_hop
+    return request.client.host if request.client else "unknown"
+
+
 # -- rate limiting -------------------------------------------------------------
 
 

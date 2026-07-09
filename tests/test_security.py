@@ -91,6 +91,39 @@ def test_cors_origins_defaults(monkeypatch):
     assert security.cors_origins() == ["https://a.example", "https://b.example"]
 
 
+class _FakeRequest:
+    """Minimal stand-in for fastapi.Request -- just enough of the surface
+    security.client_ip() reads (.headers.get, .client.host)."""
+
+    def __init__(self, client_host: str | None, headers: dict[str, str] | None = None):
+        self.headers = headers or {}
+        self.client = type("_Client", (), {"host": client_host})() if client_host is not None else None
+
+
+def test_client_ip_ignores_forwarded_header_by_default(monkeypatch):
+    monkeypatch.delenv("CRDT_CAD_TRUST_PROXY_HEADERS", raising=False)
+    req = _FakeRequest("10.0.0.5", {"x-forwarded-for": "1.2.3.4"})
+    assert security.client_ip(req) == "10.0.0.5"
+
+
+def test_client_ip_uses_last_forwarded_hop_when_trusted(monkeypatch):
+    monkeypatch.setenv("CRDT_CAD_TRUST_PROXY_HEADERS", "1")
+    req = _FakeRequest("172.18.0.2", {"x-forwarded-for": "1.2.3.4, 172.18.0.2"})
+    assert security.client_ip(req) == "172.18.0.2"
+
+
+def test_client_ip_falls_back_to_socket_when_trusted_but_header_absent(monkeypatch):
+    monkeypatch.setenv("CRDT_CAD_TRUST_PROXY_HEADERS", "1")
+    req = _FakeRequest("10.0.0.5", {})
+    assert security.client_ip(req) == "10.0.0.5"
+
+
+def test_client_ip_unknown_when_no_client_at_all(monkeypatch):
+    monkeypatch.delenv("CRDT_CAD_TRUST_PROXY_HEADERS", raising=False)
+    req = _FakeRequest(None)
+    assert security.client_ip(req) == "unknown"
+
+
 def test_token_bucket_refills_over_time():
     bucket = security.TokenBucket(rate=100.0, capacity=2.0)
     assert bucket.allow(2.0) is True

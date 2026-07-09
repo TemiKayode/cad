@@ -24,6 +24,7 @@ import asyncio
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -183,8 +184,28 @@ class SQLiteStore(DocumentStore):
                 "CREATE INDEX IF NOT EXISTS idx_room_versions_room ON room_versions(kind, room_id, created_at)"
             )
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._path)
+    @contextmanager
+    def _connect(self):
+        """`sqlite3.Connection` used as a context manager only commits or
+        rolls back on exit -- it does **not** close the connection (a
+        common gotcha, easy to miss since it doesn't error). Every
+        connection this ever opened was leaking until closed by Python's
+        garbage collector at some later, non-deterministic point --
+        harmless-looking on POSIX (an unlinked-but-open file just stays
+        on disk until every handle closes), but surfaces immediately on
+        Windows, where an open sqlite3 handle blocks *deleting* the file
+        outright (see tests/test_backup_sqlite.py's restore test, which
+        replaces the live DB file entirely). Wrapping in a real
+        `@contextmanager` guarantees `close()` always runs, while every
+        existing `with self._connect() as conn:` call site keeps working
+        unchanged -- a generator-based context manager is used identically
+        to the object it used to return directly."""
+        conn = sqlite3.connect(self._path)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def save(self, kind: str, room_id: str, data: bytes) -> None:
         with self._connect() as conn:

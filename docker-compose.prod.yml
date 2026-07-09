@@ -1,0 +1,58 @@
+# Production-oriented stack (Phase 19.1): the app plus Caddy in front of
+# it for automatic HTTPS. Contrast with docker-compose.yml (the plain
+# local-dev stack, HTTP only, port 8000 published directly) -- this file
+# is what docs/deployment.md's VPS runbook actually runs.
+#
+# The only things to edit: CRDT_CAD_DOMAIN and CRDT_CAD_SECRET in a local
+# `.env` file (docker compose reads one automatically) -- never commit
+# real values for either. CRDT_CAD_SECRET is REQUIRED for any deployment
+# reachable from the public internet -- see docs/deployment.md.
+services:
+  crdt-cad:
+    # Once a `v*` release tag has been pushed (which publishes the image
+    # via .github/workflows/release.yml), you can deploy without cloning
+    # the repo's source at all: replace `build: .` with
+    #   image: ghcr.io/temikayode/crdt-cad:latest
+    # Until that first tag exists, `build: .` from a clone is the way.
+    build: .
+    # No `ports:` -- intentionally not reachable except through Caddy.
+    # `expose` only documents the container-internal port; it isn't
+    # needed for Caddy to reach it (same Compose network), but makes the
+    # "app is internal-only" intent explicit rather than implicit.
+    expose:
+      - "8000"
+    volumes:
+      - crdt-cad-data:/data
+    environment:
+      - CRDT_CAD_DB_PATH=/data/crdt_cad.db
+      - CRDT_CAD_SECRET=${CRDT_CAD_SECRET:?CRDT_CAD_SECRET must be set for a public deployment -- see docs/deployment.md}
+      # Caddy is the sole way to reach this container, so its
+      # X-Forwarded-For is trustworthy -- see security.client_ip().
+      - CRDT_CAD_TRUST_PROXY_HEADERS=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - crdt-cad
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - CRDT_CAD_DOMAIN=${CRDT_CAD_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  crdt-cad-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,34 @@
+# Prometheus alerting rules (Phase 19.5) -- load into Prometheus via
+# `rule_files:` in prometheus.yml (already wired in
+# docker-compose.monitoring.yml). Two examples, deliberately not an
+# exhaustive rulebook -- add more as real operational experience with a
+# deployment accumulates.
+groups:
+  - name: crdt-cad
+    rules:
+      - alert: CrdtCadServerDown
+        expr: up{job="crdt-cad"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "crdt-cad server is down"
+          description: "Prometheus has not been able to scrape crdt-cad's /metrics for at least 1 minute."
+
+      - alert: CrdtCadAbnormalRejectionRate
+        expr: |
+          (
+            rate(crdt_cad_geometry_rejections_total[5m])
+            /
+            clamp_min(rate(crdt_cad_ops_relayed_total[5m]) + rate(crdt_cad_geometry_rejections_total[5m]), 1e-9)
+          ) > 0.20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "crdt-cad is rejecting an abnormally high share of ops"
+          description: >-
+            More than 20% of submitted ops were rejected by the geometry
+            validity gate over the last 5 minutes -- likely either a
+            client-side bug submitting malformed ops, or a legitimate
+            geometry rule change that needs the client updated to match.

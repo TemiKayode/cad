@@ -1,0 +1,111 @@
+{
+  "title": "crdt-cad",
+  "uid": "crdt-cad-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active WebSocket connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "targets": [
+        {
+          "expr": "crdt_cad_active_connections",
+          "legendFormat": "connections",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Active rooms",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "targets": [
+        {
+          "expr": "crdt_cad_rooms",
+          "legendFormat": "rooms",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Ops relayed (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "targets": [
+        {
+          "expr": "rate(crdt_cad_ops_relayed_total[1m])",
+          "legendFormat": "ops/sec",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "New connections (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "targets": [
+        {
+          "expr": "rate(crdt_cad_connections_total[1m])",
+          "legendFormat": "connections/sec",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Geometry rejections (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "targets": [
+        {
+          "expr": "rate(crdt_cad_geometry_rejections_total[5m])",
+          "legendFormat": "rejections/sec",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Rate-limited ops (rate/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "targets": [
+        {
+          "expr": "rate(crdt_cad_rate_limited_total[5m])",
+          "legendFormat": "rate-limited/sec",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Average merge latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "crdt-cad-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "rate(crdt_cad_merge_latency_seconds_sum[5m]) / rate(crdt_cad_merge_latency_seconds_count[5m])",
+          "legendFormat": "avg merge latency",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

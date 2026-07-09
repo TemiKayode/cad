@@ -1,0 +1,38 @@
+# Optional Prometheus + Grafana stack (Phase 19.5) -- not required to run
+# the app, just to see it. Run alongside the app itself:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#
+# Grafana is pre-provisioned with the Prometheus datasource and the
+# crdt-cad dashboard (monitoring/grafana-dashboard.json) -- open
+# http://localhost:3000 (default login admin/admin) and it's already
+# there, no manual import step.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      - prometheus
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./monitoring/grafana-provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/crdt-cad.json:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

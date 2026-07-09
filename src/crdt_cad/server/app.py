@@ -72,6 +72,7 @@ import os
 import socket
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -104,6 +105,18 @@ SNAPSHOT_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_SNAPSHOT_INTERVAL_SEC
 VERSION_CHECKPOINT_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_VERSION_CHECKPOINT_INTERVAL_SECONDS", "300"))
 GENERATION_TIMEOUT_SECONDS = float(os.environ.get("CRDT_CAD_GENERATION_TIMEOUT_SECONDS", "60"))
 GENERATION_OPS_BATCH_SIZE = int(os.environ.get("CRDT_CAD_GENERATION_BATCH_SIZE", "150"))
+# Floor on how often live-edit traffic may trigger a durable persist per
+# room (Phase 19.5 -- found by scripts/load_test.py, not hypothetically):
+# persisting is a full-document `to_bytes()` + store write, so doing it
+# per accepted ops *message* made per-message cost grow with document
+# size -- at 50 clients x 5 ops/s the event loop drowned in snapshot
+# serialization (12s mean op latency, keepalive timeouts). Debouncing to
+# at most one persist per interval (plus a trailing flush, so the last
+# edit is never left unpersisted for more than the interval) bounds that
+# cost independently of op rate. `0` restores persist-per-message.
+# Explicit saves, imports, AI generation, and graceful shutdown still
+# persist unconditionally -- see Room.persist_debounced.
+PERSIST_MIN_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_PERSIST_MIN_INTERVAL_SECONDS", "0.5"))
 REPO_ROOT = Path(__file__).resolve().parents[3]
 # REPO_ROOT only makes sense for an editable/dev install where this file
 # lives at its original source path. A regular `pip install .` (e.g. the
@@ -174,6 +187,8 @@ class Room:
         self.client_roles: dict[str, str] = {}
         self._snapshot_task: asyncio.Task | None = None
         self._redis_task: asyncio.Task | None = None
+        self._deferred_persist: asyncio.Task | None = None
+        self._last_persist = 0.0  # monotonic; 0.0 => first persist is always immediate
         self._dirty_since_snapshot = False
         self._dirty_since_version = False
         self._last_version_checkpoint = time.monotonic()
@@ -192,9 +207,52 @@ class Room:
         would leave an unbounded, untracked number of background tasks
         running (real resource-leak risk in any long-lived deployment,
         and it made the test suite hang at interpreter shutdown waiting
-        for the default thread pool to drain). Persistence is fast
-        (SQLite/in-memory), so awaiting it adds negligible latency."""
+        for the default thread pool to drain). One persist is cheap; what
+        is *not* cheap is one per accepted message under load, which is
+        why live-edit callers go through :meth:`persist_debounced`."""
         await asyncio.to_thread(self.persist)
+        self._last_persist = time.monotonic()
+
+    async def persist_debounced(self) -> None:
+        """Rate-bounded persist for live-edit traffic (see
+        PERSIST_MIN_INTERVAL_SECONDS for why): persists immediately if the
+        last persist is at least the interval old, otherwise schedules a
+        single trailing flush for when the interval elapses -- at most one
+        deferred task per room ever exists (not one per message, which is
+        the unbounded-task trap persist_async's docstring warns about),
+        and the trailing flush guarantees the newest state still lands
+        durably within one interval of the last edit. Callers where a
+        *user* expects durability right now -- explicit save, import, AI
+        generation, graceful shutdown -- call persist_async directly and
+        are not debounced."""
+        if PERSIST_MIN_INTERVAL_SECONDS <= 0:
+            await self.persist_async()
+            return
+        if self._deferred_persist is not None and not self._deferred_persist.done():
+            return  # a trailing flush is already scheduled; it will cover this edit
+        elapsed = time.monotonic() - self._last_persist
+        if elapsed >= PERSIST_MIN_INTERVAL_SECONDS:
+            await self.persist_async()
+        else:
+            self._deferred_persist = asyncio.create_task(
+                self._persist_after(PERSIST_MIN_INTERVAL_SECONDS - elapsed)
+            )
+
+    async def _persist_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        await self.persist_async()
+
+    async def flush_deferred_persist(self) -> None:
+        """Cancels any scheduled trailing flush (the caller is about to
+        persist unconditionally, so the deferred one would be redundant
+        work at best and a post-shutdown task at worst)."""
+        task = self._deferred_persist
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     def checkpoint_version(self) -> None:
         """Phase 17 (version history): appends an immutable checkpoint
@@ -343,7 +401,7 @@ class Room:
                         self.doc.apply(op)
                         touched_topology = touched_topology or _touches_mesh_topology(op)
                     self.mark_dirty()
-                    await self.persist_async()
+                    await self.persist_debounced()
                     await _check_and_broadcast_mesh_validity(self, touched_topology)
                 await self._deliver_local(message)
         except asyncio.CancelledError:
@@ -422,7 +480,52 @@ drawing_room_manager = RoomManager("drawing", DrawingDocument, DocOp.from_dict, 
 mesh_room_manager = RoomManager("mesh", MeshCRDT, MeshOp.from_dict, store, redis_client)
 room_manager = drawing_room_manager  # backwards-compatible alias
 
-app = FastAPI(title="crdt-cad collaboration server")
+# WebSocket close code for a clean, server-initiated shutdown -- the
+# standard "Going Away" code (RFC 6455), not one of the private-use
+# WS_CLOSE_* codes below (those all mean "don't bother reconnecting");
+# common.js's reconnect logic already treats every code except
+# WS_CLOSE_UNAUTHORIZED as "reconnect", so no client change was needed.
+WS_CLOSE_GOING_AWAY = 1001
+
+
+async def _graceful_shutdown() -> None:
+    """Runs on SIGTERM (via the `lifespan` shutdown phase below) -- what
+    makes `kubectl rollout restart`/a `docker stop`/a VM reboot safe. The
+    persist is the part that actually matters and is guaranteed: verified
+    against a real `docker stop` on a real container (not just a unit
+    test) -- an edit sent but never explicitly saved survives the
+    container being SIGTERM'd and a fresh container reusing the same
+    volume picking the room back up.
+
+    The `ws.close(code=...)` calls below are best-effort, not the primary
+    guarantee: in that same real-container test, uvicorn's own WebSocket
+    shutdown handling closed the connection with code 1012 ("Service
+    Restart") *before* this hook's own close() call took effect --
+    whichever side sends the first CLOSE frame wins, and uvicorn's own
+    shutdown path won that race. 1012 already isn't
+    WS_CLOSE_UNAUTHORIZED, so common.js's reconnect logic still retries
+    correctly either way; this hook's own close() is a backstop for
+    whatever ASGI server/version combination *doesn't* close things
+    itself, not something to rely on for the close code a client
+    actually observes today."""
+    for manager in (drawing_room_manager, mesh_room_manager):
+        for room in list(manager.rooms.values()):
+            await room.flush_deferred_persist()
+            await room.persist_async()
+            for ws in list(room.clients.values()):
+                try:
+                    await ws.close(code=WS_CLOSE_GOING_AWAY)
+                except Exception:
+                    pass  # already disconnecting/disconnected -- nothing to clean up
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    yield
+    await _graceful_shutdown()
+
+
+app = FastAPI(title="crdt-cad collaboration server", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=security.cors_origins(),
@@ -942,7 +1045,7 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt must not be empty")
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = security.client_ip(request)
     if not security.generate_rate_limiter.allow(client_ip):
         raise HTTPException(status_code=429, detail="generation rate limit exceeded -- try again shortly")
 
@@ -1364,5 +1467,5 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
     if accepted_wire:
         await room.broadcast({"type": "ops", "ops": accepted_wire, "from": actor}, exclude=actor)
         room.mark_dirty()
-        await room.persist_async()
+        await room.persist_debounced()
         await _check_and_broadcast_mesh_validity(room, touched_topology)

@@ -25,6 +25,14 @@ spec:
     spec:
       containers:
         - name: crdt-cad
+          # Default: a locally-built image (`docker build -t crdt-cad:latest .`
+          # then `kind load docker-image crdt-cad:latest`) -- the exact
+          # configuration Phase 18 validated and CI's k8s-smoke job re-validates
+          # on every push, with zero registry access needed. Once a `v*` release
+          # tag has been pushed (publishing via .github/workflows/release.yml),
+          # a real cluster can pull the published image instead:
+          #   image: ghcr.io/temikayode/crdt-cad:latest
+          #   imagePullPolicy: Always
           image: crdt-cad:latest
           imagePullPolicy: IfNotPresent
           ports:

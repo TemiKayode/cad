@@ -73,6 +73,13 @@ offline to see the **Time-Travel Merge** panel.
 | Kubernetes manifests | **Validated on a real cluster** (kind) -- Mode A (1 replica/SQLite) and Mode B (3 replicas/Postgres+Redis, cross-pod fan-out, rolling restarts) both verified, HPA (CPU-based, scale 1->6->1 confirmed under real load), TLS ingress (`wss://` end-to-end), CI smoke test on every push -- see `k8s/README.md` |
 | STEP export (`build123d`) | **Done** -- faceted B-Rep from `MeshCRDT`, optional extra, see below; IGES and STEP *import* not built |
 | True horizontal scaling of room state (multi-pod) | **Done** -- optional `PostgresStore` + Redis pub/sub fan-out, opt-in via env vars, live-verified with two real server processes *and* against real Kubernetes pods (Phase 18) -- see below and `k8s/README.md` |
+| TLS front door (Caddy + Docker Compose, VPS path) | **Done** -- `docker-compose.prod.yml` + `Caddyfile`, verified end-to-end: real HTTPS, `wss://` through the proxy, auth token flow, `X-Forwarded-For`-aware rate limiter -- see `docs/deployment.md` |
+| Fly.io config | **Config provided, not live-deployed** -- `fly.toml` checked for valid TOML against Fly's documented schema by hand; no Fly account/token available to run `fly config validate`/`fly deploy` against the real platform -- see `docs/deployment.md` |
+| Backups (SQLite online-backup API + Postgres `pg_dump`/`pg_restore`) | **Done** -- `scripts/backup_sqlite.py`, both with automated byte-for-byte restore tests -- see `docs/deployment.md` |
+| Graceful shutdown (SIGTERM persists unsaved rooms, clean WS close) | **Done** -- verified against a real `docker stop` on a real container, not just a unit test -- see `docs/deployment.md` |
+| Monitoring (Grafana dashboard + Prometheus alerts) | **Done** -- `monitoring/grafana-dashboard.json` + `monitoring/alerts.yml`, optional `docker-compose.monitoring.yml`, verified live with real traffic (screenshot: `docs/screenshots/grafana_dashboard.png`) -- see `docs/deployment.md` |
+| Load/soak testing | **Done** -- `scripts/load_test.py` found and fixed a real ceiling bug (persist-per-message; see "Horizontal scaling seam" below), post-fix results (lossless to 600 concurrent clients, ~100-200 comfortable on a shared dev machine) recorded honestly in `docs/deployment.md` |
+| Published container image (GHCR) | **CI workflow committed, not yet run** -- `.github/workflows/release.yml` builds+pushes on a `v*` tag; no tag has been pushed yet, so `ghcr.io/temikayode/crdt-cad` does not exist as of this writing -- see `docs/deployment.md`'s Quickstart note |
 | Pyodide/WASM client-side engine | **Not built** -- deliberate; see rationale below |
 
 ## Quickstart
@@ -102,6 +109,22 @@ behavior when omitted.
 ```bash
 docker compose up --build
 ```
+
+Or, once a `v*` release tag has been pushed (which publishes the image
+to GitHub Container Registry via `.github/workflows/release.yml` --
+Phase 19.6), without cloning anything:
+
+```bash
+docker run -p 8000:8000 -v crdt-cad-data:/data \
+  -e CRDT_CAD_DB_PATH=/data/crdt_cad.db \
+  ghcr.io/temikayode/crdt-cad:latest
+```
+
+(No release tag has been pushed yet as of this writing, so the `ghcr.io`
+image doesn't exist until the first `git tag v0.1.0 && git push origin
+v0.1.0` -- the workflow is committed and structurally standard, but
+honestly: it has not run yet. The package also needs to be flipped to
+public in the GitHub UI after its first publish for anonymous pulls.)
 
 Either way, start at the workspace home page, which lists every room
 that's ever been saved (Phase 17 -- see below):
@@ -2835,20 +2858,50 @@ the e2e one depending on the fast job passing first.
 
 ## Deployment
 
-**Docker**: `docker compose up --build` -- built and run-verified,
-including a full write -> restart -> data-still-there check against the
-named volume.
+See **`docs/deployment.md`** for the full runbook (VPS + Caddy, Fly.io,
+backups) and **`docs/configuration.md`** for every `CRDT_CAD_*`
+environment variable. Summary:
 
-**Kubernetes**: manifests exist under `k8s/` (`kubectl kustomize k8s/`
-builds cleanly) but were **not applied to a live cluster** -- none was
-reachable in the environment they were written in. Read `k8s/README.md`
-before touching `replicas` or `hpa.yaml`: the *default* configuration
-(SQLite, no Redis) still keeps room state on one pod, so scaling past 1
-replica in that configuration would silently split users across pods
-that can't see each other, not actually scale anything. `PostgresStore` +
-Redis pub/sub (see "Horizontal scaling seam" above) now make replicas > 1
-legitimate once both are configured -- `k8s/README.md` has the exact
-steps and what was/wasn't live-verified.
+**Docker (local dev)**: `docker compose up --build` -- built and
+run-verified, including a full write -> restart -> data-still-there
+check against the named volume.
+
+**Docker + Caddy (production, single VPS)**: `docker-compose.prod.yml` +
+a committed `Caddyfile` -- real HTTPS (Let's Encrypt for a real domain,
+a local self-signed cert for `localhost`), verified end-to-end: `wss://`
+through the proxy, the room-token auth flow, and the `/generate` rate
+limiter correctly reading the real client IP via `X-Forwarded-For`
+(`CRDT_CAD_TRUST_PROXY_HEADERS`) instead of Caddy's own. See
+`docs/deployment.md`'s "VPS" section.
+
+**Fly.io**: `fly.toml` committed (single machine, volume-mounted SQLite,
+always-on for WebSockets). Checked for valid TOML and cross-referenced
+against Fly's documented schema by hand, but **not live-deployed or
+platform-validated** -- no Fly account/token in this environment. See
+`docs/deployment.md`.
+
+**Kubernetes**: manifests under `k8s/`, **validated against a real
+cluster** (kind, Phase 18) -- both the default single-replica/SQLite
+configuration and the horizontally-scaled Postgres+Redis configuration,
+plus HPA and a TLS ingress. Read `k8s/README.md` before touching
+`replicas` or `hpa.yaml`: the *default* configuration (SQLite, no Redis)
+still keeps room state on one pod, so scaling past 1 replica in that
+configuration would silently split users across pods that can't see
+each other. `PostgresStore` + Redis pub/sub (see "Horizontal scaling
+seam" above) make replicas > 1 legitimate once both are configured --
+`k8s/README.md` has the exact steps and what was verified where.
+
+**Backups**: `scripts/backup_sqlite.py` (SQLite mode, using the online
+backup API -- safe against a live writer) and documented `pg_dump`/
+`pg_restore` (Postgres mode) -- both with an automated restore test
+(`tests/test_backup_sqlite.py`, `tests/test_backup_postgres.py`). See
+`docs/deployment.md`'s "Backups" section.
+
+**Graceful shutdown**: SIGTERM persists every room still holding
+unpersisted ops before the process exits -- verified against a real
+`docker stop` on a real container (not just a unit test): an edit sent
+but never explicitly saved survives, and a fresh container reusing the
+same volume picks the room back up intact.
 
 **Metrics**: `/metrics` is real `prometheus_client` output (connection
 counts, ops relayed, geometry rejections, merge-apply latency), so a
@@ -2962,12 +3015,14 @@ building this round -- and is called out in Roadmap below.
    **Done.** `PostgresStore` (shared persistence) and Redis pub/sub
    (`Room.broadcast()` now reaches clients connected to *other*
    processes) are both real, opt-in, and live-verified with two actual
-   server processes -- see "Horizontal scaling seam" in the Persistence
-   section above. What's still open: applying any of this to a real
-   Kubernetes cluster (`k8s/README.md`'s manifests remain unvalidated
-   against a live cluster, same caveat as before), and a Kafka-style
-   event log was not built (Redis pub/sub satisfies the same requirement
-   the brief poses it as an alternative for).
+   server processes *and* against real Kubernetes pods on a kind cluster
+   (Phase 18 -- see "Horizontal scaling seam" in the Persistence section
+   above and `k8s/README.md`). What's still open: a managed-cloud cluster
+   (EKS/GKE/AKS) was never tried, only kind; a Kafka-style event log was
+   not built (Redis pub/sub satisfies the same requirement the brief
+   poses it as an alternative for); and the HPA's custom-metric path
+   (scaling on `crdt_cad_active_connections` via a Prometheus Adapter,
+   rather than CPU) remains future work.
 3. ~~**Interactive constraint-assignment sketch UI**~~ -- **Done**
    (Phase 9). A new **Constrain** tool in the 2D demo: click two points
    (any paths, same or different) and apply Coincident, Parallel,
@@ -3035,29 +3090,45 @@ src/crdt_cad/
   geometry/
     constraints.py   Sketch / Constraint / numba-jitted Gauss-Newton solver
     validity.py      zero-length / self-intersection checks, the pre-commit gate
+    mesh_validity.py trimesh-based post-merge mesh checks (the "Validation Fork")
   export/
-    svg_io.py, dxf_io.py, stl_export.py
+    svg_io.py, dxf_io.py, stl_export.py, step_export.py (optional build123d extra)
   ai/
     house_spec.py       HouseSpec (bounded pydantic model the pipeline builds from)
     interpreter.py      Claude Fable 5 prompt interpretation + regex heuristic fallback
     procedural_house.py deterministic, watertight-by-construction mesh builder
     generator.py         prompt -> spec -> mesh -> batched CRDT MeshOps (ai_generator_bot)
     mesh_repair.py       optional pymeshlab print-prep (non-manifold repair, Poisson)
+    meshy_adapter.py     optional hosted text-to-3D API tier (MESHY_API_KEY; mock-tested)
   persistence/
-    store.py         DocumentStore interface, SQLiteStore, InMemoryStore (tests)
+    store.py         DocumentStore interface, SQLiteStore, PostgresStore, InMemoryStore
   server/
     app.py            FastAPI WebSocket relay + REST (export/import/solve/AI-generate)
     security.py        opt-in room tokens, CORS lockdown, rate limiting, resource ceilings
+    pubsub.py          optional Redis fan-out for multi-process rooms (CRDT_CAD_REDIS_URL)
     metrics.py         prometheus_client metric definitions
 tests/                 pytest + Hypothesis, one file per module, conftest.py isolates storage
+tests/e2e/             committed Playwright browser suite (opt-in via `-m e2e`)
+scripts/
+  load_test.py         N rooms x M WS clients load/soak driver (see docs/deployment.md)
+  backup_sqlite.py     online-backup-API SQLite backups (safe against a live writer)
+  k8s_smoke_test.py    post-deploy WebSocket round-trip check (used by CI's kind job)
 demo/static/
   common.js            relay client, P2PManager, actor identity, shared UI helpers
   home.html/home.js         workspace home page (room list, rename, history/restore)
   index.html/sketch.js      2D sketch demo
   mesh3d.html/mesh3d.js     3D mesh demo (Three.js via CDN, incl. AI Generate panel)
-  styles.css                shared dark theme
-Dockerfile, docker-compose.yml
-k8s/                   manifests + README.md explaining the replica-count caveat
+  tokens.css/styles.css/icons.svg  design tokens, themed styles, icon sprite (Part 3)
+docs/
+  deployment.md        VPS/Caddy runbook, Fly.io, backups, monitoring, load-test findings
+  configuration.md     every CRDT_CAD_* env var, exhaustively
+  design-system.md     Part 3 design-token rationale
+Dockerfile, docker-compose.yml            local dev stack
+docker-compose.prod.yml, Caddyfile        production TLS stack
+docker-compose.monitoring.yml, monitoring/  optional Prometheus + Grafana
+fly.toml               Fly.io config (provided, not live-deployed)
+k8s/                   kind-validated manifests + README.md (base/ + dev/ overlay)
+.github/workflows/     ci.yml (pytest/ruff/e2e/Docker/kind smoke), release.yml (GHCR on v* tags)
 ```
 
 ## License

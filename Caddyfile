@@ -1,0 +1,20 @@
+{$CRDT_CAD_DOMAIN:localhost} {
+	# Caddy gets automatic HTTPS (Let's Encrypt) for free for any real
+	# domain name -- for a bare `localhost` (local verification, no real
+	# DNS) it falls back to a locally-trusted self-signed certificate
+	# instead. Either way this is the only file a deployer needs to touch,
+	# and the only thing to change is the domain above (or set
+	# CRDT_CAD_DOMAIN in .env instead of editing this file at all).
+
+	reverse_proxy crdt-cad:8000 {
+		# WebSocket upgrade requests (Connection: Upgrade, Upgrade: websocket)
+		# are proxied transparently by Caddy's reverse_proxy with no special
+		# directive needed -- it forwards the Upgrade/Connection headers and
+		# switches to raw byte-shoveling automatically. What *does* need
+		# setting explicitly is X-Forwarded-For, so the app can see the real
+		# client IP instead of Caddy's own (see CRDT_CAD_TRUST_PROXY_HEADERS
+		# in docs/configuration.md) -- reverse_proxy sets this by default,
+		# listed here only to make that fact visible rather than implicit.
+		header_up X-Forwarded-For {remote_host}
+	}
+}
