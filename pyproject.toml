@@ -83,6 +83,11 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Phase G6: lets tests/test_evals.py import the top-level evals/ package
+# (a project-level artifact, deliberately not shipped inside the
+# installable src/crdt_cad package -- same reasoning as monitoring/ or
+# scripts/) via a plain `from evals... import ...`, no sys.path hacks.
+pythonpath = ["."]
 # A test that hangs (a real bug -- an uncaught exception silently dropping a
 # WebSocket connection with no reply the client's `receive_json()` was
 # waiting on -- surfaced exactly this way while writing the security suite)

@@ -1,5 +1,13 @@
 # crdt-cad
 
+**Real-time collaborative CAD in the browser — offline-first, provably
+convergent, AI-assisted, and self-hostable.**
+
+[![CI](https://github.com/TemiKayode/cad/actions/workflows/ci.yml/badge.svg)](https://github.com/TemiKayode/cad/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![Deploy](https://img.shields.io/badge/deploy-Docker%20%7C%20Kubernetes%20%7C%20VPS-2496ED?logo=docker&logoColor=white)](docs/deployment.md)
+
 A real-time, browser-based collaborative CAD engine whose geometric data
 is represented entirely as CRDTs (Conflict-free Replicated Data Types),
 implemented from scratch in pure Python. Two collaborators can edit the
@@ -9,10 +17,36 @@ edits merge automatically with no conflict-resolution step and no lost
 work. A "Time-Travel Merge" panel shows exactly what happened on each
 branch before the merge completes.
 
+**What makes it different:**
+
+- **Offline-first collaboration that actually merges.** Every edit is a
+  CRDT operation with a designed, Hypothesis-fuzzed convergence
+  guarantee -- not a lock, not a "last save wins," not a conflict dialog.
+- **Time-Travel Merge.** Reconnecting after offline edits shows both
+  branches side by side *before* the automatic merge -- the scariest
+  moment in collaboration made visible and trustworthy.
+- **AI text-to-3D that's verified, not vibes.** Claude interprets the
+  prompt; deterministic geometry builds the mesh; every generation is
+  validated (watertight/manifold/bounds), scored by a 66-case eval
+  harness in CI, and lands as ordinary collaborative edits with
+  provenance, follow-up editing, and one-unit undo.
+- **Yours to run.** MIT-licensed, pip-installable, one-command Docker
+  Compose, kind-validated Kubernetes manifests, TLS runbook, backups,
+  Grafana monitoring, and load-test results published honestly.
+
+**Jump to:** [Quickstart](#quickstart) ·
+[Architecture](#architecture) ·
+[AI generation](#ai-text-to-3d-generation-srccrdt_cadai) ·
+[Time-Travel Merge](#time-travel-merge-the-differentiator) ·
+[Testing](#testing) ·
+[Deployment](#deployment) ·
+[Roadmap](#roadmap--whats-not-built-yet)
+
 This README documents what's built, how the CRDT engine and sync
 protocol work, and how to run the workspace home page and its two live
 demos (2D sketch, 3D mesh). It also says plainly what's still missing
-and why, rather than papering over gaps.
+and why, rather than papering over gaps. (GitHub's list icon at the top
+of this file gives a full table of contents for the deep-dive sections.)
 
 Four stages of the same tool, in order of a real session: land on the
 **workspace**, open a **2D sketch** with shapes/fills/dimensions, open a
@@ -35,7 +69,7 @@ offline to see the **Time-Travel Merge** panel.
 | Mesh CRDT (vertices/edges/face boundaries/per-face properties) + presence | **Done**, composed from the primitives above |
 | Mesh undo/redo (incl. bundled extrude, Ctrl+Z/Ctrl+Y in the 3D demo) | **Done** -- inverted ops, not snapshots, same pattern as 2D |
 | Cross-component mesh validity ("Validation Fork" / "Extrusion Nightmare") | **Done** -- post-merge warning broadcast, not a rejection gate, see below |
-| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G5 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), **provenance + spec persistence + follow-up edits + one-unit undo** (select/edit/undo a whole generation, not vertex by vertex), a **report card + Prometheus metrics + a real cancel button + budget guardrails** (success measured, not asserted), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G6-G7 (eval harness, hosted ML tier) not started |
+| AI text-to-3D generation (`src/crdt_cad/ai/`) | **Done, Phase G1-G6 (Part 5)** -- a 14-generator registry (house, table, chair, shelf, stairs, column, arch, door/window w/ real CSG cuts, fence, box/cylinder/cone/torus), Claude Fable 5 dispatch via real tool-use (heuristic fallback, no API key required), multi-object **scene composition** with a deterministic layout solver ("a table with four chairs around it"), a **sandboxed JSON geometry DSL** for open-vocabulary shapes no generator covers (hard-capped, validate→repair→fallback loop), **provenance + spec persistence + follow-up edits + one-unit undo** (select/edit/undo a whole generation, not vertex by vertex), a **report card + Prometheus metrics + a real cancel button + budget guardrails** (success measured, not asserted), a **66-case golden eval harness wired into CI** (100% score, see "AI quality" below), pre-commit watertight/manifold/bounds validation + optional `pymeshlab` print-repair, injected as batched (per-object-staged, for scenes) CRDT ops -- see below for exact scope; G7 (hosted ML tier, optional) not started |
 | `DrawingDocument` (layers, paths, props, comments, presence, undo/redo) | **Done** |
 | Geometry kernel: constraint solver (coincident/tangent/perpendicular/parallel/fixed-distance), numpy+numba | **Done**, own test suite incl. an independent Pythagorean-triple correctness check |
 | Interactive constraint UI (2D demo **Constrain** tool) | **Done** (Phase 9, extended Phase 14) -- coincident/parallel/perpendicular/fixed-distance/tangent, persistent + undoable + badge glyphs + re-solve-on-drag, see below |
@@ -1163,6 +1197,68 @@ before a surprise 429 rather than after.
   kill-list check classifies Unicode check/cross marks as symbol
   glyphs, caught immediately by running the full suite rather than
   discovered later.
+
+### AI quality (Phase G6) -- measured, not asserted
+
+The engineering half of "shows success": a golden prompt set the CI
+suite actually scores on every push, replacing adjectives with a
+number.
+
+- **`evals/golden_prompts.py`**: 66 real prompts across six categories
+  -- every registry generator (two prompts each, so a pass isn't a
+  coincidence), house field extraction ("a 4 bedroom house with a
+  wooden floor" checked against `spec.bedrooms == 4` and
+  `spec.floor_material == "wood"`, not just "did it dispatch"), scene
+  composition, ambiguous prompts (no clear single-generator match --
+  falling back to `house` is the *correct*, checked behavior, not a
+  gap), adversarial/out-of-scope input (nonsense, extreme length,
+  prompt-injection-shaped text, even a SQL-injection string -- caught a
+  genuinely interesting, honestly-documented false positive: "DROP
+  TABLE" contains the literal keyword "table," so the heuristic
+  dispatches it there, a harmless artifact of plain substring matching
+  having no SQL awareness, not a security issue since the LLM never
+  emits geometry either way), and non-English samples (an honestly
+  documented *real limitation*: the heuristic's keyword table is
+  English-only, so these are expected to degrade gracefully to `house`
+  rather than dispatch correctly -- the eval checks graceful
+  degradation for this category, not correct dispatch).
+- **`evals/harness.py`** runs the *real* pipeline on every case
+  (`interpret_prompt` then `generate_ops_from_interpretation`) --
+  deliberately not a reimplementation of dispatch/build logic that
+  could silently drift from what a user actually hits. A case passes
+  only if the expected generator matches (where one's asserted), every
+  `expected_spec` field matches exactly, and the resulting geometry
+  validates cleanly.
+- **Wired into CI** (`tests/test_evals.py`, no code changes needed to
+  `.github/workflows/ci.yml` -- it's picked up by the existing
+  `pytest tests/ -v` step via a new `pythonpath = ["."]` pytest option
+  that lets a test import the top-level `evals/` package, deliberately
+  kept outside the installable `src/crdt_cad` package, same reasoning
+  as `monitoring/` or `scripts/`): the three deterministic categories
+  (registry, house-dimensioned, scene) are held to a perfect 100% bar
+  -- any failure is a real regression, not noise; the three graceful-
+  degradation categories (ambiguous, adversarial, non-English) get an
+  85% floor, loose enough that a future, still-correct keyword-table
+  change can't spuriously break CI; the overall score must stay at or
+  above 95%. **Current score: 66/66 (100%)** across every category,
+  confirmed by running the harness directly against this codebase
+  (heuristic path only, no network -- runs in ~16s including generator
+  import time).
+- **The live-LLM eval** (`evals/run_live_eval.py`) is a separate,
+  manually-triggered script -- never run by CI, since it needs a real
+  `ANTHROPIC_API_KEY` and spends real money per invocation. Measures
+  what only a real model call can: schema-valid response rate,
+  dispatch accuracy against the golden set's known-correct answers,
+  the DSL path's first-try validity and repair-loop recovery rates
+  (against 8 prompts deliberately shaped to miss every registry
+  generator, forcing the "dsl" tool), and p50/p95 latency -- appending
+  a dated, model-id-stamped entry to `evals/RESULTS.md` every run,
+  including a bad run's numbers. **Not run in this environment**: no
+  `ANTHROPIC_API_KEY` was ever configured here (confirmed throughout
+  this project's own test suite and every `LLM ... unavailable ...
+  using the heuristic dispatcher` log line it produces) -- stated
+  plainly in `RESULTS.md` itself rather than fabricating numbers, the
+  same honesty rule this project already applies to Meshy and Fly.io.
 
 **3D-print preparation** (`mesh_repair.py`) is a separate, opt-in path
 -- *not* part of the CRDT-injection pipeline, per the brief's own
