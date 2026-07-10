@@ -1,24 +1,29 @@
 # Fly.io config (Phase 19.2) -- the fastest path to a public HTTPS URL.
-# See docs/deployment.md's "Fly.io" section for the full `fly launch` /
-# `fly secrets set` / `fly volumes create` / `fly deploy` sequence.
+# See docs/deployment.md's "Fly.io" section for the full `fly secrets set`
+# / `fly volumes create` / `fly deploy` sequence.
 #
-# Honesty note: `flyctl` was installed and this file confirmed to be
-# valid TOML matching Fly's documented v2 machine-config schema (app,
-# primary_region, build, env, mounts, http_service, vm) -- but
-# `flyctl config validate` itself checks against the live Fly platform
-# API, which requires an authenticated account/token that isn't
-# available in this environment. This has NOT been live-deployed or
-# platform-validated. See docs/deployment.md.
-app = "crdt-cad"
+# App name/region come from the real `fly launch` run on 2026-07-05
+# (PR #1, "New files from Fly.io Launch"); everything else keeps the
+# Phase 19 config, deliberately over the generated defaults:
+#   - internal_port 8000 (the app's actual port; the generated file said 8080)
+#   - auto_stop OFF + min_machines_running 1: WebSocket connections are
+#     long-lived and often idle between edits -- scale-to-zero would kill
+#     the machine out from under a connected room. Collaboration is the
+#     whole point of this app, so one always-on machine is the correct
+#     trade-off, not a cost optimization to fight later.
+#   - a [[mounts]] volume: without it the SQLite file dies with the machine
+#     (create it once: `fly volumes create crdt_cad_data --region iad`).
+#
+# Honesty note: this merged config has still not itself been deployed
+# (`fly deploy`) -- validate on first deploy. CRDT_CAD_SECRET is set via
+# `fly secrets set`, never in [env] (this file is committed and public).
+app = "cad-hxpczw"
 primary_region = "iad"
 
 [build]
 
 [env]
   CRDT_CAD_DB_PATH = "/data/crdt_cad.db"
-  # CRDT_CAD_SECRET is set via `fly secrets set`, never here -- secrets
-  # live in `[env]` are visible in `fly.toml` (committed, public), which
-  # defeats the point of a secret.
 
 [[mounts]]
   source = "crdt_cad_data"
@@ -27,11 +32,6 @@ primary_region = "iad"
 [http_service]
   internal_port = 8000
   force_https = true
-  # WebSocket connections are long-lived and often idle between edits --
-  # Fly's auto-stop/auto-start (scale-to-zero on idle) would kill the
-  # machine out from under a connected room. Collaboration is the whole
-  # point of this app, so a single always-on machine is the correct
-  # trade-off here, not a cost-optimization to fight later.
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
