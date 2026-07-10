@@ -3847,3 +3847,9 @@ setInterval(() => {
 
 resizeCanvas();
 setTool("pen");
+
+// Part 6 P5: the room activity feed -- a light poll (not tied to the
+// 400ms presence heartbeat above) since it's a REST round trip, not an
+// already-open WebSocket message.
+renderActivityFeed("drawing", room, "activityList");
+setInterval(() => renderActivityFeed("drawing", room, "activityList"), 20000);

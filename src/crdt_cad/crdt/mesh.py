@@ -44,6 +44,7 @@ from crdt_cad.crdt.serialize import dumps_msgpack, loads_msgpack
 
 VertexId = str
 FaceId = str
+CommentId = str
 Position = tuple[float, float, float]
 Edge = tuple[VertexId, VertexId]
 
@@ -70,7 +71,7 @@ def decode_edge(key: str) -> Edge:
 class MeshOp:
     """A routable envelope around one op from one of the mesh's sub-CRDTs."""
 
-    target: str  # "vertex" | "edge" | "face_index" | "face_geom" | "face_prop" | "presence" | "generation"
+    target: str  # "vertex" | "edge" | "face_index" | "face_geom" | "face_prop" | "comment" | "presence" | "generation"
     payload: dict
     face_id: Optional[FaceId] = None
 
@@ -101,6 +102,13 @@ class MeshCRDT:
         # never patches one field of it, so there's no reason to split it
         # into per-field entries the way face_props does).
         self.generations: LWWMap[str, dict] = LWWMap(clock)
+        # Part 6 P5: 3D comments, mirroring DrawingDocument.comments
+        # exactly (same LWWMap-of-dicts shape, same generic "comment" op
+        # target reusing the existing ops transport) -- anchored to a
+        # face id instead of a path id, since a face is this document's
+        # primary selectable/addressable object the way a path is for
+        # DrawingDocument.
+        self.comments: LWWMap[CommentId, dict] = LWWMap(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -211,6 +219,18 @@ class MeshCRDT:
 
     def generations_dict(self) -> dict[str, dict]:
         return dict(self.generations.items())
+
+    # -- local mutation: comments (Part 6 P5) ---------------------------------
+    def add_comment(self, face_id: FaceId, text: str, author: str) -> tuple[CommentId, MeshOp]:
+        comment_id = new_id("comment")
+        op = self.comments.set(comment_id, {"face_id": face_id, "text": text, "author": author})
+        return comment_id, MeshOp("comment", op.to_dict())
+
+    def remove_comment(self, comment_id: CommentId) -> MeshOp:
+        return MeshOp("comment", self.comments.delete(comment_id).to_dict())
+
+    def comment_list(self) -> list[dict]:
+        return [{"id": cid, **payload} for cid, payload in self.comments.items()]
 
     def extrude_face(self, face_id: FaceId, height: float) -> list[MeshOp]:
         """Extrudes a face along +Y by ``height``: duplicates its boundary
@@ -381,6 +401,8 @@ class MeshCRDT:
             return self.presence.apply(LWWOp.from_dict(op.payload))
         if op.target == "generation":
             return self.generations.apply(LWWOp.from_dict(op.payload))
+        if op.target == "comment":
+            return self.comments.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown mesh op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -397,6 +419,7 @@ class MeshCRDT:
                 changed |= self._face_props(face_id).merge(other.face_props[face_id])
         changed |= self.presence.merge(other.presence)
         changed |= self.generations.merge(other.generations)
+        changed |= self.comments.merge(other.comments)
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -428,6 +451,7 @@ class MeshCRDT:
             vc = vc.merge(m.frontier())
         vc = vc.merge(self.presence.frontier())
         vc = vc.merge(self.generations.frontier())
+        vc = vc.merge(self.comments.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[MeshOp]:
@@ -443,6 +467,7 @@ class MeshCRDT:
             out += [MeshOp("face_prop", op.to_dict(), face_id=face_id) for op in m.ops_since(vc)]
         out += [MeshOp("presence", op.to_dict()) for op in self.presence.ops_since(vc)]
         out += [MeshOp("generation", op.to_dict()) for op in self.generations.ops_since(vc)]
+        out += [MeshOp("comment", op.to_dict()) for op in self.comments.ops_since(vc)]
         return out
 
     # -- reads: presence ------------------------------------------------------
@@ -459,6 +484,7 @@ class MeshCRDT:
             "face_props": {fid: m.to_dict() for fid, m in self.face_props.items()},
             "presence": self.presence.to_dict(),
             "generations": self.generations.to_dict(),
+            "comments": self.comments.to_dict(),
         }
 
     @staticmethod
@@ -478,6 +504,8 @@ class MeshCRDT:
             mesh.presence = LWWMap.from_dict(clock, d["presence"])
         if "generations" in d:
             mesh.generations = LWWMap.from_dict(clock, d["generations"])
+        if "comments" in d:
+            mesh.comments = LWWMap.from_dict(clock, d["comments"])
         return mesh
 
     def to_bytes(self) -> bytes:

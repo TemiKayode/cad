@@ -1751,3 +1751,48 @@ class P2PManager {
     }
   }
 }
+
+// -- per-room activity feed (Part 6 P5) ---------------------------------------
+//
+// Shared between sketch.js and mesh3d.js: both call renderActivityFeed(kind,
+// room, containerId) once at startup and on a timer. Accounts-mode only --
+// the endpoint always answers (even in tokens mode, where it's just an empty
+// list, see app.py's _room_activity), so this never needs its own gate.
+
+function _describeActivity(entry) {
+  const who = entry.payload?.author || "someone";
+  switch (entry.kind) {
+    case "comment_added":
+      return `${who} commented: "${entry.payload.text || ""}"`;
+    case "comment_removed":
+      return `${who} removed a comment`;
+    case "generation_completed":
+      return `${who} generated: "${entry.payload.prompt || ""}"`;
+    default:
+      return `${who}: ${entry.kind}`;
+  }
+}
+
+async function renderActivityFeed(kind, room, containerId) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const path = kind === "mesh" ? `/api/mesh/${encodeURIComponent(room)}/activity` : `/api/rooms/${encodeURIComponent(room)}/activity`;
+  let entries = [];
+  try {
+    const resp = await fetch(path);
+    if (resp.ok) entries = (await resp.json()).activity || [];
+  } catch (err) {
+    return; // leave whatever was already rendered -- a transient fetch failure isn't worth clearing the panel over
+  }
+  if (entries.length === 0) {
+    el.innerHTML = '<div class="empty-hint">No activity yet.</div>';
+    return;
+  }
+  el.innerHTML = "";
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "activity-row";
+    row.innerHTML = `<span>${escapeHtmlCommon(_describeActivity(entry))}</span><span class="room-card-meta">${relativeTimeShort(entry.created_at)}</span>`;
+    el.appendChild(row);
+  }
+}

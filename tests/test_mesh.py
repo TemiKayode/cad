@@ -230,3 +230,60 @@ def test_generation_included_in_frontier_and_ops_since():
     delta = mesh.ops_since(frontier_before)
     assert any(op.target == "generation" for op in delta)
     assert mesh.frontier().get("bot") > frontier_before.get("bot")
+
+
+# -- comments (Part 6 P5) -----------------------------------------------------
+
+
+def test_comment_add_and_remove():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    face_id, _ = "face_1", mesh.add_face("face_1", ["v1", "v2", "v3"])
+    comment_id, _ = mesh.add_comment(face_id, "check this corner", author="alice")
+    assert len(mesh.comment_list()) == 1
+    assert mesh.comment_list()[0]["face_id"] == face_id
+    assert mesh.comment_list()[0]["text"] == "check this corner"
+    mesh.remove_comment(comment_id)
+    assert mesh.comment_list() == []
+
+
+def test_comment_op_syncs_between_replicas():
+    mesh_a = MeshCRDT(LamportClock(actor="a"))
+    mesh_b = MeshCRDT(LamportClock(actor="b"))
+    _comment_id, op = mesh_a.add_comment("face_1", "looks great", author="alice")
+    assert mesh_b.apply(op) is True
+    assert mesh_b.comment_list() == mesh_a.comment_list()
+
+
+def test_comment_merge_and_serialization_roundtrip():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    mesh.add_comment("face_1", "note", author="alice")
+
+    restored = MeshCRDT.from_bytes(LamportClock(actor="b"), mesh.to_bytes())
+    assert restored.comment_list() == mesh.comment_list()
+
+    other = MeshCRDT(LamportClock(actor="c"))
+    other.add_comment("face_2", "another note", author="bob")
+    assert mesh.merge(other) is True
+    assert len(mesh.comment_list()) == 2
+
+
+def test_comment_included_in_frontier_and_ops_since():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    frontier_before = mesh.frontier()
+    mesh.add_comment("face_1", "note", author="alice")
+    delta = mesh.ops_since(frontier_before)
+    assert any(op.target == "comment" for op in delta)
+    assert mesh.frontier().get("a") > frontier_before.get("a")
+
+
+def test_pre_p5_snapshot_without_comments_key_loads_cleanly():
+    """Backward compatibility: a mesh persisted before comments existed
+    has no "comments" key in its serialized dict at all -- from_dict
+    must default to an empty LWWMap rather than KeyError, same as every
+    other Part 5/6-added field this class already handles this way."""
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    mesh.add_vertex("v1", (0.0, 0.0, 0.0))
+    d = mesh.to_dict()
+    del d["comments"]
+    restored = MeshCRDT.from_dict(LamportClock(actor="b"), d)
+    assert restored.comment_list() == []

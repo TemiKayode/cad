@@ -26,6 +26,7 @@ What is stored, and what deliberately is not:
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -279,6 +280,51 @@ class AccountStore:
         an admin deletes the room's content outright."""
         raise NotImplementedError
 
+    # -- notifications (Part 6, P5) ----------------------------------------------
+
+    def create_notification(self, user_id: str, kind: str, payload: dict) -> dict:
+        """``kind`` is e.g. ``"mention"`` or ``"room_shared"``; ``payload``
+        is whatever that kind needs to render itself (room id/kind,
+        who triggered it, a snippet of text) -- opaque to the store,
+        round-tripped as-is. Returns the created row, including its new
+        ``notification_id`` and ``created_at``."""
+        raise NotImplementedError
+
+    def list_notifications(self, user_id: str, unread_only: bool = False, limit: int = 50) -> list[dict]:
+        """Newest first. Each row: ``{"notification_id", "user_id",
+        "kind", "payload", "created_at", "read"}``."""
+        raise NotImplementedError
+
+    def mark_notification_read(self, notification_id: str, user_id: str) -> bool:
+        """``user_id`` must match the notification's own owner -- one
+        user can never mark another's notification read. Returns False
+        if no matching, unowned-by-someone-else row exists."""
+        raise NotImplementedError
+
+    def mark_all_notifications_read(self, user_id: str) -> int:
+        """Returns how many were newly marked read."""
+        raise NotImplementedError
+
+    def count_unread_notifications(self, user_id: str) -> int:
+        raise NotImplementedError
+
+    # -- per-room activity feed (Part 6, P5) --------------------------------------
+
+    def log_activity(self, room_kind: str, room_id: str, actor_user_id: Optional[str], kind: str, payload: dict) -> None:
+        """Appends one entry to a room's activity feed -- e.g.
+        ``kind="comment_added"``, ``"visibility_changed"``,
+        ``"room_shared"``, ``"transferred_to_org"``,
+        ``"generation_completed"``. ``actor_user_id`` is None when the
+        actor isn't signed in (a comment from a guest actor in
+        tokens-only mode still writes a comment, just with no stable
+        identity to log against)."""
+        raise NotImplementedError
+
+    def list_activity(self, room_kind: str, room_id: str, limit: int = 50) -> list[dict]:
+        """Newest first. Each row: ``{"activity_id", "room_kind",
+        "room_id", "actor_user_id", "kind", "payload", "created_at"}``."""
+        raise NotImplementedError
+
 
 class InMemoryAccountStore(AccountStore):
     """Non-durable accounts store used in tests."""
@@ -292,6 +338,8 @@ class InMemoryAccountStore(AccountStore):
         self._orgs: dict[str, dict] = {}
         self._org_members: dict[tuple[str, str], dict] = {}
         self._quota_usage: dict[tuple[str, str, str], int] = {}
+        self._notifications: dict[str, dict] = {}
+        self._activity: list[dict] = []
 
     def create_or_get_user(self, email: str, display_name: Optional[str] = None) -> dict:
         email = email.strip().lower()
@@ -574,6 +622,67 @@ class InMemoryAccountStore(AccountStore):
         for key in [k for k in self._grants if k[0] == kind and k[1] == room_id]:
             del self._grants[key]
 
+    # -- notifications --------------------------------------------------------
+
+    def create_notification(self, user_id: str, kind: str, payload: dict) -> dict:
+        row = {
+            "notification_id": uuid.uuid4().hex,
+            "user_id": user_id,
+            "kind": kind,
+            "payload": dict(payload),
+            "created_at": time.time(),
+            "read": False,
+        }
+        self._notifications[row["notification_id"]] = row
+        return dict(row)
+
+    def list_notifications(self, user_id: str, unread_only: bool = False, limit: int = 50) -> list[dict]:
+        rows = [
+            dict(r) for r in self._notifications.values()
+            if r["user_id"] == user_id and (not unread_only or not r["read"])
+        ]
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        return rows[:limit]
+
+    def mark_notification_read(self, notification_id: str, user_id: str) -> bool:
+        row = self._notifications.get(notification_id)
+        if row is None or row["user_id"] != user_id:
+            return False
+        row["read"] = True
+        return True
+
+    def mark_all_notifications_read(self, user_id: str) -> int:
+        count = 0
+        for row in self._notifications.values():
+            if row["user_id"] == user_id and not row["read"]:
+                row["read"] = True
+                count += 1
+        return count
+
+    def count_unread_notifications(self, user_id: str) -> int:
+        return sum(1 for r in self._notifications.values() if r["user_id"] == user_id and not r["read"])
+
+    # -- per-room activity feed -------------------------------------------------
+
+    def log_activity(self, room_kind: str, room_id: str, actor_user_id: Optional[str], kind: str, payload: dict) -> None:
+        self._activity.append({
+            "activity_id": uuid.uuid4().hex,
+            "room_kind": room_kind,
+            "room_id": room_id,
+            "actor_user_id": actor_user_id,
+            "kind": kind,
+            "payload": dict(payload),
+            "created_at": time.time(),
+        })
+
+    def list_activity(self, room_kind: str, room_id: str, limit: int = 50) -> list[dict]:
+        rows = [
+            dict(r) for r in self._activity
+            if r["room_kind"] == room_kind and r["room_id"] == room_id
+        ]
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        return rows[:limit]
+
 
 _USERS_DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -648,6 +757,29 @@ CREATE TABLE IF NOT EXISTS quota_usage (
 )
 """
 
+_NOTIFICATIONS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS notifications (
+    notification_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    read INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+_ACTIVITY_LOG_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS activity_log (
+    activity_id TEXT PRIMARY KEY,
+    room_kind TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    actor_user_id TEXT,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at REAL NOT NULL
+)
+"""
+
 
 class SQLiteAccountStore(AccountStore):
     """Accounts in a SQLite file -- by default the same file as room
@@ -690,6 +822,12 @@ class SQLiteAccountStore(AccountStore):
             conn.execute(_ORG_MEMBERS_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id)")
             conn.execute(_QUOTA_USAGE_DDL_SQLITE)
+            conn.execute(_NOTIFICATIONS_DDL_SQLITE)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read)")
+            conn.execute(_ACTIVITY_LOG_DDL_SQLITE)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_activity_room ON activity_log(room_kind, room_id, created_at)"
+            )
 
     @contextmanager
     def _connect(self):
@@ -1095,6 +1233,84 @@ class SQLiteAccountStore(AccountStore):
             conn.execute("DELETE FROM room_ownership WHERE kind = ? AND room_id = ?", (kind, room_id))
             conn.execute("DELETE FROM room_grants WHERE kind = ? AND room_id = ?", (kind, room_id))
 
+    # -- notifications --------------------------------------------------------
+
+    def create_notification(self, user_id: str, kind: str, payload: dict) -> dict:
+        notification_id = uuid.uuid4().hex
+        created_at = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO notifications (notification_id, user_id, kind, payload, created_at, read) "
+                "VALUES (?, ?, ?, ?, ?, 0)",
+                (notification_id, user_id, kind, json.dumps(payload), created_at),
+            )
+        return {
+            "notification_id": notification_id, "user_id": user_id, "kind": kind,
+            "payload": dict(payload), "created_at": created_at, "read": False,
+        }
+
+    def list_notifications(self, user_id: str, unread_only: bool = False, limit: int = 50) -> list[dict]:
+        query = "SELECT notification_id, user_id, kind, payload, created_at, read FROM notifications WHERE user_id = ?"
+        params: list = [user_id]
+        if unread_only:
+            query += " AND read = 0"
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "notification_id": r[0], "user_id": r[1], "kind": r[2],
+                "payload": json.loads(r[3]), "created_at": r[4], "read": bool(r[5]),
+            }
+            for r in rows
+        ]
+
+    def mark_notification_read(self, notification_id: str, user_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE notifications SET read = 1 WHERE notification_id = ? AND user_id = ?",
+                (notification_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def mark_all_notifications_read(self, user_id: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("UPDATE notifications SET read = 1 WHERE user_id = ? AND read = 0", (user_id,))
+            return cur.rowcount
+
+    def count_unread_notifications(self, user_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read = 0", (user_id,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    # -- per-room activity feed -------------------------------------------------
+
+    def log_activity(self, room_kind: str, room_id: str, actor_user_id: Optional[str], kind: str, payload: dict) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO activity_log (activity_id, room_kind, room_id, actor_user_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (uuid.uuid4().hex, room_kind, room_id, actor_user_id, kind, json.dumps(payload), time.time()),
+            )
+
+    def list_activity(self, room_kind: str, room_id: str, limit: int = 50) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT activity_id, room_kind, room_id, actor_user_id, kind, payload, created_at "
+                "FROM activity_log WHERE room_kind = ? AND room_id = ? ORDER BY created_at DESC LIMIT ?",
+                (room_kind, room_id, limit),
+            ).fetchall()
+        return [
+            {
+                "activity_id": r[0], "room_kind": r[1], "room_id": r[2], "actor_user_id": r[3],
+                "kind": r[4], "payload": json.loads(r[5]), "created_at": r[6],
+            }
+            for r in rows
+        ]
+
 
 class PostgresAccountStore(AccountStore):
     """Accounts in Postgres, for multi-process deployments (k8s Mode B).
@@ -1233,6 +1449,37 @@ class PostgresAccountStore(AccountStore):
                         PRIMARY KEY (user_id, kind, day)
                     )
                     """
+                )
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS notifications (
+                        notification_id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at DOUBLE PRECISION NOT NULL,
+                        read BOOLEAN NOT NULL DEFAULT FALSE
+                    )
+                    """
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, read)"
+                )
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS activity_log (
+                        activity_id TEXT PRIMARY KEY,
+                        room_kind TEXT NOT NULL,
+                        room_id TEXT NOT NULL,
+                        actor_user_id TEXT,
+                        kind TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at DOUBLE PRECISION NOT NULL
+                    )
+                    """
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_activity_room ON activity_log(room_kind, room_id, created_at)"
                 )
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1)", self._SCHEMA_LOCK_KEY)
@@ -1759,3 +2006,111 @@ class PostgresAccountStore(AccountStore):
                 await conn.execute("DELETE FROM room_grants WHERE kind = $1 AND room_id = $2", kind, room_id)
 
         self._call(_go())
+
+    # -- notifications --------------------------------------------------------
+
+    def create_notification(self, user_id: str, kind: str, payload: dict) -> dict:
+        notification_id = uuid.uuid4().hex
+        created_at = time.time()
+
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO notifications (notification_id, user_id, kind, payload, created_at, read) "
+                    "VALUES ($1, $2, $3, $4, $5, FALSE)",
+                    notification_id, user_id, kind, json.dumps(payload), created_at,
+                )
+
+        self._call(_go())
+        return {
+            "notification_id": notification_id, "user_id": user_id, "kind": kind,
+            "payload": dict(payload), "created_at": created_at, "read": False,
+        }
+
+    def list_notifications(self, user_id: str, unread_only: bool = False, limit: int = 50) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                if unread_only:
+                    rows = await conn.fetch(
+                        "SELECT notification_id, user_id, kind, payload, created_at, read FROM notifications "
+                        "WHERE user_id = $1 AND read = FALSE ORDER BY created_at DESC LIMIT $2",
+                        user_id, limit,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT notification_id, user_id, kind, payload, created_at, read FROM notifications "
+                        "WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                        user_id, limit,
+                    )
+                return [
+                    {
+                        "notification_id": r["notification_id"], "user_id": r["user_id"], "kind": r["kind"],
+                        "payload": json.loads(r["payload"]), "created_at": r["created_at"], "read": r["read"],
+                    }
+                    for r in rows
+                ]
+
+        return self._call(_go())
+
+    def mark_notification_read(self, notification_id: str, user_id: str) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE notifications SET read = TRUE WHERE notification_id = $1 AND user_id = $2",
+                    notification_id, user_id,
+                )
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    def mark_all_notifications_read(self, user_id: str) -> int:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE notifications SET read = TRUE WHERE user_id = $1 AND read = FALSE", user_id,
+                )
+                return int(result.split(" ")[-1])
+
+        return self._call(_go())
+
+    def count_unread_notifications(self, user_id: str) -> int:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT COUNT(*) AS c FROM notifications WHERE user_id = $1 AND read = FALSE", user_id,
+                )
+                return row["c"] if row else 0
+
+        return self._call(_go())
+
+    # -- per-room activity feed -------------------------------------------------
+
+    def log_activity(self, room_kind: str, room_id: str, actor_user_id: Optional[str], kind: str, payload: dict) -> None:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO activity_log (activity_id, room_kind, room_id, actor_user_id, kind, payload, created_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    uuid.uuid4().hex, room_kind, room_id, actor_user_id, kind, json.dumps(payload), time.time(),
+                )
+
+        self._call(_go())
+
+    def list_activity(self, room_kind: str, room_id: str, limit: int = 50) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT activity_id, room_kind, room_id, actor_user_id, kind, payload, created_at "
+                    "FROM activity_log WHERE room_kind = $1 AND room_id = $2 ORDER BY created_at DESC LIMIT $3",
+                    room_kind, room_id, limit,
+                )
+                return [
+                    {
+                        "activity_id": r["activity_id"], "room_kind": r["room_kind"], "room_id": r["room_id"],
+                        "actor_user_id": r["actor_user_id"], "kind": r["kind"],
+                        "payload": json.loads(r["payload"]), "created_at": r["created_at"],
+                    }
+                    for r in rows
+                ]
+
+        return self._call(_go())

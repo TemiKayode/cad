@@ -215,6 +215,13 @@ class Room:
         # the "hello" token, consulted in `_handle_message` to reject an
         # `ops` message from a read-only viewer connection.
         self.client_roles: dict[str, str] = {}
+        # Part 6 P5: the signed-in user (or None) behind each connected
+        # actor, keyed the same as `clients`/`client_roles` -- lets
+        # `_handle_message` attribute a comment's @mentions and this
+        # room's activity-log entries to a real account without
+        # re-resolving the session cookie on every message (auth is
+        # only ever checked once, at "hello" time, same as `role` is).
+        self.client_users: dict[str, Optional[dict]] = {}
         self._snapshot_task: asyncio.Task | None = None
         self._redis_task: asyncio.Task | None = None
         self._deferred_persist: asyncio.Task | None = None
@@ -1355,6 +1362,62 @@ async def admin_delete_room(kind: str, room_id: str) -> dict:
     return {"ok": True}
 
 
+# -- notifications & per-room activity feed (Part 6 P5) ------------------------
+
+
+@app.get("/api/notifications")
+async def list_notifications(request: Request, unread_only: bool = False) -> dict:
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    store = auth.get_account_store()
+    return {
+        "notifications": store.list_notifications(user["user_id"], unread_only=unread_only),
+        "unread_count": store.count_unread_notifications(user["user_id"]),
+    }
+
+
+@app.post("/api/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, request: Request) -> dict:
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    if not auth.get_account_store().mark_notification_read(notification_id, user["user_id"]):
+        raise HTTPException(status_code=404, detail="notification not found")
+    return {"ok": True}
+
+
+@app.post("/api/notifications/read-all")
+async def mark_all_notifications_read(request: Request) -> dict:
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    count = auth.get_account_store().mark_all_notifications_read(user["user_id"])
+    return {"ok": True, "marked_read": count}
+
+
+async def _room_activity(kind: str, room_id: str) -> dict:
+    if not auth.accounts_enabled():
+        return {"activity": []}  # feature is accounts-only -- see _handle_comment_ops's docstring
+    return {"activity": auth.get_account_store().list_activity(kind, room_id)}
+
+
+@app.get("/api/rooms/{room_id}/activity", dependencies=[Depends(require_room_access("drawing"))])
+async def drawing_room_activity(room_id: str) -> dict:
+    return await _room_activity("drawing", room_id)
+
+
+@app.get("/api/mesh/{room_id}/activity", dependencies=[Depends(require_room_access("mesh"))])
+async def mesh_room_activity(room_id: str) -> dict:
+    return await _room_activity("mesh", room_id)
+
+
 class RenameRequest(BaseModel):
     display_name: str
 
@@ -1925,6 +1988,20 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
     elapsed = time.monotonic() - request_start
     metrics.generations_total.labels(outcome=outcome, path=path).inc()
     metrics.generation_latency_seconds.observe(elapsed)
+    if auth.accounts_enabled():
+        # Part 6 P5: the room activity feed's one non-comment trigger --
+        # a generation is this app's most visible "something happened"
+        # event, worth surfacing there even though it's not itself a
+        # comment/mention. actor_user_id is whoever's REST session made
+        # the call (None for an anonymous/token-only request).
+        requester = auth.current_user(request)
+        auth.get_account_store().log_activity(
+            "mesh", room_id, requester["user_id"] if requester else None, "generation_completed",
+            {
+                "prompt": req.prompt, "generator": result.generator_name, "generation_id": result.generation_id,
+                "author": requester["display_name"] if requester else "someone",
+            },
+        )
     logger.info(
         "room mesh/%s: generated %d ops (%d vertices, %d faces) from prompt %r via %s (%s/%s), sent in %d batches",
         room_id, len(result.ops), result.vertex_count, result.face_count, req.prompt,
@@ -2111,6 +2188,7 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
     actor = str(hello["actor"])
     room.clients[actor] = websocket
     room.client_roles[actor] = role
+    room.client_users[actor] = user
     room.start_snapshot_loop()
     room.start_redis_relay_loop()
     metrics.connections_total.inc()
@@ -2154,6 +2232,7 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
     finally:
         room.clients.pop(actor, None)
         room.client_roles.pop(actor, None)
+        room.client_users.pop(actor, None)
         metrics.active_connections.dec()
         logger.info(
             "room %s/%s: actor %s disconnected (%d clients left)",
@@ -2248,6 +2327,61 @@ async def _check_and_broadcast_mesh_validity(room: Room, touched_topology: bool)
         await room.broadcast({"type": "validity_warning", "faces": all_faces, "problems": problems})
 
 
+_MENTION_RE = re.compile(r"@([\w.+-]+@[\w-]+\.[\w.-]+)")
+
+
+async def _handle_comment_ops(room: Room, actor: str, accepted_wire: list[dict]) -> None:
+    """Part 6 P5: for every accepted comment op, logs a room activity
+    entry, and -- accounts mode only, since this needs a real identity
+    to attribute and notify -- resolves any ``@email`` mentions in a
+    newly-added comment's text to real accounts and creates a
+    notification for each, skipping anyone who couldn't actually reach
+    a *private* room (an unowned or public/link room is reachable by
+    anyone anyway, so mentioning someone there is always notified).
+    Adding/removing a comment itself works in tokens-only mode too,
+    mirroring the pre-existing 2D comments feature -- only this
+    attribution/notification layer is accounts-gated."""
+    comment_ops = [op for op in accepted_wire if op.get("target") == "comment"]
+    if not comment_ops:
+        return
+    accounts_on = auth.accounts_enabled()
+    if not accounts_on:
+        return
+    store = auth.get_account_store()
+    actor_user = room.client_users.get(actor)
+    actor_user_id = actor_user["user_id"] if actor_user else None
+    ownership = store.get_room_ownership(room.kind, room.room_id)
+
+    for op_dict in comment_ops:
+        payload = op_dict.get("payload") or {}
+        deleted = bool(payload.get("d"))
+        value = payload.get("v") or {}
+        store.log_activity(
+            room.kind, room.room_id, actor_user_id,
+            "comment_removed" if deleted else "comment_added",
+            {"comment_id": payload.get("k"), "text": value.get("text"), "author": value.get("author")},
+        )
+        if deleted:
+            continue
+        text = value.get("text") or ""
+        for email in {m.lower() for m in _MENTION_RE.findall(text)}:
+            mentioned = store.get_user_by_email(email)
+            if mentioned is None or mentioned["user_id"] == actor_user_id:
+                continue
+            if ownership is not None and ownership["visibility"] == "private":
+                if _account_role_for_room(room.kind, room.room_id, mentioned) is None:
+                    continue  # a private room this mentioned user has no access to
+            store.create_notification(
+                mentioned["user_id"], "mention",
+                {
+                    "room_kind": room.kind, "room_id": room.room_id,
+                    "comment_id": payload.get("k"), "text": text,
+                    "from_user_id": actor_user_id,
+                    "from_display_name": (actor_user or {}).get("display_name") or actor,
+                },
+            )
+
+
 async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: security.TokenBucket) -> None:
     msg_type = message.get("type")
 
@@ -2299,24 +2433,39 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
     if msg_type != "ops":
         return
 
-    if room.client_roles.get(actor) in ("viewer", "commenter"):
+    role_for_actor = room.client_roles.get(actor)
+    if role_for_actor == "viewer":
         # Phase 17 read-only share links: a viewer-role connection still
         # receives every snapshot/delta/ops broadcast normally (so it can
         # render the live document), but anything *it* submits as an edit
         # is refused here, server-side -- the UI also hides editing tools
         # and shows a "view only" badge (see mesh3d.js/sketch.js), but
         # that's a courtesy, not the actual enforcement boundary.
-        # "commenter" (Part 6 P2) gets the identical geometry-ops
-        # refusal -- it's a real, distinct role (comments allowed,
-        # geometry not), but comments themselves are a Phase P5 feature
-        # not yet built, so today a commenter's practical experience is
-        # the same read-only one a viewer gets.
         ws = room.clients.get(actor)
         if ws is not None:
             await ws.send_json({"type": "rejected", "reason": "connected as a read-only viewer -- editing is disabled"})
         return
 
     ops_wire = message.get("ops", [])
+
+    if role_for_actor == "commenter":
+        # Part 6 P5: a commenter may add/remove comments but not touch
+        # geometry -- filtered per-op (unlike "viewer" above, which
+        # refuses the whole message) so a commenter's comment ops land
+        # normally while any geometry op they send is individually
+        # rejected, the same per-op shape already used below for a
+        # malformed or geometry-invalid op.
+        allowed_wire = []
+        for op_dict in ops_wire:
+            if op_dict.get("target") == "comment":
+                allowed_wire.append(op_dict)
+            else:
+                ws = room.clients.get(actor)
+                if ws is not None:
+                    await ws.send_json(
+                        {"type": "rejected", "reason": "commenter access -- only comments may be added", "op": op_dict}
+                    )
+        ops_wire = allowed_wire
 
     if len(ops_wire) > security.max_ops_per_message():
         ws = room.clients.get(actor)
@@ -2383,3 +2532,4 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
         room.mark_dirty()
         await room.persist_debounced()
         await _check_and_broadcast_mesh_validity(room, touched_topology)
+        await _handle_comment_ops(room, actor, accepted_wire)

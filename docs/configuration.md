@@ -73,6 +73,14 @@ generic OAuth -- is redirected to the org's own SSO flow instead. Needs
 the `accounts` extra (the same `authlib` dependency the Google/GitHub
 flow already needs); SAML is out of scope.
 
+Comments, @mentions, notifications, and the per-room activity feed
+(Part 6 Phase P5) need no env vars either. Comments work in tokens-only
+mode with no account (same as every other zero-config guarantee in
+this table); @mention resolution, the notifications bell, and the
+activity feed activate automatically under `CRDT_CAD_AUTH_MODE=accounts`
+and are read through `GET /api/notifications` and
+`GET /api/{rooms,mesh}/{room_id}/activity`.
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

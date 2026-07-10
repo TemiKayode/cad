@@ -258,26 +258,47 @@ def test_private_room_ws_connect_allowed_for_grantee(monkeypatch):
         assert snap["role"] == "editor"
 
 
-def test_commenter_role_ops_rejected_same_as_viewer(monkeypatch):
+def test_commenter_role_geometry_ops_rejected(monkeypatch):
+    """Part 6 P5: a commenter is a real, distinct role from viewer --
+    it may add/remove comments (the assertion below sends a real
+    comment op and confirms it's *not* rejected), but geometry ops are
+    still refused, individually, the same way a viewer's are."""
+    from crdt_cad.crdt.clock import LamportClock
+    from crdt_cad.crdt.mesh import MeshCRDT
+
     _enable_accounts(monkeypatch)
     owner_client = _client()
     _sign_in(owner_client, "alice@example.com")
-    with owner_client.websocket_connect("/ws/mesh/commroomws1") as ws:
-        _hello(ws)
-        ws.receive_json()
-
     bob = auth.get_account_store().create_or_get_user("bob@example.com")
-    auth.get_account_store().set_room_grant("mesh", "commroomws1", bob["user_id"], "commenter")
 
-    bob_client = _client()
-    _sign_in(bob_client, "bob@example.com")
-    with bob_client.websocket_connect("/ws/mesh/commroomws1") as ws:
-        _hello(ws)
-        snap = ws.receive_json()
-        assert snap["role"] == "commenter"
-        ws.send_json({"type": "ops", "ops": [], "from": "a"})
-        reply = ws.receive_json()
-        assert reply["type"] == "rejected"
+    with owner_client.websocket_connect("/ws/mesh/commroomws1") as alice_ws:
+        _hello(alice_ws, actor="alice")
+        alice_ws.receive_json()
+
+        auth.get_account_store().set_room_grant("mesh", "commroomws1", bob["user_id"], "commenter")
+
+        bob_client = _client()
+        _sign_in(bob_client, "bob@example.com")
+        with bob_client.websocket_connect("/ws/mesh/commroomws1") as bob_ws:
+            _hello(bob_ws, actor="bob")
+            snap = bob_ws.receive_json()
+            assert snap["role"] == "commenter"
+
+            mesh = MeshCRDT(LamportClock("bob"))
+            vertex_op = mesh.add_vertex("v1", (0.0, 0.0, 0.0))
+            bob_ws.send_json({"type": "ops", "ops": [vertex_op.to_dict()], "from": "bob"})
+            reply = bob_ws.receive_json()
+            assert reply["type"] == "rejected"
+            assert "commenter" in reply["reason"]
+
+            _comment_id, comment_op = mesh.add_comment("face_1", "looks great", "bob")
+            bob_ws.send_json({"type": "ops", "ops": [comment_op.to_dict()], "from": "bob"})
+            # A comment op is accepted and broadcast to the rest of the
+            # room (not echoed back to its own sender) -- alice seeing
+            # it is exactly what proves it wasn't rejected.
+            broadcast = alice_ws.receive_json()
+            assert broadcast["type"] == "ops"
+            assert broadcast["ops"][0]["target"] == "comment"
 
 
 def test_share_link_token_still_works_on_a_private_room(monkeypatch):

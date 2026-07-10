@@ -42,6 +42,7 @@ const state = {
   presence: new Map(),
   invalidFaces: new Set(),  // face ids currently flagged by a validity_warning (see syncScene)
   generations: new Map(),   // generationId -> {prompt, generator_name, spec, ...} (Phase G4)
+  comments: new Map(),      // commentId -> {face_id, text, author} (Part 6 P5)
 };
 
 const ui = {
@@ -119,6 +120,7 @@ function observeSnapshotCounters(doc) {
   for (const m of Object.values(doc.face_props || {})) scanEntries(m);
   scanEntries(doc.presence);
   scanEntries(doc.generations);
+  scanEntries(doc.comments);
   clock.observe(maxCounter);
 }
 
@@ -142,6 +144,8 @@ function loadSnapshot(doc) {
   if (doc.presence) for (const e of doc.presence.entries) if (!e.d) state.presence.set(e.k, e.v);
   state.generations.clear();
   if (doc.generations) for (const e of doc.generations.entries) if (!e.d) state.generations.set(e.k, e.v);
+  state.comments.clear();
+  if (doc.comments) for (const e of doc.comments.entries) if (!e.d) state.comments.set(e.k, e.v);
   syncScene();
 }
 
@@ -171,6 +175,8 @@ function applyOp(op) {
     }
   } else if (op.target === "generation") {
     if (!p.d) state.generations.set(p.k, p.v); else state.generations.delete(p.k);
+  } else if (op.target === "comment") {
+    if (!p.d) state.comments.set(p.k, p.v); else state.comments.delete(p.k);
   }
 }
 
@@ -215,6 +221,20 @@ function setGenerationOp(generationId, record) {
 }
 function removeGenerationOp(generationId) {
   return { target: "generation", payload: lwwOp(clock.tick(), generationId, null, true) };
+}
+
+// -- comments (Part 6 P5) -- mirrors sketch.js's addComment/removeComment,
+// anchored to a face id instead of a path id. ------------------------------
+function addComment(faceId, text) {
+  const id = "comment_" + rid();
+  const op = { target: "comment", payload: lwwOp(clock.tick(), id, { face_id: faceId, text, author: actorName }, false) };
+  applyOp(op);
+  sendOps([op]);
+}
+function removeComment(id) {
+  const op = { target: "comment", payload: lwwOp(clock.tick(), id, null, true) };
+  applyOp(op);
+  sendOps([op]);
 }
 
 // -- undo / redo: fresh inverted ops each time, not snapshots ---------------------
@@ -1963,10 +1983,57 @@ function escapeHtml(s) {
 function renderPanels() {
   renderToolHint();
   renderFacePanel();
+  renderCommentPanel();
   renderVertexList();
   renderFaceList();
   renderPresenceList();
   renderGenerationList();
+}
+
+// -- comments panel (Part 6 P5) -- mirrors sketch.js's renderSelectionPanel's
+// comment section, filtered by the selected face instead of the selected path.
+function renderCommentPanel() {
+  const panel = document.getElementById("commentList");
+  // Same in-progress-edit guard as renderFacePanel/renderVertexList.
+  if (panel.contains(document.activeElement)) return;
+  if (!ui.selectedFace || !state.faceIndex.has(ui.selectedFace)) {
+    panel.innerHTML = '<div class="empty-hint">No face selected.</div>';
+    return;
+  }
+  const faceId = ui.selectedFace;
+  const commentsForFace = [...state.comments.entries()].filter(([, c]) => c && c.face_id === faceId);
+  if (commentsForFace.length === 0) {
+    panel.innerHTML = '<div class="empty-hint">No comments yet.</div>';
+  } else {
+    panel.innerHTML = "";
+    for (const [cid, c] of commentsForFace) {
+      const row = document.createElement("div");
+      row.className = "comment-row";
+      row.innerHTML = `<div style="flex:1"><b>${escapeHtml(c.author)}</b>: ${escapeHtml(c.text)}</div><button class="ghost-btn" data-act="del" title="Delete" aria-label="Delete">${iconHtml("x")}</button>`;
+      row.querySelector('[data-act="del"]').onclick = () => {
+        removeComment(cid);
+        document.activeElement?.blur(); // same stale-panel trap as the Comment button above
+        renderCommentPanel();
+      };
+      panel.appendChild(row);
+    }
+  }
+  const addRow = document.createElement("div");
+  addRow.style.marginTop = "8px";
+  addRow.innerHTML = `<textarea id="commentText" rows="2" placeholder="Add a comment… (@email to mention someone)"></textarea><button id="commentAdd" style="width:100%;margin-top:4px">Comment</button>`;
+  panel.appendChild(addRow);
+  document.getElementById("commentAdd").onclick = () => {
+    const text = document.getElementById("commentText").value.trim();
+    if (!text) return;
+    addComment(faceId, text);
+    // Same stale-panel trap the Extrude button hit: the just-clicked
+    // button is itself inside this panel and still focused right after
+    // the click, so renderCommentPanel()'s own in-progress-edit guard
+    // (above) would otherwise no-op this call and leave "No comments
+    // yet." on screen despite the comment having been added.
+    document.activeElement?.blur();
+    renderCommentPanel();
+  };
 }
 
 function renderToolHint() {
@@ -2256,3 +2323,9 @@ animate();
 
 setTool("vertex");
 renderPanels();
+
+// Part 6 P5: the room activity feed -- a light poll (not tied to the
+// 400ms status heartbeat above) since it's a REST round trip, not an
+// already-open WebSocket message.
+renderActivityFeed("mesh", room, "activityList");
+setInterval(() => renderActivityFeed("mesh", room, "activityList"), 20000);

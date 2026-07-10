@@ -33,7 +33,7 @@ A real-time, browser-based collaborative CAD engine whose geometric data is repr
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 736 tests
+./.venv/Scripts/python -m pytest tests/ -v   # 751 tests
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -138,6 +138,8 @@ Pre-commit validation (watertight, manifold, winding-consistent, in-bounds) runs
 
 **Cross-component mesh validity**: after any merge that could create a cross-component inconsistency in a mesh (a face boundary referencing a vertex a concurrent edit deleted, non-manifold topology from a genuine edit race), the server re-checks the room's merged mesh and broadcasts a warning — never a rejection, since an already-merged CRDT operation can't be rolled back without breaking convergence. The client outlines the affected faces in red with a dismissible banner naming the problem; a human decides whether to fix or delete them.
 
+**Comments, mentions, and activity**: both demos support threaded, per-object comments (anchored to a path in 2D, a face in 3D) as ordinary CRDT ops — they merge, persist, and sync exactly like geometry, and work in zero-config tokens-only mode with no account needed. A `commenter` role can add comments but never touch geometry, enforced per-op server-side, not just hidden client-side. In accounts mode, `@email` mentions inside a comment resolve to real accounts and land as a notification (a bell in the workspace top bar, badge and all) — skipped for anyone who couldn't actually reach a private room, so a mention never leaks visibility into content someone shouldn't see. Each room also keeps a lightweight activity feed (comments, AI generations) visible in its own side panel.
+
 ## Security and production hardening
 
 Zero-config local development is completely unaffected by anything below — every mechanism here is opt-in via environment variable.
@@ -179,7 +181,7 @@ Both demos share a hand-written design token system (color for dark and light th
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-**736 non-browser tests**: unit tests for every CRDT type and geometry module, serialization round-trips, a full-mesh merge-convergence test for RGA, a Hypothesis property test fuzzing random concurrent insert/delete programs across three replicas, import/export round-trips for every supported format, the constraint solver's independent correctness checks, persistence save/load/restart-hydration, WebSocket protocol tests covering the relay, reconnect-with-delta, the validity gate, and the WebRTC signaling relay's targeted delivery, the full AI generation pipeline (heuristic and mocked-LLM interpretation, every generator's geometry invariants, the DSL's validation/repair/fallback loop, the 66-case eval harness), security hardening (every auth gate, every rate limit and resource ceiling actually tripping), account/permission/organization storage and REST/WS enforcement, SSO domain capture, disabled-account gating, per-user quotas, and the admin panel's own access control, and Postgres/Redis integration tests that skip cleanly when neither is reachable.
+**751 non-browser tests**: unit tests for every CRDT type and geometry module, serialization round-trips, a full-mesh merge-convergence test for RGA, a Hypothesis property test fuzzing random concurrent insert/delete programs across three replicas, import/export round-trips for every supported format, the constraint solver's independent correctness checks, persistence save/load/restart-hydration, WebSocket protocol tests covering the relay, reconnect-with-delta, the validity gate, and the WebRTC signaling relay's targeted delivery, the full AI generation pipeline (heuristic and mocked-LLM interpretation, every generator's geometry invariants, the DSL's validation/repair/fallback loop, the 66-case eval harness), security hardening (every auth gate, every rate limit and resource ceiling actually tripping), account/permission/organization storage and REST/WS enforcement, SSO domain capture, disabled-account gating, per-user quotas, the admin panel's own access control, 3D comments and @mention notification eligibility, and Postgres/Redis integration tests that skip cleanly when neither is reachable.
 
 **91 browser tests** (Playwright, opt-in via `pytest -m e2e`, excluded from the default run so a fresh checkout without Chromium still passes): two tabs drawing concurrently and converging; the full offline → edit both sides → reconnect → Time-Travel Merge → converge sequence; a real `RTCPeerConnection` negotiating between two headless Chrome tabs; the offline outbox surviving a hard refresh; the full account sign-in, sharing, and organization flow end to end with multiple real browser contexts; and a dedicated regression test per non-trivial bug found during development. Each spins up a real `uvicorn` subprocess against its own temp SQLite file, exercising the actual client JS against the actual relay, not an in-process test double.
 

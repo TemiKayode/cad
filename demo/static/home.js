@@ -791,15 +791,18 @@ function renderAccountArea(acct) {
   const area = document.getElementById("accountArea");
   const orgsBtn = document.getElementById("orgsBtn");
   const adminLink = document.getElementById("adminLink");
+  const notificationsBtn = document.getElementById("notificationsBtn");
   area.innerHTML = "";
   if (acct.mode !== "accounts") {
     orgsBtn.style.display = "none";
     adminLink.style.display = "none";
+    notificationsBtn.style.display = "none";
     return;
   }
   adminLink.style.display = acct.signed_in && acct.is_platform_admin ? "" : "none";
   if (!acct.signed_in) {
     orgsBtn.style.display = "none";
+    notificationsBtn.style.display = "none";
     const btn = document.createElement("button");
     btn.id = "signInBtn";
     btn.textContent = "Sign in";
@@ -808,6 +811,8 @@ function renderAccountArea(acct) {
     return;
   }
   orgsBtn.style.display = ""; // Part 6 P3: organizations need a real account, same gate as everything else here
+  notificationsBtn.style.display = ""; // Part 6 P5: @mentions land here, real account only
+  refreshNotificationsBadge();
   const chip = document.createElement("button");
   chip.id = "accountChip";
   chip.className = "status-pill";
@@ -823,5 +828,68 @@ fetchAccount().then((acct) => {
   renderAccountArea(acct);
   syncActorNameFromAccount();
 });
+
+// -- notifications (Part 6 P5) ---------------------------------------------------
+// A workspace-wide bell, not room-scoped like comments/activity -- an
+// @mention can happen in any room this account can reach, so this polls
+// independently of whichever room (if any) is currently open elsewhere.
+
+async function refreshNotificationsBadge() {
+  const resp = await fetch("/api/notifications?unread_only=true");
+  if (!resp.ok) return;
+  const body = await resp.json();
+  const btn = document.getElementById("notificationsBtn");
+  btn.textContent = body.unread_count > 0 ? `Notifications (${body.unread_count})` : "Notifications";
+}
+setInterval(refreshNotificationsBadge, 30000);
+
+function renderNotificationRow(n) {
+  const row = document.createElement("div");
+  row.className = "comment-row";
+  if (!n.read) row.style.background = "var(--accent-muted)";
+  const roomId = n.payload.room_id;
+  const roomKind = n.payload.room_kind;
+  const label =
+    n.kind === "mention"
+      ? `<b>${escapeHtml(n.payload.from_display_name || "Someone")}</b> mentioned you: "${escapeHtml(n.payload.text || "")}"`
+      : escapeHtml(n.kind);
+  row.innerHTML = `<div style="flex:1;cursor:pointer">${label}<div class="room-card-meta">${relativeTime(n.created_at)}</div></div>`;
+  row.querySelector("div").onclick = async () => {
+    if (!n.read) await fetch(`/api/notifications/${n.notification_id}/read`, { method: "POST" });
+    if (roomId && roomKind) location.href = roomHomeUrl(roomKind, roomId);
+  };
+  return row;
+}
+
+async function openNotificationsModal() {
+  const modal = document.getElementById("notificationsModal");
+  const body = document.getElementById("notificationsListBody");
+  modal.style.display = "flex";
+  const resp = await fetch("/api/notifications");
+  if (!resp.ok) return;
+  const data = await resp.json();
+  body.innerHTML = "";
+  if (data.notifications.length === 0) {
+    body.innerHTML = '<div class="empty-hint">No notifications yet.</div>';
+    return;
+  }
+  for (const n of data.notifications) body.appendChild(renderNotificationRow(n));
+}
+
+function closeNotificationsModal() {
+  document.getElementById("notificationsModal").style.display = "none";
+  refreshNotificationsBadge();
+}
+
+document.getElementById("notificationsBtn").onclick = openNotificationsModal;
+document.getElementById("notificationsModalClose").onclick = closeNotificationsModal;
+document.getElementById("notificationsModal").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeNotificationsModal();
+});
+document.getElementById("notificationsMarkAllBtn").onclick = async () => {
+  await fetch("/api/notifications/read-all", { method: "POST" });
+  await openNotificationsModal();
+  await refreshNotificationsBadge();
+};
 
 loadRooms();
