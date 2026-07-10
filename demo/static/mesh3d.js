@@ -1050,11 +1050,46 @@ function cancelFace() {
   syncScene();
 }
 
+// Faces created purely as an extrude's own top cap, never since touched
+// (Extrude tracks this so a *second* extrude starting from one can tell
+// "was this just scaffolding for the wall I'm building taller" apart
+// from "a face the user has actually made something of" -- see the
+// merge-away logic at the top of extrudeFace).
+const extrudeCapFaces = new Set();
+
 function extrudeFace(faceId, height) {
-  const loop = liveValues(state.faceNodes.get(faceId));
+  let loop = liveValues(state.faceNodes.get(faceId));
   if (loop.length < 3) return;
   const ops = [];
   const subEntries = [];
+
+  // Extruding straight up from a bare cap this same tool just created
+  // (no color/material of its own -- nobody has treated it as a real
+  // floor yet) merges it away instead of keeping it as a second cap.
+  // Two Extrude clicks in a row is how a user makes one wall taller,
+  // not a request for two solids sharing an internal floor -- and an
+  // internal shared floor is genuinely, unavoidably an edge shared by
+  // 3+ faces (itself plus a wall on each side), which is exactly the
+  // non-manifold warning a repeat click was tripping. A face the user
+  // has since colored or materialed is a real floor and is left alone;
+  // its extrude keeps the (accurately reported) shared-edge warning,
+  // same as extruding any other pre-existing face would.
+  const capProps = state.faceProps.get(faceId);
+  if (extrudeCapFaces.has(faceId) && !capProps?.color && !capProps?.material) {
+    const removeOp = removeFaceOp(faceId);
+    applyOp(removeOp); ops.push(removeOp);
+    subEntries.push({ kind: "face_remove", faceId });
+    extrudeCapFaces.delete(faceId);
+    // A cap's own boundary is stored in the reverse of its parent
+    // extrude's top-ring order (see the winding comment below) --
+    // that's what made IT consistent with the sides just below it.
+    // Continuing the same wall from here needs that original order
+    // back, or the new side faces below would end up wound consistent
+    // with a cap that no longer exists instead of with their real
+    // neighbor: the existing sides one story down.
+    loop = [...loop].reverse();
+  }
+
   const newLoop = [];
   for (const vid of loop) {
     const p = state.vertices.get(vid);
@@ -1076,16 +1111,31 @@ function extrudeFace(faceId, height) {
   };
   for (let i = 0; i < loop.length; i++) {
     const j = (i + 1) % loop.length;
-    const sideLoop = [loop[i], loop[j], newLoop[j], newLoop[i]];
+    // [loop[j], loop[i], newLoop[i], newLoop[j]], not [loop[i], loop[j],
+    // newLoop[j], newLoop[i]]: the latter traverses the shared bottom
+    // edge in the SAME direction the base face itself does, which the
+    // manifold-winding rule (adjacent faces must traverse a shared edge
+    // in OPPOSITE directions) makes a real, always-reproducible
+    // inconsistency -- not a concurrent-edit corner case, but every
+    // single extrude of any face, verified against crdt_cad.geometry.
+    // mesh_validity directly. The base face's edge stays untouched
+    // (extrude never rewrites pre-existing geometry), so it's this new
+    // side face's own vertex order that has to run opposite to it.
+    const sideLoop = [loop[j], loop[i], newLoop[i], newLoop[j]];
     const sideId = "face_" + rid();
     for (const op of addFaceOps(sideId, sideLoop)) { applyOp(op); ops.push(op); }
     subEntries.push({ kind: "face_add", faceId: sideId });
     buildRing(sideLoop);
   }
   const topId = "face_" + rid();
-  for (const op of addFaceOps(topId, newLoop)) { applyOp(op); ops.push(op); }
+  // Reversed for the same reason as the side loop above: reusing the
+  // base's own index order for the top cap (just translated in height)
+  // gives the top face the same winding sense as the base instead of
+  // the opposite one two opposing faces of a solid need.
+  for (const op of addFaceOps(topId, [...newLoop].reverse())) { applyOp(op); ops.push(op); }
   subEntries.push({ kind: "face_add", faceId: topId });
   buildRing(newLoop);
+  extrudeCapFaces.add(topId);
 
   sendOps(ops);
   // One bundled undo entry -- a single Ctrl+Z/Undo click removes every
@@ -1093,6 +1143,21 @@ function extrudeFace(faceId, height) {
   // of what a collaborator may have concurrently changed elsewhere (see
   // MeshCRDT.extrude_face's docstring and its concurrent-safety test).
   pushUndo({ kind: "composite", entries: subEntries });
+  // Move selection to the new top face so a second "Extrude" click
+  // naturally continues building upward. Left pointed at the original
+  // base face, a repeat click would re-extrude the same base loop,
+  // stacking a duplicate ring of side faces on the same bottom edges --
+  // genuinely non-manifold geometry, not a false positive, but an easy
+  // trap for exactly the "keep building the wall taller" motion this
+  // button invites. renderFacePanel() skips its own rebuild while a
+  // panel element still has focus (protecting an in-progress color/
+  // material edit from a re-render mid-keystroke) -- but the just-
+  // clicked Extrude button is itself inside that panel and still
+  // focused right now, so without the blur() below the panel (and its
+  // Extrude button's closure over the OLD faceId) would never refresh,
+  // and a second click would silently re-extrude the base face anyway.
+  document.activeElement?.blur();
+  ui.selectedFace = topId;
   syncScene();
 }
 
