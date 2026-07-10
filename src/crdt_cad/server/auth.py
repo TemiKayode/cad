@@ -149,11 +149,17 @@ def _hash_token(token: str) -> str:
 
 
 def create_session(user_id: str) -> str:
-    """Mints a session, stores its hash, returns the raw cookie value."""
+    """Mints a session, stores its hash, returns the raw cookie value.
+    The only two call sites (magic-link verify, OAuth callback) are both
+    a genuine "this account just signed in" moment, so this is also
+    where Part 6 P3's pending org invites are accepted -- an invite sent
+    to an address with no account yet is stored "pending" until the
+    person it names actually shows up and proves it by signing in."""
     token = secrets.token_urlsafe(32)
     get_account_store().create_session(
         _hash_token(token), user_id, expires_at=time.time() + session_max_age_seconds()
     )
+    get_account_store().activate_pending_memberships(user_id)
     return token
 
 

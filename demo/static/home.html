@@ -32,6 +32,9 @@
     <div class="spacer"></div>
     <button id="newDrawingBtn"><svg class="icon"><use href="#icon-pen"></use></svg>New 2D drawing</button>
     <button id="newMeshBtn"><svg class="icon"><use href="#icon-box"></use></svg>New 3D mesh</button>
+    <!-- Part 6 P3: shown only once signed in (accounts mode) -- toggled
+         alongside accountArea in home.js's renderAccountArea(). -->
+    <button id="orgsBtn" style="display:none">Organizations</button>
     <!-- Part 6 P1: populated by home.js from /api/auth/me -- stays empty
          (and invisible) on tokens-mode deployments. -->
     <span id="accountArea" style="display:contents"></span>
@@ -90,6 +93,64 @@
             <option value="editor">Editor</option>
           </select>
           <button id="shareGrantBtn">Add</button>
+        </div>
+        <!-- Part 6 P3: hidden unless the signed-in user is an admin of
+             at least one organization -- populated in openShareModal(). -->
+        <div id="shareOrgTransferSection" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+          <div style="font-size:13px;color:var(--text-secondary);margin-bottom:6px">Transfer to organization</div>
+          <div class="tool-row">
+            <select id="shareOrgSelect" style="flex:1"></select>
+            <button id="shareOrgTransferBtn">Transfer</button>
+          </div>
+          <p class="empty-hint" style="margin-top:6px">Every active member of that organization gets access -- an admin manages it like an owner, a plain member like an editor.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="orgsModal" class="modal-overlay" style="display:none">
+    <div class="modal">
+      <div class="modal-header">
+        <span id="orgsModalTitle">Organizations</span>
+        <button id="orgsModalClose" class="ghost-btn" title="Close" aria-label="Close"><svg class="icon"><use href="#icon-x"></use></svg></button>
+      </div>
+      <div class="modal-body">
+        <!-- List view -->
+        <div id="orgsListView">
+          <div id="orgsList" style="margin-bottom:12px"></div>
+          <div class="tool-row">
+            <input id="newOrgName" type="text" placeholder="New organization name" style="flex:1" />
+            <button id="newOrgBtn">Create</button>
+          </div>
+        </div>
+        <!-- Detail view (one org) -->
+        <div id="orgDetailView" style="display:none">
+          <button id="orgDetailBackBtn" class="ghost-btn" style="margin-bottom:10px">&larr; All organizations</button>
+          <div id="orgDetailAdminControls" style="display:none">
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:6px">Defaults for new documents</div>
+            <div class="tool-row" style="margin-bottom:14px">
+              <select id="orgDefaultVisibility">
+                <option value="private">Private</option>
+                <option value="link">Link</option>
+                <option value="public">Public</option>
+              </select>
+              <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input id="orgAllowViewerLinks" type="checkbox" />Allow viewer links</label>
+              <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input id="orgAllowEditorLinks" type="checkbox" />Allow editor links</label>
+            </div>
+          </div>
+          <div style="font-size:13px;color:var(--text-secondary);margin-bottom:6px">Members</div>
+          <div id="orgMembersList" style="margin-bottom:10px"></div>
+          <div id="orgInviteRow" class="tool-row" style="display:none">
+            <input id="orgInviteEmail" type="email" placeholder="email@example.com" style="flex:1" />
+            <select id="orgInviteRole">
+              <option value="member">Member</option>
+              <option value="admin">Admin</option>
+            </select>
+            <button id="orgInviteBtn">Invite</button>
+          </div>
+          <div class="tool-row" style="margin-top:14px;justify-content:flex-end">
+            <button id="orgLeaveBtn" class="danger-btn">Leave organization</button>
+          </div>
         </div>
       </div>
     </div>

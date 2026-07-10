@@ -39,7 +39,7 @@ async function fetchRooms() {
 function renderRoomCard(room) {
   const {
     kind, room_id: roomId, display_name: displayName, updated_at: updatedAt,
-    visibility, owner_display_name: ownerDisplayName, your_role: yourRole,
+    visibility, owner_display_name: ownerDisplayName, your_role: yourRole, org_name: orgName,
   } = room;
   const kindLabel = kind === "mesh" ? "3D" : "2D";
   const name = displayName || roomId;
@@ -68,15 +68,22 @@ function renderRoomCard(room) {
   // today's badge-free card.
   const visBadge = visibility
     ? `<span class="room-visibility-badge ${visibility}">${visibility}</span>` : "";
-  const sharedByMeta = yourRole && yourRole !== "owner" && ownerDisplayName
-    ? `<span class="room-card-meta">shared by ${escapeHtml(ownerDisplayName)} -- your role: ${yourRole}</span>` : "";
+  // Part 6 P3: an org-owned room shows its org, not the original
+  // creator -- access here comes from team membership, not a personal
+  // grant, and that's the more useful thing to tell every other member.
+  let contextMeta = "";
+  if (orgName) {
+    contextMeta = `<span class="room-card-meta">org: ${escapeHtml(orgName)} -- your role: ${escapeHtml(yourRole)}</span>`;
+  } else if (yourRole && yourRole !== "owner" && ownerDisplayName) {
+    contextMeta = `<span class="room-card-meta">shared by ${escapeHtml(ownerDisplayName)} -- your role: ${yourRole}</span>`;
+  }
   body.innerHTML = `
     <span class="room-kind-badge ${kind}">${kindLabel}</span>
     ${visBadge}
     <span class="room-card-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
     <span class="room-card-meta">room: ${escapeHtml(roomId)}</span>
     <span class="room-card-meta">updated ${relativeTime(updatedAt)}</span>
-    ${sharedByMeta}
+    ${contextMeta}
   `;
   card.appendChild(body);
 
@@ -273,6 +280,7 @@ document.addEventListener("keydown", (e) => {
   if (document.getElementById("historyModal").style.display === "flex") closeHistoryModal();
   else if (document.getElementById("renameModal").style.display === "flex") closeRenameModal();
   else if (document.getElementById("shareModal").style.display === "flex") closeShareModal();
+  else if (document.getElementById("orgsModal").style.display === "flex") closeOrgsModal();
 });
 
 // -- sharing (Part 6 P2) -----------------------------------------------------
@@ -295,7 +303,50 @@ async function openShareModal(kind, roomId, name) {
   document.getElementById("shareModal").style.display = "flex";
   _releaseModalFocus = trapFocusIn(document.querySelector("#shareModal .modal"));
   await loadSharing();
+  await loadShareOrgTransferOptions();
 }
+
+// Part 6 P3: lets the room's current manager (owner, or an org admin --
+// require_owner_access allows both) hand it off to any organization
+// they themselves admin. Hidden entirely if they don't admin any org --
+// nothing to transfer *to*.
+async function loadShareOrgTransferOptions() {
+  const section = document.getElementById("shareOrgTransferSection");
+  const select = document.getElementById("shareOrgSelect");
+  section.style.display = "none";
+  select.innerHTML = "";
+  const resp = await fetch("/api/orgs");
+  if (!resp.ok) return;
+  const orgs = (await resp.json()).filter((o) => o.role === "admin");
+  if (!orgs.length) return;
+  for (const org of orgs) {
+    const opt = document.createElement("option");
+    opt.value = org.org_id;
+    opt.textContent = org.name;
+    select.appendChild(opt);
+  }
+  section.style.display = "";
+}
+
+document.getElementById("shareOrgTransferBtn").onclick = async () => {
+  if (!shareTarget) return;
+  const orgId = document.getElementById("shareOrgSelect").value;
+  if (!orgId) return;
+  const { kind, roomId } = shareTarget;
+  const resp = await fetch(`${sharingBasePath(kind, roomId)}/transfer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ org_id: orgId }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not transfer: ${detail}`, "error");
+    return;
+  }
+  showToast("Transferred to organization", "success");
+  await loadSharing();
+  await loadRooms();
+};
 
 function closeShareModal() {
   document.getElementById("shareModal").style.display = "none";
@@ -402,6 +453,221 @@ document.getElementById("shareModal").addEventListener("click", (e) => {
   if (e.target === e.currentTarget) closeShareModal();
 });
 
+// -- organizations & teams (Part 6 P3) ---------------------------------------
+// A team, not just a shared document: an org's members see every
+// private, org-owned document automatically (per _account_role_for_room
+// server-side) -- no per-document, per-person grant needed once someone
+// is on the team. This modal has two views sharing one dialog: a list
+// of the signed-in user's orgs, and (clicking one) that org's own
+// members/defaults/invite panel.
+
+let currentOrgId = null;
+
+function openOrgsModal() {
+  document.getElementById("orgsModal").style.display = "flex";
+  _releaseModalFocus = trapFocusIn(document.querySelector("#orgsModal .modal"));
+  showOrgsListView();
+}
+
+function closeOrgsModal() {
+  document.getElementById("orgsModal").style.display = "none";
+  currentOrgId = null;
+  if (_releaseModalFocus) { _releaseModalFocus(); _releaseModalFocus = null; }
+}
+
+function showOrgsListView() {
+  currentOrgId = null;
+  document.getElementById("orgsListView").style.display = "";
+  document.getElementById("orgDetailView").style.display = "none";
+  document.getElementById("orgsModalTitle").textContent = "Organizations";
+  loadOrgsList();
+}
+
+async function loadOrgsList() {
+  const list = document.getElementById("orgsList");
+  const resp = await fetch("/api/orgs");
+  const orgs = resp.ok ? await resp.json() : [];
+  list.innerHTML = "";
+  if (!orgs.length) {
+    list.innerHTML = '<div class="empty-hint">Not a member of any organization yet.</div>';
+    return;
+  }
+  for (const org of orgs) {
+    const row = document.createElement("div");
+    row.className = "share-grant-row";
+    row.style.cursor = "pointer";
+    row.innerHTML = `
+      <span class="grant-email">${escapeHtml(org.name)}</span>
+      <span class="room-card-meta">${escapeHtml(org.role)}</span>
+    `;
+    row.onclick = () => showOrgDetailView(org.org_id);
+    list.appendChild(row);
+  }
+}
+
+document.getElementById("newOrgBtn").onclick = async () => {
+  const name = document.getElementById("newOrgName").value.trim();
+  if (!name) return;
+  const resp = await fetch("/api/orgs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not create organization: ${detail}`, "error");
+    return;
+  }
+  document.getElementById("newOrgName").value = "";
+  await loadOrgsList();
+};
+
+async function showOrgDetailView(orgId) {
+  currentOrgId = orgId;
+  document.getElementById("orgsListView").style.display = "none";
+  document.getElementById("orgDetailView").style.display = "";
+  await loadOrgDetail();
+}
+
+document.getElementById("orgDetailBackBtn").onclick = showOrgsListView;
+
+async function loadOrgDetail() {
+  if (!currentOrgId) return;
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}`);
+  if (!resp.ok) {
+    showToast("Could not load organization", "error");
+    showOrgsListView();
+    return;
+  }
+  const org = await resp.json();
+  document.getElementById("orgsModalTitle").textContent = org.name;
+
+  const me = await fetchAccount();
+  const myMembership = org.members.find((m) => m.user_id === me.user?.user_id);
+  const isAdmin = myMembership?.role === "admin";
+
+  document.getElementById("orgDetailAdminControls").style.display = isAdmin ? "" : "none";
+  document.getElementById("orgInviteRow").style.display = isAdmin ? "" : "none";
+  if (isAdmin) {
+    document.getElementById("orgDefaultVisibility").value = org.default_visibility;
+    document.getElementById("orgAllowViewerLinks").checked = org.allowed_share_link_roles.includes("viewer");
+    document.getElementById("orgAllowEditorLinks").checked = org.allowed_share_link_roles.includes("editor");
+  }
+  renderOrgMembers(org.members, isAdmin);
+}
+
+function renderOrgMembers(members, isAdmin) {
+  const list = document.getElementById("orgMembersList");
+  list.innerHTML = "";
+  for (const m of members) {
+    const row = document.createElement("div");
+    row.className = "share-grant-row";
+    const statusSuffix = m.status === "pending" ? " (invited, not yet joined)" : "";
+    row.innerHTML = `
+      <span class="grant-email" title="${escapeHtml(m.email)}">${escapeHtml(m.display_name || m.email)}${statusSuffix}</span>
+    `;
+    if (isAdmin) {
+      const roleSelect = document.createElement("select");
+      roleSelect.innerHTML = '<option value="member">Member</option><option value="admin">Admin</option>';
+      roleSelect.value = m.role;
+      roleSelect.onchange = () => setOrgMemberRole(m.user_id, roleSelect.value);
+      row.appendChild(roleSelect);
+      const removeBtn = document.createElement("button");
+      removeBtn.className = "ghost-btn";
+      removeBtn.title = "Remove from organization";
+      removeBtn.setAttribute("aria-label", "Remove from organization");
+      removeBtn.innerHTML = iconHtml("x");
+      removeBtn.onclick = () => removeOrgMember(m.user_id);
+      row.appendChild(removeBtn);
+    } else {
+      const roleLabel = document.createElement("span");
+      roleLabel.className = "room-card-meta";
+      roleLabel.textContent = m.role;
+      row.appendChild(roleLabel);
+    }
+    list.appendChild(row);
+  }
+}
+
+async function setOrgMemberRole(userId, role) {
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/members/${encodeURIComponent(userId)}/role`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not change role: ${detail}`, "error");
+  }
+  await loadOrgDetail();
+}
+
+async function removeOrgMember(userId) {
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not remove member: ${detail}`, "error");
+  }
+  await loadOrgDetail();
+}
+
+document.getElementById("orgInviteBtn").onclick = async () => {
+  const email = document.getElementById("orgInviteEmail").value.trim();
+  if (!email) return;
+  const role = document.getElementById("orgInviteRole").value;
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/invite`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, role }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not invite: ${detail}`, "error");
+    return;
+  }
+  document.getElementById("orgInviteEmail").value = "";
+  await loadOrgDetail();
+};
+
+async function saveOrgDefaults() {
+  if (!currentOrgId) return;
+  const roles = [];
+  if (document.getElementById("orgAllowViewerLinks").checked) roles.push("viewer");
+  if (document.getElementById("orgAllowEditorLinks").checked) roles.push("editor");
+  await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/defaults`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      default_visibility: document.getElementById("orgDefaultVisibility").value,
+      allowed_share_link_roles: roles,
+    }),
+  });
+}
+document.getElementById("orgDefaultVisibility").addEventListener("change", saveOrgDefaults);
+document.getElementById("orgAllowViewerLinks").addEventListener("change", saveOrgDefaults);
+document.getElementById("orgAllowEditorLinks").addEventListener("change", saveOrgDefaults);
+
+document.getElementById("orgLeaveBtn").onclick = async () => {
+  if (!currentOrgId) return;
+  if (!window.confirm("Leave this organization?")) return;
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/leave`, { method: "POST" });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not leave: ${detail}`, "error");
+    return;
+  }
+  showOrgsListView();
+  await loadRooms();
+};
+
+document.getElementById("orgsBtn").onclick = openOrgsModal;
+document.getElementById("orgsModalClose").onclick = closeOrgsModal;
+document.getElementById("orgsModal").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeOrgsModal();
+});
+
 // -- new room ------------------------------------------------------------------
 
 function createRoom(kind) {
@@ -483,9 +749,14 @@ async function signOut(everywhere) {
 
 function renderAccountArea(acct) {
   const area = document.getElementById("accountArea");
+  const orgsBtn = document.getElementById("orgsBtn");
   area.innerHTML = "";
-  if (acct.mode !== "accounts") return;
+  if (acct.mode !== "accounts") {
+    orgsBtn.style.display = "none";
+    return;
+  }
   if (!acct.signed_in) {
+    orgsBtn.style.display = "none";
     const btn = document.createElement("button");
     btn.id = "signInBtn";
     btn.textContent = "Sign in";
@@ -493,6 +764,7 @@ function renderAccountArea(acct) {
     area.appendChild(btn);
     return;
   }
+  orgsBtn.style.display = ""; // Part 6 P3: organizations need a real account, same gate as everything else here
   const chip = document.createElement("button");
   chip.id = "accountChip";
   chip.className = "status-pill";

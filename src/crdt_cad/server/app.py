@@ -743,14 +743,22 @@ def _better_role(a: Optional[str], b: Optional[str]) -> Optional[str]:
 
 
 def _account_role_for_room(kind: str, room_id: str, user: Optional[dict]) -> Optional[str]:
-    """The role Part 6 P2 ownership/grants grants for this room, purely
-    from account identity -- independent of any room token. None when
-    accounts mode is off, or the room has no owner yet (every room
-    predating this phase, or one no signed-in user has ever opened --
-    see ``Room.was_freshly_created``), since there's no account-based
-    permission to check in either case. A room *with* an owner and
-    visibility ``"public"`` is open to everyone, signed in or not, the
-    same way an unowned room always has been."""
+    """The role Part 6 P2/P3 ownership/grants/org-membership grants for
+    this room, purely from account identity -- independent of any room
+    token. None when accounts mode is off, or the room has no owner yet
+    (every room predating this phase, or one no signed-in user has ever
+    opened -- see ``Room.was_freshly_created``), since there's no
+    account-based permission to check in either case. A room *with* an
+    owner and visibility ``"public"`` is open to everyone, signed in or
+    not, the same way an unowned room always has been.
+
+    Precedence, most specific first: the personal owner; an explicit
+    per-room grant (Part 6 P2 -- always wins even on an org-owned room,
+    since it's the more specific instruction); active org membership on
+    an org-owned room (Part 6 P3 -- an org admin manages it like an
+    owner, an ordinary member gets editor, this is what makes "only
+    members of the same team can see this" real); finally the room's
+    own visibility default."""
     if not auth.accounts_enabled():
         return None
     ownership = auth.get_account_store().get_room_ownership(kind, room_id)
@@ -762,6 +770,11 @@ def _account_role_for_room(kind: str, room_id: str, user: Optional[dict]) -> Opt
         grant = auth.get_account_store().get_room_grant(kind, room_id, user["user_id"])
         if grant is not None:
             return grant
+        org_id = ownership.get("owner_org_id")
+        if org_id is not None:
+            membership = auth.get_account_store().get_org_membership(org_id, user["user_id"])
+            if membership is not None and membership["status"] == "active":
+                return "owner" if membership["role"] == "admin" else "editor"
     return "editor" if ownership["visibility"] == "public" else None
 
 
@@ -821,7 +834,11 @@ def require_owner_access(kind: str):
     """Part 6 P2: only a room's owner may change its visibility or manage
     per-user grants -- editor access isn't enough. 404s (not 403) when
     accounts mode is off or the room has no owner at all, since there is
-    nothing to manage in either case, not merely something forbidden."""
+    nothing to manage in either case, not merely something forbidden.
+    Part 6 P3: once a room is org-owned, any active *admin* of that org
+    manages it exactly like the owner would -- the whole point of
+    transferring a document to an org is that its sharing no longer
+    depends on one specific person still being around."""
 
     async def _dep(room_id: str, request: Request) -> None:
         if not auth.accounts_enabled():
@@ -830,8 +847,17 @@ def require_owner_access(kind: str):
         if ownership is None:
             raise HTTPException(status_code=404, detail="this room has no owner to manage")
         user = auth.current_user(request)
-        if user is None or user["user_id"] != ownership["owner_user_id"]:
-            raise HTTPException(status_code=403, detail="only this room's owner can manage sharing")
+        if user is not None:
+            if user["user_id"] == ownership["owner_user_id"]:
+                return
+            org_id = ownership.get("owner_org_id")
+            if org_id is not None:
+                membership = auth.get_account_store().get_org_membership(org_id, user["user_id"])
+                if membership is not None and membership["status"] == "active" and membership["role"] == "admin":
+                    return
+        raise HTTPException(
+            status_code=403, detail="only this room's owner (or an admin of its organization) can manage sharing"
+        )
 
     return _dep
 
@@ -852,6 +878,7 @@ class RoomSummary(BaseModel):
     visibility: Optional[str] = None  # "private" | "link" | "public"
     owner_display_name: Optional[str] = None
     your_role: Optional[str] = None
+    org_name: Optional[str] = None  # Part 6 P3, set only once a room's been transferred to an org
 
 
 @app.get("/api/workspace/rooms", response_model=list[RoomSummary])
@@ -882,8 +909,13 @@ async def list_workspace_rooms(request: Request) -> list[RoomSummary]:
                         continue
                     summary.visibility = ownership["visibility"]
                     summary.your_role = role
-                    owner = auth.get_account_store().get_user(ownership["owner_user_id"])
-                    summary.owner_display_name = owner["display_name"] if owner else None
+                    org_id = ownership.get("owner_org_id")
+                    if org_id is not None:
+                        org = auth.get_account_store().get_org(org_id)
+                        summary.org_name = org["name"] if org else None
+                    else:
+                        owner = auth.get_account_store().get_user(ownership["owner_user_id"])
+                        summary.owner_display_name = owner["display_name"] if owner else None
             rows.append(summary)
     rows.sort(key=lambda r: r.updated_at, reverse=True)
     return rows
@@ -975,6 +1007,190 @@ async def grant_mesh_room(room_id: str, req: GrantRequest) -> dict:
 @app.delete("/api/mesh/{room_id}/grant/{user_id}", dependencies=[Depends(require_owner_access("mesh"))])
 async def revoke_mesh_grant(room_id: str, user_id: str) -> dict:
     return await _revoke_grant("mesh", room_id, user_id)
+
+
+# ---------------------------------------------------------------------------
+# Organizations and teams (Part 6, Phase P3)
+# ---------------------------------------------------------------------------
+
+
+def require_org_membership():
+    """Any active member (admin or plain member) may view an org's own
+    detail page -- read access only, matching require_room_access's
+    "any role gets in" shape."""
+
+    async def _dep(org_id: str, request: Request) -> None:
+        if not auth.accounts_enabled():
+            raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+        user = auth.current_user(request)
+        membership = auth.get_account_store().get_org_membership(org_id, user["user_id"]) if user else None
+        if membership is None or membership["status"] != "active":
+            raise HTTPException(status_code=403, detail="not a member of this organization")
+
+    return _dep
+
+
+def require_org_admin():
+    """Membership management, invites, and per-org defaults are
+    admin-only -- an ordinary member can see the roster but not change
+    it, matching the brief's admin/member split."""
+
+    async def _dep(org_id: str, request: Request) -> None:
+        if not auth.accounts_enabled():
+            raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+        user = auth.current_user(request)
+        membership = auth.get_account_store().get_org_membership(org_id, user["user_id"]) if user else None
+        if membership is None or membership["status"] != "active" or membership["role"] != "admin":
+            raise HTTPException(status_code=403, detail="organization admin access required")
+
+    return _dep
+
+
+class CreateOrgRequest(BaseModel):
+    name: str
+
+
+class OrgSummary(BaseModel):
+    org_id: str
+    name: str
+    role: str
+
+
+@app.post("/api/orgs")
+async def create_org(req: CreateOrgRequest, request: Request) -> dict:
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    return auth.get_account_store().create_org(name, user["user_id"])
+
+
+@app.get("/api/orgs", response_model=list[OrgSummary])
+async def list_my_orgs(request: Request) -> list[OrgSummary]:
+    if not auth.accounts_enabled():
+        return []
+    user = auth.current_user(request)
+    if user is None:
+        return []
+    return [OrgSummary(**o) for o in auth.get_account_store().list_orgs_for_user(user["user_id"])]
+
+
+@app.get("/api/orgs/{org_id}", dependencies=[Depends(require_org_membership())])
+async def get_org_detail(org_id: str) -> dict:
+    org = auth.get_account_store().get_org(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    return {**org, "members": auth.get_account_store().list_org_members(org_id)}
+
+
+class InviteOrgMemberRequest(BaseModel):
+    email: str
+    role: str = "member"  # "admin" | "member"
+
+
+@app.post("/api/orgs/{org_id}/invite", dependencies=[Depends(require_org_admin())])
+async def invite_org_member(org_id: str, req: InviteOrgMemberRequest) -> dict:
+    if req.role not in ("admin", "member"):
+        raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
+    user, status = auth.get_account_store().invite_org_member(org_id, req.email, req.role)
+    return {"user_id": user["user_id"], "email": user["email"], "role": req.role, "status": status}
+
+
+class SetOrgMemberRoleRequest(BaseModel):
+    role: str  # "admin" | "member"
+
+
+@app.post("/api/orgs/{org_id}/members/{user_id}/role", dependencies=[Depends(require_org_admin())])
+async def set_org_member_role(org_id: str, user_id: str, req: SetOrgMemberRoleRequest) -> dict:
+    if req.role not in ("admin", "member"):
+        raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
+    if req.role == "member":
+        membership = auth.get_account_store().get_org_membership(org_id, user_id)
+        if (
+            membership and membership["role"] == "admin"
+            and auth.get_account_store().count_org_admins(org_id) <= 1
+        ):
+            raise HTTPException(status_code=400, detail="cannot demote the organization's last admin")
+    if not auth.get_account_store().set_org_member_role(org_id, user_id, req.role):
+        raise HTTPException(status_code=404, detail="member not found")
+    return {"ok": True}
+
+
+@app.delete("/api/orgs/{org_id}/members/{user_id}", dependencies=[Depends(require_org_admin())])
+async def remove_org_member(org_id: str, user_id: str) -> dict:
+    membership = auth.get_account_store().get_org_membership(org_id, user_id)
+    if membership and membership["role"] == "admin" and auth.get_account_store().count_org_admins(org_id) <= 1:
+        raise HTTPException(status_code=400, detail="cannot remove the organization's last admin")
+    auth.get_account_store().remove_org_member(org_id, user_id)
+    return {"ok": True}
+
+
+@app.post("/api/orgs/{org_id}/leave")
+async def leave_org(org_id: str, request: Request) -> dict:
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    membership = auth.get_account_store().get_org_membership(org_id, user["user_id"])
+    if membership is None:
+        raise HTTPException(status_code=404, detail="not a member of this organization")
+    if membership["role"] == "admin" and auth.get_account_store().count_org_admins(org_id) <= 1:
+        raise HTTPException(
+            status_code=400, detail="cannot leave -- you are the last admin; promote someone else first"
+        )
+    auth.get_account_store().remove_org_member(org_id, user["user_id"])
+    return {"ok": True}
+
+
+class OrgDefaultsRequest(BaseModel):
+    default_visibility: Optional[str] = None
+    allowed_share_link_roles: Optional[list[str]] = None
+
+
+@app.post("/api/orgs/{org_id}/defaults", dependencies=[Depends(require_org_admin())])
+async def set_org_defaults(org_id: str, req: OrgDefaultsRequest) -> dict:
+    if req.default_visibility is not None and req.default_visibility not in _VALID_VISIBILITIES:
+        raise HTTPException(
+            status_code=400, detail=f"default_visibility must be one of {sorted(_VALID_VISIBILITIES)}"
+        )
+    if req.allowed_share_link_roles is not None and not set(req.allowed_share_link_roles) <= {"viewer", "editor"}:
+        raise HTTPException(status_code=400, detail="allowed_share_link_roles must be a subset of ['viewer', 'editor']")
+    auth.get_account_store().set_org_defaults(org_id, req.default_visibility, req.allowed_share_link_roles)
+    return {"ok": True}
+
+
+async def _transfer_room_to_org(kind: str, room_id: str, org_id: str, user: Optional[dict]) -> dict:
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    membership = auth.get_account_store().get_org_membership(org_id, user["user_id"])
+    if membership is None or membership["status"] != "active" or membership["role"] != "admin":
+        raise HTTPException(status_code=403, detail="only an admin of the target organization can accept a transfer")
+    org = auth.get_account_store().get_org(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    if not auth.get_account_store().transfer_room_to_org(kind, room_id, org_id):
+        raise HTTPException(status_code=404, detail="this room has no owner to transfer")
+    auth.get_account_store().set_room_visibility(kind, room_id, org["default_visibility"])
+    return {"ok": True, "owner_org_id": org_id, "visibility": org["default_visibility"]}
+
+
+class TransferRequest(BaseModel):
+    org_id: str
+
+
+@app.post("/api/rooms/{room_id}/transfer", dependencies=[Depends(require_owner_access("drawing"))])
+async def transfer_drawing_room(room_id: str, req: TransferRequest, request: Request) -> dict:
+    return await _transfer_room_to_org("drawing", room_id, req.org_id, auth.current_user(request))
+
+
+@app.post("/api/mesh/{room_id}/transfer", dependencies=[Depends(require_owner_access("mesh"))])
+async def transfer_mesh_room(room_id: str, req: TransferRequest, request: Request) -> dict:
+    return await _transfer_room_to_org("mesh", room_id, req.org_id, auth.current_user(request))
 
 
 class RenameRequest(BaseModel):
@@ -1102,6 +1318,22 @@ async def _create_share_link(kind: str, room_id: str, role: str) -> ShareLinkRes
         )
     if role not in ("viewer", "editor"):
         raise HTTPException(status_code=400, detail="role must be 'viewer' or 'editor'")
+    # Part 6 P3: an org can restrict which roles a share link may carry
+    # for one of its own documents (e.g. "no editor links, viewer only")
+    # -- checked here so it applies no matter which room this link is
+    # for, without touching the (accounts-agnostic) token-minting code
+    # in security.py itself.
+    if auth.accounts_enabled():
+        ownership = auth.get_account_store().get_room_ownership(kind, room_id)
+        org_id = ownership.get("owner_org_id") if ownership else None
+        if org_id is not None:
+            org = auth.get_account_store().get_org(org_id)
+            if org is not None and role not in org["allowed_share_link_roles"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"this document's organization only allows share links with role(s): "
+                    f"{', '.join(org['allowed_share_link_roles'])}",
+                )
     return ShareLinkResponse(token=security.mint_room_token(kind, room_id, role=role), role=role)
 
 

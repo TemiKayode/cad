@@ -96,6 +96,7 @@ offline to see the **Time-Travel Merge** panel.
 | Security hardening (opt-in room tokens, CORS lockdown, rate limits, resource ceilings) | **Done** -- off/wide-open by default, see below |
 | User accounts: magic-link + OAuth sign-in, server-side sessions (Part 6 Phase P1) | **Done, opt-in** (`CRDT_CAD_AUTH_MODE=accounts`) -- magic-link flow verified end-to-end incl. a live browser run; OAuth (Google/GitHub via `authlib`, the `accounts` extra) is env-gated and **config/gating-tested only** (no real provider credentials were available to exercise the live redirect dance). Default `tokens` mode is byte-for-byte unchanged, tested as such. See "User accounts" below |
 | Document ownership & per-person permissions: private/link/public visibility, owner/editor/commenter/viewer grants by e-mail (Part 6 Phase P2) | **Done, opt-in** -- claim-on-first-touch (never retroactive), composes with (never replaces) the pre-existing room-token system, home page filters private rooms from anyone without access, Share modal for owners. Live-verified end to end in a real browser (3 signed-in accounts, one denied). See "Document ownership and per-person permissions" below |
+| Organizations & teams: admin/member orgs, org-owned documents, invite-by-e-mail with a real pending state, per-org defaults (Part 6 Phase P3) | **Done, opt-in** -- transferring a document to an org makes every active member see it automatically (an admin manages it, a member edits it) -- the "only my team sees this" feature -- without a single per-person grant. Live-verified end to end (an invited-while-signed-out teammate's membership activates on their first real sign-in; a non-member sees nothing). See "Organizations and teams" below |
 | Durable persistence (SQLite snapshots, survives restart) | **Done**; optional `PostgresStore` for multi-process sharing, see below |
 | Save / download (JSON, SVG, DXF for 2D; JSON, STL for 3D) | **Done** |
 | Import (SVG, DXF reference geometry) | **Done** -- SVG now includes quadratic/cubic Bezier curves (Phase 8), see below; arcs and DXF splines/arcs remain unsupported |
@@ -1714,6 +1715,77 @@ composition helpers directly, claim-on-first-touch (including the
 never-retroactively-claim case), WS/REST visibility enforcement, the
 share-link-still-works-on-a-private-room guarantee, and the workspace
 listing filter.
+
+## Organizations and teams (Part 6 Phase P3)
+
+Layered directly on top of P2's ownership/visibility model -- an org
+doesn't replace the personal-owner concept, it's a *second* kind of
+owner a room can have. Two new tables (`orgs`, `org_members`), plus one
+new nullable column on P2's existing `room_ownership` table
+(`owner_org_id`, migrated in with the same idempotent
+try/except-`ALTER TABLE` pattern `store.py`'s `display_name` column
+uses, so a database that already ran P2's DDL upgrades cleanly).
+
+- **Admin/member orgs.** `POST /api/orgs` creates an org and makes its
+  creator an active admin in the same step -- there's no "orgless"
+  moment. Admins manage membership and defaults; members see the
+  roster read-only.
+- **Org-owned documents are the actual feature.** Transferring a room
+  to an org (`POST /api/{rooms,mesh}/{room_id}/transfer`, gated the
+  same `require_owner_access` way as P2's sharing endpoints -- now
+  extended so an org *admin*, not just the room's original personal
+  owner, can manage it once it's org-owned) reassigns `owner_org_id`.
+  From then on, `_account_role_for_room`'s precedence is: the personal
+  creator (still "owner", for continuity) -- an explicit per-room grant
+  (P2, always wins, since it's the more specific instruction) -- active
+  org membership (an admin gets "owner", an ordinary member gets
+  "editor") -- the room's own visibility default. A **private**,
+  org-owned room is therefore visible and editable to *every active
+  member of that org automatically* -- no per-person grant needed at
+  all -- which is the actual "only my team sees this project" feature,
+  not just a bigger sharing list. The workspace listing reflects it
+  too: an org-owned room shows "org: Acme -- your role: editor" instead
+  of "shared by \<name\>".
+- **Invite flow with a real pending-invite state.** `POST
+  /api/orgs/{org_id}/invite` creates (or reuses) the invitee's account
+  by e-mail, same as a P2 room grant -- but tracks whether they already
+  had one: a brand-new account is `"pending"` until the moment they
+  actually sign in for the first time (`activate_pending_memberships`,
+  called from the one place both the magic-link and OAuth flows share:
+  `create_session`), at which point every pending invite tied to that
+  address goes `"active"`. Inviting someone who already has an account
+  activates immediately -- they're a known, reachable person already.
+- **Per-org defaults.** `default_visibility` (applied automatically the
+  moment a room is transferred in, unless the transferrer changes it
+  after) and `allowed_share_link_roles` (an org can forbid minting
+  editor-role share links for its own documents entirely, e.g.
+  view-only links only -- enforced in the same `_create_share_link`
+  path Phase 17's share links already went through, not a parallel
+  check that could drift).
+- **Last-admin guards.** An org can never end up adminless: demoting,
+  removing, or self-leaving the sole remaining admin is refused (400)
+  server-side, not just discouraged in the UI.
+- **The home page** gains an "Organizations" button (visible only when
+  signed in) opening a two-view modal -- an org list plus "Create", and
+  (clicking one) that org's own member roster, invite-by-e-mail row,
+  and per-org default controls, admin-only where it should be. The
+  existing Share modal grows a "Transfer to organization" section,
+  shown only when the signed-in user actually admins at least one org.
+
+Live-verified end to end in a real browser: Alice creates "Acme",
+invites bob@example.com (who has never signed in -- shown "invited, not
+yet joined"), transfers a freshly-created room to Acme; Bob then signs
+in for the very first time and his invite activates automatically,
+his home page shows the room labeled "org: Acme -- your role: editor"
+with zero per-room grant ever created for him, and his own view of the
+member roster has no role-change or remove controls since he's a plain
+member, not an admin; Carol, unrelated to the org entirely, still sees
+nothing. 27 new tests in `tests/test_org_permissions.py` cover org
+creation/membership, the pending-to-active transition, last-admin
+guards, the transfer flow's authorization (room owner *and* target-org
+admin both required), the org-membership-grants-a-role composition
+(including that an explicit per-room grant still overrides the org
+default), and the share-link role restriction.
 
 ## The home page and the two demos
 

@@ -46,6 +46,14 @@ entirely through the workspace home page's Share modal and the
 `/api/rooms/{room_id}/{sharing,visibility,grant}` / `/api/mesh/...`
 REST endpoints, not further env vars.
 
+Organizations and teams (Part 6 Phase P3 -- admin/member orgs,
+org-owned documents, invite-by-e-mail, per-org defaults) are the same:
+no new env vars, just `CRDT_CAD_AUTH_MODE=accounts`. Managed through the
+home page's Organizations button/modal and the `/api/orgs/...` REST
+endpoints; per-org defaults (new-document visibility, allowed
+share-link roles) are per-organization settings stored in the database,
+not deployment-level configuration.
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

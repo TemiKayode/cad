@@ -107,10 +107,12 @@ class AccountStore:
         raise NotImplementedError
 
     def get_room_ownership(self, kind: str, room_id: str) -> Optional[dict]:
-        """Returns ``{"owner_user_id", "visibility"}``, or None if this
-        room has no owner -- true for every room predating this phase,
-        and for any room never opened by a signed-in user. An unowned
-        room is treated as fully public, identical to today's behavior."""
+        """Returns ``{"owner_user_id", "visibility", "owner_org_id"}``
+        (the last one None unless :meth:`transfer_room_to_org` has been
+        called -- Part 6 P3), or None if this room has no owner at all --
+        true for every room predating this phase, and for any room never
+        opened by a signed-in user. An unowned room is treated as fully
+        public, identical to today's behavior."""
         raise NotImplementedError
 
     def set_room_visibility(self, kind: str, room_id: str, visibility: str) -> bool:
@@ -143,6 +145,73 @@ class AccountStore:
         "shared with you"."""
         raise NotImplementedError
 
+    # -- organizations & teams (Part 6, P3) ---------------------------------
+
+    def create_org(self, name: str, created_by_user_id: str) -> dict:
+        """Creates an org and adds its creator as an active admin member
+        in one step -- there is no "orgless" moment. Returns
+        ``{"org_id", "name", "created_by", "created_at",
+        "default_visibility", "allowed_share_link_roles"}``."""
+        raise NotImplementedError
+
+    def get_org(self, org_id: str) -> Optional[dict]:
+        raise NotImplementedError
+
+    def set_org_defaults(
+        self, org_id: str, default_visibility: Optional[str] = None,
+        allowed_share_link_roles: Optional[list[str]] = None,
+    ) -> bool:
+        """Updates only the fields given. Returns False if the org doesn't
+        exist."""
+        raise NotImplementedError
+
+    def list_orgs_for_user(self, user_id: str) -> list[dict]:
+        """Active memberships only -- ``[{"org_id", "name", "role"}, ...]``."""
+        raise NotImplementedError
+
+    def invite_org_member(self, org_id: str, email: str, role: str = "member") -> tuple[dict, str]:
+        """Creates (or reuses) the invitee's account and adds them as a
+        member -- ``"active"`` immediately if they already had an account
+        (they're a known, reachable person), ``"pending"`` if this invite
+        is what created their account (the brief's "pending-invite
+        state": consumed automatically the first time they actually sign
+        in -- see :meth:`activate_pending_memberships`). Returns
+        ``(user, status)``. Idempotent: re-inviting an existing member
+        updates their role instead of erroring."""
+        raise NotImplementedError
+
+    def activate_pending_memberships(self, user_id: str) -> None:
+        """Flips every ``"pending"`` membership for this user to
+        ``"active"`` -- called once, right after their first successful
+        sign-in (magic-link verify / OAuth callback), the moment a
+        pending invite is genuinely accepted."""
+        raise NotImplementedError
+
+    def set_org_member_role(self, org_id: str, user_id: str, role: str) -> bool:
+        raise NotImplementedError
+
+    def remove_org_member(self, org_id: str, user_id: str) -> None:
+        raise NotImplementedError
+
+    def get_org_membership(self, org_id: str, user_id: str) -> Optional[dict]:
+        """``{"role", "status"}`` or None."""
+        raise NotImplementedError
+
+    def list_org_members(self, org_id: str) -> list[dict]:
+        """``[{"user_id", "email", "display_name", "role", "status"}, ...]``
+        for the org settings page."""
+        raise NotImplementedError
+
+    def count_org_admins(self, org_id: str) -> int:
+        """Active admins only -- used to refuse the last admin leaving or
+        demoting themself, so an org can never end up ownerless."""
+        raise NotImplementedError
+
+    def transfer_room_to_org(self, kind: str, room_id: str, org_id: str) -> bool:
+        """Reassigns an already-claimed room's ``owner_org_id``. Returns
+        False if the room has no owner yet (nothing to transfer)."""
+        raise NotImplementedError
+
 
 class InMemoryAccountStore(AccountStore):
     """Non-durable accounts store used in tests."""
@@ -153,6 +222,8 @@ class InMemoryAccountStore(AccountStore):
         self._sessions: dict[str, dict] = {}
         self._ownership: dict[tuple[str, str], dict] = {}
         self._grants: dict[tuple[str, str, str], str] = {}
+        self._orgs: dict[str, dict] = {}
+        self._org_members: dict[tuple[str, str], dict] = {}
 
     def create_or_get_user(self, email: str, display_name: Optional[str] = None) -> dict:
         email = email.strip().lower()
@@ -226,7 +297,7 @@ class InMemoryAccountStore(AccountStore):
         key = (kind, room_id)
         if key in self._ownership:
             return False
-        self._ownership[key] = {"owner_user_id": owner_user_id, "visibility": visibility}
+        self._ownership[key] = {"owner_user_id": owner_user_id, "visibility": visibility, "owner_org_id": None}
         return True
 
     def get_room_ownership(self, kind: str, room_id: str) -> Optional[dict]:
@@ -272,6 +343,98 @@ class InMemoryAccountStore(AccountStore):
             for (k, r, u), role in self._grants.items() if u == user_id
         ]
 
+    # -- organizations & teams -----------------------------------------------
+
+    def create_org(self, name: str, created_by_user_id: str) -> dict:
+        org_id = uuid.uuid4().hex
+        org = {
+            "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": time.time(),
+            "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
+        }
+        self._orgs[org_id] = org
+        self._org_members[(org_id, created_by_user_id)] = {"role": "admin", "status": "active"}
+        return dict(org)
+
+    def get_org(self, org_id: str) -> Optional[dict]:
+        org = self._orgs.get(org_id)
+        return dict(org) if org else None
+
+    def set_org_defaults(
+        self, org_id: str, default_visibility: Optional[str] = None,
+        allowed_share_link_roles: Optional[list[str]] = None,
+    ) -> bool:
+        org = self._orgs.get(org_id)
+        if not org:
+            return False
+        if default_visibility is not None:
+            org["default_visibility"] = default_visibility
+        if allowed_share_link_roles is not None:
+            org["allowed_share_link_roles"] = list(allowed_share_link_roles)
+        return True
+
+    def list_orgs_for_user(self, user_id: str) -> list[dict]:
+        out = []
+        for (org_id, uid), m in self._org_members.items():
+            if uid == user_id and m["status"] == "active":
+                org = self._orgs.get(org_id)
+                if org:
+                    out.append({"org_id": org_id, "name": org["name"], "role": m["role"]})
+        return out
+
+    def invite_org_member(self, org_id: str, email: str, role: str = "member") -> tuple[dict, str]:
+        existing = self.get_user_by_email(email)
+        user = self.create_or_get_user(email)
+        key = (org_id, user["user_id"])
+        if key in self._org_members:
+            self._org_members[key]["role"] = role
+            return user, self._org_members[key]["status"]
+        status = "active" if existing else "pending"
+        self._org_members[key] = {"role": role, "status": status}
+        return user, status
+
+    def activate_pending_memberships(self, user_id: str) -> None:
+        for key, m in self._org_members.items():
+            if key[1] == user_id and m["status"] == "pending":
+                m["status"] = "active"
+
+    def set_org_member_role(self, org_id: str, user_id: str, role: str) -> bool:
+        key = (org_id, user_id)
+        if key not in self._org_members:
+            return False
+        self._org_members[key]["role"] = role
+        return True
+
+    def remove_org_member(self, org_id: str, user_id: str) -> None:
+        self._org_members.pop((org_id, user_id), None)
+
+    def get_org_membership(self, org_id: str, user_id: str) -> Optional[dict]:
+        m = self._org_members.get((org_id, user_id))
+        return dict(m) if m else None
+
+    def list_org_members(self, org_id: str) -> list[dict]:
+        out = []
+        for (oid, user_id), m in self._org_members.items():
+            if oid == org_id:
+                user = self.get_user(user_id) or {}
+                out.append({
+                    "user_id": user_id, "email": user.get("email"), "display_name": user.get("display_name"),
+                    "role": m["role"], "status": m["status"],
+                })
+        return out
+
+    def count_org_admins(self, org_id: str) -> int:
+        return sum(
+            1 for (oid, _), m in self._org_members.items()
+            if oid == org_id and m["role"] == "admin" and m["status"] == "active"
+        )
+
+    def transfer_room_to_org(self, kind: str, room_id: str, org_id: str) -> bool:
+        row = self._ownership.get((kind, room_id))
+        if not row:
+            return False
+        row["owner_org_id"] = org_id
+        return True
+
 
 _USERS_DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -315,6 +478,27 @@ CREATE TABLE IF NOT EXISTS room_grants (
 )
 """
 
+_ORGS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS orgs (
+    org_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    default_visibility TEXT NOT NULL DEFAULT 'private',
+    allowed_share_link_roles TEXT NOT NULL DEFAULT 'viewer,editor'
+)
+"""
+
+_ORG_MEMBERS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS org_members (
+    org_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    PRIMARY KEY (org_id, user_id)
+)
+"""
+
 
 class SQLiteAccountStore(AccountStore):
     """Accounts in a SQLite file -- by default the same file as room
@@ -331,8 +515,20 @@ class SQLiteAccountStore(AccountStore):
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
             conn.execute(_ROOM_OWNERSHIP_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_room_ownership_owner ON room_ownership(owner_user_id)")
+            try:
+                # A fresh CREATE TABLE above doesn't include this column
+                # (Part 6 P3 added it after P2 shipped) -- ALTER ADD
+                # COLUMN has no IF NOT EXISTS in sqlite3, so a database
+                # that already ran P2's DDL needs this explicit try/except
+                # dance, same pattern as store.py's display_name migration.
+                conn.execute("ALTER TABLE room_ownership ADD COLUMN owner_org_id TEXT")
+            except sqlite3.OperationalError:
+                pass  # already migrated
             conn.execute(_ROOM_GRANTS_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_room_grants_user ON room_grants(user_id)")
+            conn.execute(_ORGS_DDL_SQLITE)
+            conn.execute(_ORG_MEMBERS_DDL_SQLITE)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id)")
 
     @contextmanager
     def _connect(self):
@@ -450,10 +646,10 @@ class SQLiteAccountStore(AccountStore):
     def get_room_ownership(self, kind: str, room_id: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT owner_user_id, visibility FROM room_ownership WHERE kind = ? AND room_id = ?",
+                "SELECT owner_user_id, visibility, owner_org_id FROM room_ownership WHERE kind = ? AND room_id = ?",
                 (kind, room_id),
             ).fetchone()
-            return {"owner_user_id": row[0], "visibility": row[1]} if row else None
+            return {"owner_user_id": row[0], "visibility": row[1], "owner_org_id": row[2]} if row else None
 
     def set_room_visibility(self, kind: str, room_id: str, visibility: str) -> bool:
         with self._connect() as conn:
@@ -507,6 +703,138 @@ class SQLiteAccountStore(AccountStore):
                 "SELECT kind, room_id, role FROM room_grants WHERE user_id = ?", (user_id,)
             ).fetchall()
             return [{"kind": r[0], "room_id": r[1], "role": r[2]} for r in rows]
+
+    # -- organizations & teams -----------------------------------------------
+
+    @staticmethod
+    def _org_row_to_dict(row) -> dict:
+        return {
+            "org_id": row[0], "name": row[1], "created_by": row[2], "created_at": row[3],
+            "default_visibility": row[4], "allowed_share_link_roles": row[5].split(",") if row[5] else [],
+        }
+
+    def create_org(self, name: str, created_by_user_id: str) -> dict:
+        org_id = uuid.uuid4().hex
+        created = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO orgs (org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles) "
+                "VALUES (?, ?, ?, ?, 'private', 'viewer,editor')",
+                (org_id, name, created_by_user_id, created),
+            )
+            conn.execute(
+                "INSERT INTO org_members (org_id, user_id, role, status) VALUES (?, ?, 'admin', 'active')",
+                (org_id, created_by_user_id),
+            )
+        return {
+            "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": created,
+            "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
+        }
+
+    def get_org(self, org_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles "
+                "FROM orgs WHERE org_id = ?",
+                (org_id,),
+            ).fetchone()
+            return self._org_row_to_dict(row) if row else None
+
+    def set_org_defaults(
+        self, org_id: str, default_visibility: Optional[str] = None,
+        allowed_share_link_roles: Optional[list[str]] = None,
+    ) -> bool:
+        sets, params = [], []
+        if default_visibility is not None:
+            sets.append("default_visibility = ?")
+            params.append(default_visibility)
+        if allowed_share_link_roles is not None:
+            sets.append("allowed_share_link_roles = ?")
+            params.append(",".join(allowed_share_link_roles))
+        if not sets:
+            return self.get_org(org_id) is not None
+        params.append(org_id)
+        with self._connect() as conn:
+            cur = conn.execute(f"UPDATE orgs SET {', '.join(sets)} WHERE org_id = ?", params)
+            return cur.rowcount > 0
+
+    def list_orgs_for_user(self, user_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT o.org_id, o.name, m.role FROM org_members m JOIN orgs o ON o.org_id = m.org_id "
+                "WHERE m.user_id = ? AND m.status = 'active'",
+                (user_id,),
+            ).fetchall()
+            return [{"org_id": r[0], "name": r[1], "role": r[2]} for r in rows]
+
+    def invite_org_member(self, org_id: str, email: str, role: str = "member") -> tuple[dict, str]:
+        existing = self.get_user_by_email(email)
+        user = self.create_or_get_user(email)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM org_members WHERE org_id = ? AND user_id = ?", (org_id, user["user_id"])
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE org_members SET role = ? WHERE org_id = ? AND user_id = ?",
+                    (role, org_id, user["user_id"]),
+                )
+                return user, row[0]
+            status = "active" if existing else "pending"
+            conn.execute(
+                "INSERT INTO org_members (org_id, user_id, role, status) VALUES (?, ?, ?, ?)",
+                (org_id, user["user_id"], role, status),
+            )
+            return user, status
+
+    def activate_pending_memberships(self, user_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE org_members SET status = 'active' WHERE user_id = ? AND status = 'pending'", (user_id,)
+            )
+
+    def set_org_member_role(self, org_id: str, user_id: str, role: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE org_members SET role = ? WHERE org_id = ? AND user_id = ?", (role, org_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    def remove_org_member(self, org_id: str, user_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM org_members WHERE org_id = ? AND user_id = ?", (org_id, user_id))
+
+    def get_org_membership(self, org_id: str, user_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT role, status FROM org_members WHERE org_id = ? AND user_id = ?", (org_id, user_id)
+            ).fetchone()
+            return {"role": row[0], "status": row[1]} if row else None
+
+    def list_org_members(self, org_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT m.user_id, u.email, u.display_name, m.role, m.status FROM org_members m "
+                "JOIN users u ON u.user_id = m.user_id WHERE m.org_id = ?",
+                (org_id,),
+            ).fetchall()
+            return [{"user_id": r[0], "email": r[1], "display_name": r[2], "role": r[3], "status": r[4]} for r in rows]
+
+    def count_org_admins(self, org_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM org_members WHERE org_id = ? AND role = 'admin' AND status = 'active'",
+                (org_id,),
+            ).fetchone()
+            return row[0]
+
+    def transfer_room_to_org(self, kind: str, room_id: str, org_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE room_ownership SET owner_org_id = ? WHERE kind = ? AND room_id = ?",
+                (org_id, kind, room_id),
+            )
+            return cur.rowcount > 0
 
 
 class PostgresAccountStore(AccountStore):
@@ -587,6 +915,11 @@ class PostgresAccountStore(AccountStore):
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_room_ownership_owner ON room_ownership(owner_user_id)"
                 )
+                # A fresh CREATE TABLE above doesn't include this column
+                # (Part 6 P3 added it after P2 shipped) -- ADD COLUMN IF
+                # NOT EXISTS is a real Postgres feature, so a database
+                # that already ran P2's DDL just gets it added here.
+                await conn.execute("ALTER TABLE room_ownership ADD COLUMN IF NOT EXISTS owner_org_id TEXT")
                 await conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS room_grants (
@@ -600,6 +933,30 @@ class PostgresAccountStore(AccountStore):
                     """
                 )
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_room_grants_user ON room_grants(user_id)")
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS orgs (
+                        org_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        created_by TEXT NOT NULL,
+                        created_at DOUBLE PRECISION NOT NULL,
+                        default_visibility TEXT NOT NULL DEFAULT 'private',
+                        allowed_share_link_roles TEXT NOT NULL DEFAULT 'viewer,editor'
+                    )
+                    """
+                )
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS org_members (
+                        org_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        PRIMARY KEY (org_id, user_id)
+                    )
+                    """
+                )
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id)")
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1)", self._SCHEMA_LOCK_KEY)
         return pool
@@ -748,10 +1105,11 @@ class PostgresAccountStore(AccountStore):
         async def _go():
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT owner_user_id, visibility FROM room_ownership WHERE kind = $1 AND room_id = $2",
+                    "SELECT owner_user_id, visibility, owner_org_id FROM room_ownership "
+                    "WHERE kind = $1 AND room_id = $2",
                     kind, room_id,
                 )
-                return {"owner_user_id": row["owner_user_id"], "visibility": row["visibility"]} if row else None
+                return dict(row) if row else None
 
         return self._call(_go())
 
@@ -827,5 +1185,179 @@ class PostgresAccountStore(AccountStore):
                     "SELECT kind, room_id, role FROM room_grants WHERE user_id = $1", user_id
                 )
                 return [dict(r) for r in rows]
+
+        return self._call(_go())
+
+    # -- organizations & teams -----------------------------------------------
+
+    @staticmethod
+    def _org_row_to_dict(row) -> dict:
+        d = dict(row)
+        roles = d.pop("allowed_share_link_roles", "")
+        d["allowed_share_link_roles"] = roles.split(",") if roles else []
+        return d
+
+    def create_org(self, name: str, created_by_user_id: str) -> dict:
+        org_id = uuid.uuid4().hex
+        created = time.time()
+
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO orgs (org_id, name, created_by, created_at, default_visibility, "
+                    "allowed_share_link_roles) VALUES ($1, $2, $3, $4, 'private', 'viewer,editor')",
+                    org_id, name, created_by_user_id, created,
+                )
+                await conn.execute(
+                    "INSERT INTO org_members (org_id, user_id, role, status) VALUES ($1, $2, 'admin', 'active')",
+                    org_id, created_by_user_id,
+                )
+
+        self._call(_go())
+        return {
+            "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": created,
+            "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
+        }
+
+    def get_org(self, org_id: str) -> Optional[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles "
+                    "FROM orgs WHERE org_id = $1",
+                    org_id,
+                )
+                return self._org_row_to_dict(row) if row else None
+
+        return self._call(_go())
+
+    def set_org_defaults(
+        self, org_id: str, default_visibility: Optional[str] = None,
+        allowed_share_link_roles: Optional[list[str]] = None,
+    ) -> bool:
+        async def _go():
+            sets, params = [], []
+            if default_visibility is not None:
+                params.append(default_visibility)
+                sets.append(f"default_visibility = ${len(params)}")
+            if allowed_share_link_roles is not None:
+                params.append(",".join(allowed_share_link_roles))
+                sets.append(f"allowed_share_link_roles = ${len(params)}")
+            async with self._pool.acquire() as conn:
+                if not sets:
+                    row = await conn.fetchrow("SELECT 1 FROM orgs WHERE org_id = $1", org_id)
+                    return row is not None
+                params.append(org_id)
+                result = await conn.execute(
+                    f"UPDATE orgs SET {', '.join(sets)} WHERE org_id = ${len(params)}", *params
+                )
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    def list_orgs_for_user(self, user_id: str) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT o.org_id, o.name, m.role FROM org_members m JOIN orgs o ON o.org_id = m.org_id "
+                    "WHERE m.user_id = $1 AND m.status = 'active'",
+                    user_id,
+                )
+                return [dict(r) for r in rows]
+
+        return self._call(_go())
+
+    def invite_org_member(self, org_id: str, email: str, role: str = "member") -> tuple[dict, str]:
+        existing = self.get_user_by_email(email)
+        user = self.create_or_get_user(email)
+
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT status FROM org_members WHERE org_id = $1 AND user_id = $2", org_id, user["user_id"]
+                )
+                if row:
+                    await conn.execute(
+                        "UPDATE org_members SET role = $1 WHERE org_id = $2 AND user_id = $3",
+                        role, org_id, user["user_id"],
+                    )
+                    return row["status"]
+                status = "active" if existing else "pending"
+                await conn.execute(
+                    "INSERT INTO org_members (org_id, user_id, role, status) VALUES ($1, $2, $3, $4)",
+                    org_id, user["user_id"], role, status,
+                )
+                return status
+
+        status = self._call(_go())
+        return user, status
+
+    def activate_pending_memberships(self, user_id: str) -> None:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE org_members SET status = 'active' WHERE user_id = $1 AND status = 'pending'", user_id
+                )
+
+        self._call(_go())
+
+    def set_org_member_role(self, org_id: str, user_id: str, role: str) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE org_members SET role = $1 WHERE org_id = $2 AND user_id = $3", role, org_id, user_id
+                )
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    def remove_org_member(self, org_id: str, user_id: str) -> None:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2", org_id, user_id)
+
+        self._call(_go())
+
+    def get_org_membership(self, org_id: str, user_id: str) -> Optional[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT role, status FROM org_members WHERE org_id = $1 AND user_id = $2", org_id, user_id
+                )
+                return dict(row) if row else None
+
+        return self._call(_go())
+
+    def list_org_members(self, org_id: str) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT m.user_id, u.email, u.display_name, m.role, m.status FROM org_members m "
+                    "JOIN users u ON u.user_id = m.user_id WHERE m.org_id = $1",
+                    org_id,
+                )
+                return [dict(r) for r in rows]
+
+        return self._call(_go())
+
+    def count_org_admins(self, org_id: str) -> int:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT COUNT(*) AS n FROM org_members WHERE org_id = $1 AND role = 'admin' AND status = 'active'",
+                    org_id,
+                )
+                return row["n"]
+
+        return self._call(_go())
+
+    def transfer_room_to_org(self, kind: str, room_id: str, org_id: str) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE room_ownership SET owner_org_id = $1 WHERE kind = $2 AND room_id = $3",
+                    org_id, kind, room_id,
+                )
+                return not result.endswith(" 0")
 
         return self._call(_go())
