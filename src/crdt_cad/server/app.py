@@ -105,6 +105,7 @@ from crdt_cad.geometry.constraints import Constraint, Sketch
 from crdt_cad.geometry.mesh_validity import check_mesh_validity
 from crdt_cad.geometry.validity import GeometryError, validate_new_point
 from crdt_cad.persistence.store import DocumentStore, PostgresStore, SQLiteStore
+from crdt_cad.server import auth
 from crdt_cad.server import metrics
 from crdt_cad.server import pubsub
 from crdt_cad.server import security
@@ -568,6 +569,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Part 6 P1: user accounts -- entirely inert in the default tokens mode
+# (the router still mounts so /api/auth/me can answer {"mode": "tokens"},
+# but no schema is created and every sign-in route 404s). The signed-
+# cookie SessionMiddleware exists solely to hold OAuth's state/nonce
+# between the redirect out and the callback back (authlib requires it);
+# it is not the user session, which is server-side (see auth.py).
+app.include_router(auth.router)
+if auth.accounts_enabled():
+    _auth_secret = os.environ.get("CRDT_CAD_SECRET")
+    if _auth_secret:
+        from starlette.middleware.sessions import SessionMiddleware
+
+        app.add_middleware(SessionMiddleware, secret_key=_auth_secret, same_site="lax")
+    else:
+        logger.warning(
+            "CRDT_CAD_AUTH_MODE=accounts but CRDT_CAD_SECRET is unset -- "
+            "sign-in routes will answer 503 until it is configured"
+        )
 
 # Kubernetes sets HOSTNAME to the pod name automatically; falls back to
 # socket.gethostname() so this is still meaningful outside a cluster.

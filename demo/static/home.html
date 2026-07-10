@@ -32,6 +32,9 @@
     <div class="spacer"></div>
     <button id="newDrawingBtn"><svg class="icon"><use href="#icon-pen"></use></svg>New 2D drawing</button>
     <button id="newMeshBtn"><svg class="icon"><use href="#icon-box"></use></svg>New 3D mesh</button>
+    <!-- Part 6 P1: populated by home.js from /api/auth/me -- stays empty
+         (and invisible) on tokens-mode deployments. -->
+    <span id="accountArea" style="display:contents"></span>
     <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
   </div>
 
@@ -63,6 +66,30 @@
         <div class="tool-row" style="margin-top:10px;justify-content:flex-end">
           <button id="renameCancelBtn">Cancel</button>
           <button id="renameSaveBtn" class="primary-btn">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="signInModal" class="modal-overlay" style="display:none">
+    <div class="modal modal-narrow">
+      <div class="modal-header">
+        <span>Sign in</span>
+        <button id="signInModalClose" class="ghost-btn" title="Close" aria-label="Close"><svg class="icon"><use href="#icon-x"></use></svg></button>
+      </div>
+      <div class="modal-body">
+        <div id="signInForm">
+          <label for="signInEmail" style="font-size:13px;color:var(--text-secondary)">E-mail address</label>
+          <input id="signInEmail" type="email" autocomplete="email" placeholder="you@example.com" style="width:100%;margin-top:6px" />
+          <div class="tool-row" style="margin-top:10px;justify-content:flex-end">
+            <button id="signInLinkBtn" class="primary-btn">Email me a sign-in link</button>
+          </div>
+          <div id="oauthButtons" class="tool-row" style="margin-top:10px;display:none"></div>
+          <p class="empty-hint" style="margin-top:10px">No password to remember -- the link signs you in. It expires after 15 minutes.</p>
+        </div>
+        <div id="signInSent" style="display:none">
+          <p>Check your e-mail -- a sign-in link is on its way to <strong id="signInSentTo"></strong>.</p>
+          <p id="signInDevLinkWrap" class="empty-hint" style="display:none">Dev mode (no SMTP configured): <a id="signInDevLink" href="#">open the sign-in link</a></p>
         </div>
       </div>
     </div>

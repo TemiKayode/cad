@@ -267,4 +267,99 @@ function createRoom(kind) {
 document.getElementById("newDrawingBtn").onclick = () => createRoom("drawing");
 document.getElementById("newMeshBtn").onclick = () => createRoom("mesh");
 
+// -- accounts (Part 6 P1) --------------------------------------------------------
+// Everything below renders nothing at all on a tokens-mode deployment --
+// the home page is byte-for-byte the pre-accounts experience there.
+
+const signInModal = document.getElementById("signInModal");
+
+function openSignInModal(oauthProviders) {
+  document.getElementById("signInForm").style.display = "";
+  document.getElementById("signInSent").style.display = "none";
+  const oauthRow = document.getElementById("oauthButtons");
+  oauthRow.innerHTML = "";
+  if (oauthProviders && oauthProviders.length) {
+    for (const provider of oauthProviders) {
+      const btn = document.createElement("button");
+      btn.textContent = `Continue with ${provider[0].toUpperCase()}${provider.slice(1)}`;
+      btn.style.flex = "1";
+      btn.onclick = () => { location.href = `/api/auth/oauth/${provider}/start`; };
+      oauthRow.appendChild(btn);
+    }
+    oauthRow.style.display = "flex";
+  } else {
+    oauthRow.style.display = "none";
+  }
+  signInModal.style.display = "flex";
+  document.getElementById("signInEmail").focus();
+}
+
+function closeSignInModal() { signInModal.style.display = "none"; }
+document.getElementById("signInModalClose").onclick = closeSignInModal;
+signInModal.addEventListener("click", (e) => { if (e.target === e.currentTarget) closeSignInModal(); });
+
+async function requestSignInLink() {
+  const email = document.getElementById("signInEmail").value.trim();
+  if (!email) { document.getElementById("signInEmail").focus(); return; }
+  const resp = await fetch("/api/auth/request-link", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not send link: ${detail}`, "error");
+    return;
+  }
+  const result = await resp.json();
+  document.getElementById("signInForm").style.display = "none";
+  document.getElementById("signInSent").style.display = "";
+  document.getElementById("signInSentTo").textContent = email;
+  const devWrap = document.getElementById("signInDevLinkWrap");
+  if (result.dev_link) {
+    devWrap.style.display = "";
+    document.getElementById("signInDevLink").href = result.dev_link;
+  } else {
+    devWrap.style.display = "none";
+  }
+}
+document.getElementById("signInLinkBtn").onclick = requestSignInLink;
+document.getElementById("signInEmail").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") requestSignInLink();
+});
+
+async function signOut(everywhere) {
+  await fetch(everywhere ? "/api/auth/logout-everywhere" : "/api/auth/logout", { method: "POST" });
+  if (everywhere) await fetch("/api/auth/logout", { method: "POST" }); // drop this session's cookie too
+  location.reload();
+}
+
+function renderAccountArea(acct) {
+  const area = document.getElementById("accountArea");
+  area.innerHTML = "";
+  if (acct.mode !== "accounts") return;
+  if (!acct.signed_in) {
+    const btn = document.createElement("button");
+    btn.id = "signInBtn";
+    btn.textContent = "Sign in";
+    btn.onclick = () => openSignInModal(acct.oauth_providers);
+    area.appendChild(btn);
+    return;
+  }
+  const chip = document.createElement("button");
+  chip.id = "accountChip";
+  chip.className = "status-pill";
+  chip.title = `Signed in as ${acct.user.email} -- click to sign out`;
+  chip.textContent = acct.user.display_name || acct.user.email;
+  chip.onclick = () => {
+    if (window.confirm(`Sign out of ${acct.user.email}?`)) signOut(false);
+  };
+  area.appendChild(chip);
+}
+
+fetchAccount().then((acct) => {
+  renderAccountArea(acct);
+  syncActorNameFromAccount();
+});
+
 loadRooms();

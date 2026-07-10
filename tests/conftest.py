@@ -33,6 +33,24 @@ def no_meshy_api_key_by_default(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_account_store(monkeypatch):
+    """Part 6 P1: every test gets a fresh in-memory accounts store and
+    starts in the default tokens mode (accounts fully inert), so no test
+    can touch a real accounts table or leak sessions/users into another.
+    Tests that exercise accounts mode set CRDT_CAD_AUTH_MODE themselves
+    via monkeypatch, which layers on top of this."""
+    from crdt_cad.persistence.accounts import InMemoryAccountStore
+    from crdt_cad.server import auth
+
+    fresh = InMemoryAccountStore()
+    monkeypatch.setattr(auth, "_account_store", fresh)
+    monkeypatch.delenv("CRDT_CAD_AUTH_MODE", raising=False)
+    monkeypatch.delenv("CRDT_CAD_AUTH_DEV_ECHO", raising=False)
+    monkeypatch.delenv("CRDT_CAD_SMTP_HOST", raising=False)
+    yield fresh
+
+
+@pytest.fixture(autouse=True)
 def isolated_rate_limiter(monkeypatch):
     """The per-IP /generate rate limiter (crdt_cad.server.security.
     generate_rate_limiter) is a process-lifetime singleton by design in

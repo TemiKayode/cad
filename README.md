@@ -94,6 +94,7 @@ offline to see the **Time-Travel Merge** panel.
 | WebSocket relay server (rooms, snapshots, delta resync) | **Done**, FastAPI/asyncio |
 | Bounded periodic self-heal traffic (frontier ping, not a full snapshot) | **Done** -- O(actor count), not O(document size), see below |
 | Security hardening (opt-in room tokens, CORS lockdown, rate limits, resource ceilings) | **Done** -- off/wide-open by default, see below |
+| User accounts: magic-link + OAuth sign-in, server-side sessions (Part 6 Phase P1) | **Done, opt-in** (`CRDT_CAD_AUTH_MODE=accounts`) -- magic-link flow verified end-to-end incl. a live browser run; OAuth (Google/GitHub via `authlib`, the `accounts` extra) is env-gated and **config/gating-tested only** (no real provider credentials were available to exercise the live redirect dance). Default `tokens` mode is byte-for-byte unchanged, tested as such. See "User accounts" below |
 | Durable persistence (SQLite snapshots, survives restart) | **Done**; optional `PostgresStore` for multi-process sharing, see below |
 | Save / download (JSON, SVG, DXF for 2D; JSON, STL for 3D) | **Done** |
 | Import (SVG, DXF reference geometry) | **Done** -- SVG now includes quadratic/cubic Bezier curves (Phase 8), see below; arcs and DXF splines/arcs remain unsupported |
@@ -1502,6 +1503,32 @@ decides whether to fix or delete the affected face. See "Responses to
 the architecture critique" claim 3 above for the full rationale,
 including why watertightness is deliberately not one of the checks.
 
+**A real bug this warning caught, now fixed at the source (not
+suppressed):** the manual Extrude tool (`extrudeFace()` in `mesh3d.js`)
+had two defects that made this warning fire on completely ordinary,
+single-user, sequential clicks rather than only the intended
+concurrent-edit races. First, every extrude's side and top faces were
+wound with the *same* sense as their base instead of the opposite one
+manifold winding requires -- a real, always-reproducible inconsistency
+on the very first extrude of any face, independently confirmed against
+`check_mesh_validity` and now fixed by reversing the side-quad and
+top-cap vertex order. Second, clicking Extrude twice in a row (the
+natural "build the wall taller" motion) left `ui.selectedFace` -- and,
+independently, the face panel's own Extrude button closure, blocked
+from refreshing by an in-progress-edit focus guard -- pointed at the
+original base face, so the second click silently re-extruded it,
+stacking a duplicate ring of side faces on the same bottom edges. Both
+are fixed; a third fix changes behavior on top of them: extruding a
+face that is itself a bare, never-customized cap from a prior extrude
+now *merges that cap away* rather than keeping it, since two solids
+sharing an internal floor is unavoidably an edge shared by 3+ faces --
+genuinely non-manifold, but not what "keep building the same wall
+taller" means. A face the user has since colored or materialed is
+treated as a real floor and is kept; extruding from *that* one still
+correctly (and no longer spuriously) surfaces the warning. All three
+covered by `tests/e2e/test_3d_usability_e2e.py`'s
+`test_repeated_extrude_clicks_build_upward_without_a_validity_warning`.
+
 ## Security hardening (`src/crdt_cad/server/security.py`)
 
 The zero-config local demo (`git clone && pip install -e . && uvicorn ...`,
@@ -1566,6 +1593,52 @@ rate-limit test that (accidentally, at first) sent a payload missing its
 `id` field. Fixed: a malformed op is now rejected the same clean way a
 geometry-invalid op is (see `test_malformed_op_is_rejected_cleanly...`
 in `tests/test_security.py`).
+
+## User accounts (`src/crdt_cad/server/auth.py`, Part 6 Phase P1)
+
+Opt-in real identity, layered on top of (never replacing) the room-token
+model above: set `CRDT_CAD_AUTH_MODE=accounts` (plus the same
+`CRDT_CAD_SECRET` the token layer uses) and the workspace home page
+gains a **Sign in** flow. The default `tokens` mode keeps every account
+feature completely inert -- routes answer "not enabled", **no account
+schema is ever created**, and the zero-config experience is byte-for-byte
+what it was before this section existed (tested as such, not assumed:
+see `tests/test_accounts.py`'s tokens-mode tests).
+
+- **Magic links, no passwords.** POST an e-mail address; a time-limited
+  signed link (15 min, `itsdangerous`, signed with the deployment
+  secret) arrives by SMTP -- or, with no SMTP configured, is echoed to
+  the server log for development. It is returned in the API response
+  *only* under an explicit `CRDT_CAD_AUTH_DEV_ECHO=1` opt-in, because a
+  deployment that merely forgot SMTP must never hand any visitor a
+  working sign-in link for any address they type. There is no password
+  column to breach because there are no passwords at all.
+- **Server-side sessions.** The cookie (HttpOnly, SameSite=Lax, Secure
+  over TLS) holds a random token whose SHA-256 *hash* is what's stored
+  -- a leaked database cannot mint working cookies -- so "sign out" is a
+  row deletion and "sign out everywhere" (`POST
+  /api/auth/logout-everywhere`) is a real operation, both tested
+  including the replayed-stolen-cookie case.
+- **OAuth (Google, GitHub)** via `authlib` (the `accounts` extra),
+  active per provider only when its client id/secret env vars are set;
+  identity resolves to the provider-verified e-mail and lands in the
+  same user row a magic link for that address would. Honest scope: the
+  configuration/gating layer is tested; the live redirect dance is
+  **not** -- no real provider credentials were available in this
+  environment.
+- **Accounts feed presence.** A signed-in user's display name (editable
+  via `PATCH /api/auth/profile`) wins over the localStorage guest name
+  in every editor -- collaborators see "Alice the Architect", not
+  "Guest 511". Signed-out users keep exactly the old guest behavior.
+- Storage mirrors room persistence: `users`/`sessions` tables in the
+  same SQLite file by default, or Postgres (`CRDT_CAD_DATABASE_URL`)
+  for multi-replica deployments -- see
+  `src/crdt_cad/persistence/accounts.py`.
+
+What P1 deliberately does **not** include (it's identity only): document
+ownership and per-person permissions (P2), organizations (P3), SSO and
+per-account quotas (P4) -- see `PLATFORM_PROMPT.md` for the rest of
+Part 6.
 
 ## The home page and the two demos
 

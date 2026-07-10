@@ -26,6 +26,18 @@ you add a new one, add a row here too.
 | `CRDT_CAD_CORS_ORIGINS` | unset | Comma-separated explicit CORS origin allowlist. Unset: wide open (`*`) if `CRDT_CAD_SECRET` is unset, locked to same-origin only (`[]`) once it's set. Only read once at process startup -- changing it needs a restart. |
 | `CRDT_CAD_TRUST_PROXY_HEADERS` | unset (off) | Trust the last hop of `X-Forwarded-For` for the `/generate` rate limiter's client-IP key, instead of the raw socket peer. **Only set this when a reverse proxy you control is the sole way to reach the process** (Caddy, nginx-ingress) -- otherwise any client can bypass the rate limit by spoofing the header. See `security.client_ip`. |
 
+## Accounts (Part 6, opt-in -- fully inert by default)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CRDT_CAD_AUTH_MODE` | `tokens` | `accounts` enables user accounts (magic-link + OAuth sign-in, server-side sessions). The default keeps every account feature inert -- no schema created, sign-in routes 404, zero behavior change. Accounts mode **requires `CRDT_CAD_SECRET`** (magic links are signed with it). |
+| `CRDT_CAD_MAGIC_LINK_MAX_AGE_SECONDS` | `900` (15 min) | How long a sign-in link stays valid. |
+| `CRDT_CAD_SESSION_MAX_AGE_SECONDS` | `2592000` (30 days) | How long a session cookie stays valid. Sessions are server-side; sign-out deletes the row, not just the cookie. |
+| `CRDT_CAD_AUTH_DEV_ECHO` | unset (off) | Dev only: when no SMTP is configured, also return the magic link in the API response. **Never enable on a public deployment** -- it lets any visitor obtain a sign-in link for any address. Without it, a no-SMTP deployment only logs links server-side. |
+| `CRDT_CAD_SMTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_FROM` / `_STARTTLS` | unset / `587` / – / – / user@host / `1` | SMTP delivery for magic-link e-mails. Unset host = console-echo mode (see above). |
+| `CRDT_CAD_OAUTH_GOOGLE_CLIENT_ID` / `_CLIENT_SECRET` | unset | Enables "Continue with Google" (needs the `accounts` extra: `pip install crdt-cad[accounts]`). Redirect URI: `<base>/api/auth/oauth/google/callback`. |
+| `CRDT_CAD_OAUTH_GITHUB_CLIENT_ID` / `_CLIENT_SECRET` | unset | Enables "Continue with GitHub", same pattern. |
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

@@ -661,6 +661,36 @@ function setActorName(name) {
   return trimmed;
 }
 
+/** Part 6 P1 (accounts): one memoized fetch of /api/auth/me per page.
+ * Resolves to the endpoint's JSON ({mode, signed_in, user, oauth_providers})
+ * or, on any network/server failure, to the tokens-mode shape -- account
+ * features must degrade to exactly the pre-accounts behavior, never
+ * block a page from loading. */
+let _accountPromise = null;
+function fetchAccount() {
+  if (!_accountPromise) {
+    _accountPromise = fetch("/api/auth/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null)
+      .then((data) => data || { mode: "tokens", signed_in: false, user: null, oauth_providers: [] });
+  }
+  return _accountPromise;
+}
+
+/** When signed in to a real account, the account's display name wins over
+ * the localStorage guest name (and is mirrored into it, so presence,
+ * comments, and the rename prompt all stay consistent). Fire-and-forget:
+ * pages call this at startup; the guest name is used until it resolves. */
+function syncActorNameFromAccount() {
+  return fetchAccount().then((acct) => {
+    if (acct.signed_in && acct.user && acct.user.display_name) {
+      localStorage.setItem("crdt_cad_actor_name", acct.user.display_name);
+      return acct.user.display_name;
+    }
+    return null;
+  });
+}
+
 /** Phase 17 read-only share links: toggles the shared "viewer mode" UI
  * treatment -- disables (dims, `pointer-events:none`) every button/input
  * inside `.panel.left` and `.tool-rail` (Phase D2 moved the actual tool

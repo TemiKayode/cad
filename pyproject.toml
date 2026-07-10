@@ -71,6 +71,13 @@ meshy = [
     # trimesh.Trimesh.simplify_quadric_decimation needs this backend.
     "fast_simplification>=0.1.7",
 ]
+accounts = [
+    # Part 6 P1: OAuth sign-in (Google/GitHub) only -- magic-link sign-in
+    # needs nothing beyond the core deps (itsdangerous is already core).
+    "authlib>=1.3",
+    # authlib's Starlette OAuth client uses httpx for token/userinfo calls.
+    "httpx>=0.27",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
