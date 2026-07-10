@@ -108,6 +108,7 @@ from crdt_cad.geometry.mesh_validity import check_mesh_validity
 from crdt_cad.geometry.validity import GeometryError, validate_new_point
 from crdt_cad.persistence.store import DocumentStore, PostgresStore, SQLiteStore
 from crdt_cad.server import auth
+from crdt_cad.server import billing
 from crdt_cad.server import metrics
 from crdt_cad.server import pubsub
 from crdt_cad.server import security
@@ -1138,7 +1139,27 @@ class InviteOrgMemberRequest(BaseModel):
 async def invite_org_member(org_id: str, req: InviteOrgMemberRequest) -> dict:
     if req.role not in ("admin", "member"):
         raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
-    user, status = auth.get_account_store().invite_org_member(org_id, req.email, req.role)
+    store = auth.get_account_store()
+    # Part 6 P6: a free-plan seat cap, only when this deployment has
+    # actually configured billing -- a deployment that never sets
+    # CRDT_CAD_STRIPE_SECRET_KEY keeps P3's original unlimited org
+    # membership, byte-for-byte. Re-inviting an *existing* active
+    # member (e.g. just to change their role) never counts as growing
+    # the roster, so that's exempted from the cap.
+    if billing.billing_enabled():
+        org = store.get_org(org_id)
+        limit = billing.seat_limit_for_plan(org["billing_plan"]) if org else None
+        if limit is not None:
+            invitee = store.get_user_by_email(req.email)
+            membership = store.get_org_membership(org_id, invitee["user_id"]) if invitee else None
+            already_active = membership is not None and membership["status"] == "active"
+            active_count = sum(1 for m in store.list_org_members(org_id) if m["status"] == "active")
+            if active_count >= limit and not already_active:
+                raise HTTPException(
+                    status_code=402,
+                    detail=f"this organization's free plan is limited to {limit} members -- upgrade to add more",
+                )
+    user, status = store.invite_org_member(org_id, req.email, req.role)
     return {"user_id": user["user_id"], "email": user["email"], "role": req.role, "status": status}
 
 
@@ -1252,6 +1273,77 @@ async def set_org_sso(org_id: str, req: OrgSSORequest) -> dict:
 async def clear_org_sso(org_id: str) -> dict:
     auth.get_account_store().set_org_sso(org_id, None, None, None, None)
     auth.forget_org_oidc_client(org_id)
+    return {"ok": True}
+
+
+# -- billing (Part 6 P6) -------------------------------------------------------
+
+
+@app.get("/api/orgs/{org_id}/billing", dependencies=[Depends(require_org_membership())])
+async def get_org_billing(org_id: str) -> dict:
+    org = auth.get_account_store().get_org(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    return {
+        "billing_enabled": billing.billing_enabled(),
+        "plan": org["billing_plan"],
+        "status": org["billing_status"],
+        "seat_limit": billing.seat_limit_for_plan(org["billing_plan"]) if billing.billing_enabled() else None,
+        "has_customer": bool(org.get("billing_customer_id")),
+    }
+
+
+@app.post("/api/orgs/{org_id}/billing/checkout", dependencies=[Depends(require_org_admin())])
+async def start_org_checkout(org_id: str, request: Request) -> dict:
+    if not billing.billing_enabled():
+        raise HTTPException(status_code=404, detail="billing is not configured on this server")
+    store = auth.get_account_store()
+    org = store.get_org(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    base = str(request.base_url).rstrip("/")
+    try:
+        url = billing.create_checkout_session(
+            store, org, success_url=f"{base}/?billing=success", cancel_url=f"{base}/?billing=cancelled",
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"checkout_url": url}
+
+
+@app.post("/api/orgs/{org_id}/billing/portal", dependencies=[Depends(require_org_admin())])
+async def start_org_billing_portal(org_id: str, request: Request) -> dict:
+    if not billing.billing_enabled():
+        raise HTTPException(status_code=404, detail="billing is not configured on this server")
+    org = auth.get_account_store().get_org(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    base = str(request.base_url).rstrip("/")
+    try:
+        url = billing.create_portal_session(org, return_url=f"{base}/")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"portal_url": url}
+
+
+@app.post("/api/billing/webhook")
+async def stripe_webhook(request: Request) -> dict:
+    """Stripe calls this directly -- no session/room auth applies here
+    at all; the webhook signature (verified against
+    CRDT_CAD_STRIPE_WEBHOOK_SECRET) is the entire trust boundary, which
+    is why this reads the raw body instead of a parsed Pydantic model
+    (signature verification needs the exact bytes Stripe signed)."""
+    if not billing.billing_enabled():
+        raise HTTPException(status_code=404, detail="billing is not configured on this server")
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    try:
+        event = billing.verify_webhook(payload, sig_header)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid webhook signature: {exc}") from exc
+    billing.handle_webhook_event(auth.get_account_store(), event)
     return {"ok": True}
 
 

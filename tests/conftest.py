@@ -48,6 +48,13 @@ def isolated_account_store(monkeypatch):
     monkeypatch.delenv("CRDT_CAD_AUTH_DEV_ECHO", raising=False)
     monkeypatch.delenv("CRDT_CAD_SMTP_HOST", raising=False)
     monkeypatch.delenv("CRDT_CAD_ADMIN_EMAILS", raising=False)
+    # Part 6 P6: same reasoning as MESHY_API_KEY above -- a developer's
+    # own real Stripe keys must never leak into a test that didn't ask
+    # for billing to be enabled.
+    monkeypatch.delenv("CRDT_CAD_STRIPE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("CRDT_CAD_STRIPE_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("CRDT_CAD_STRIPE_PRICE_ID", raising=False)
+    monkeypatch.delenv("CRDT_CAD_FREE_PLAN_MAX_MEMBERS", raising=False)
     yield fresh
 
 

@@ -85,6 +85,14 @@ accounts = [
     # authlib's Starlette OAuth client uses httpx for token/userinfo calls.
     "httpx>=0.27",
 ]
+billing = [
+    # Part 6 P6: org subscriptions (Stripe Checkout + billing portal +
+    # webhook-driven status sync), test-mode only in this repo -- see
+    # docs/configuration.md. Lazily imported (crdt_cad.server.billing),
+    # so a deployment that never sets CRDT_CAD_STRIPE_SECRET_KEY doesn't
+    # need this extra installed at all.
+    "stripe>=10.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -97,6 +105,7 @@ dev = [
     "redis>=5.0",
     "requests>=2.31",
     "fast_simplification>=0.1.7",
+    "stripe>=10.0",
 ]
 
 [tool.pytest.ini_options]

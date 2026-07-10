@@ -81,6 +81,20 @@ activity feed activate automatically under `CRDT_CAD_AUTH_MODE=accounts`
 and are read through `GET /api/notifications` and
 `GET /api/{rooms,mesh}/{room_id}/activity`.
 
+| Variable | Default | Effect |
+|---|---|---|
+| `CRDT_CAD_STRIPE_SECRET_KEY` | unset (billing off) | Stripe secret API key -- the single switch for Part 6 Phase P6 (org subscriptions). Unset: `/api/orgs/{id}/billing*` all 404 and every org's `billing_plan` stays `"free"` with no seat cap enforced, byte-for-byte the same as before this phase existed. Needs the `billing` extra (`pip install crdt-cad[billing]`). Use a Stripe **test-mode** key (`sk_test_...`) unless you intend to charge real cards. |
+| `CRDT_CAD_STRIPE_WEBHOOK_SECRET` | unset | Verifies the signature on `POST /api/billing/webhook` (from your Stripe dashboard's webhook endpoint config). This is the only thing standing between that endpoint and a forged "you're subscribed now" event -- required for billing to actually sync plan/status, even though checkout itself would still redirect without it. |
+| `CRDT_CAD_STRIPE_PRICE_ID` | unset | The Stripe Price id `POST /api/orgs/{id}/billing/checkout` checks an org out into (one plan, subscription mode). |
+| `CRDT_CAD_FREE_PLAN_MAX_MEMBERS` | `3` | Active-member cap for an org still on the free plan, enforced on `POST /api/orgs/{id}/invite`. Only checked at all when `CRDT_CAD_STRIPE_SECRET_KEY` is set -- an org's `billing_plan` field exists regardless of billing being enabled, but the cap it implies is deliberately inert until there's a real upgrade path in front of it. |
+
+Subscribe your Stripe webhook endpoint to at least `checkout.session.completed`,
+`customer.subscription.updated`, and `customer.subscription.deleted` --
+those three are what keep an org's `billing_plan`/`billing_status`
+truthful. An org's Stripe customer is created lazily on its first
+checkout and reused on every subsequent one (a canceled-then-
+resubscribed org never accumulates duplicate Stripe customers).
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

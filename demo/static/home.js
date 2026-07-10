@@ -554,8 +554,57 @@ async function loadOrgDetail() {
     document.getElementById("orgAllowEditorLinks").checked = org.allowed_share_link_roles.includes("editor");
     await loadOrgSSO();
   }
+  await loadOrgBilling(isAdmin);
   renderOrgMembers(org.members, isAdmin);
 }
+
+// -- billing (Part 6 P6) ----------------------------------------------------
+
+async function loadOrgBilling(isAdmin) {
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/billing`);
+  if (!resp.ok) return;
+  const billing = await resp.json();
+  const section = document.getElementById("orgBillingSection");
+  if (!billing.billing_enabled) {
+    // No CRDT_CAD_STRIPE_SECRET_KEY on this server -- billing is a
+    // no-op feature here, so don't show an empty/dead section at all.
+    section.style.display = "none";
+    return;
+  }
+  section.style.display = "";
+  const statusEl = document.getElementById("orgBillingStatus");
+  statusEl.textContent =
+    billing.plan === "pro"
+      ? `(Pro${billing.status ? " -- " + billing.status : ""} -- unlimited members)`
+      : `(Free plan -- up to ${billing.seat_limit} members)`;
+
+  const actions = document.getElementById("orgBillingActions");
+  actions.style.display = isAdmin ? "flex" : "none";
+  document.getElementById("orgUpgradeBtn").style.display = billing.plan === "pro" ? "none" : "";
+  document.getElementById("orgManageBillingBtn").style.display = billing.has_customer ? "" : "none";
+}
+
+document.getElementById("orgUpgradeBtn").onclick = async () => {
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/billing/checkout`, { method: "POST" });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not start checkout: ${detail}`, "error");
+    return;
+  }
+  const { checkout_url } = await resp.json();
+  location.href = checkout_url;
+};
+
+document.getElementById("orgManageBillingBtn").onclick = async () => {
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/billing/portal`, { method: "POST" });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not open billing portal: ${detail}`, "error");
+    return;
+  }
+  const { portal_url } = await resp.json();
+  location.href = portal_url;
+};
 
 async function loadOrgSSO() {
   const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/sso`);

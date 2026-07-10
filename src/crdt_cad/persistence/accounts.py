@@ -242,6 +242,24 @@ class AccountStore:
         through that org's own SSO, not a magic link or generic OAuth."""
         raise NotImplementedError
 
+    # -- billing (Part 6, P6) -----------------------------------------------------
+
+    def set_org_billing(
+        self, org_id: str, customer_id: Optional[str] = None, subscription_id: Optional[str] = None,
+        plan: Optional[str] = None, status: Optional[str] = None,
+    ) -> bool:
+        """Updates only the fields given (None = leave unchanged) --
+        unlike :meth:`set_org_sso`, there's no "clear everything" call
+        here since a canceled subscription still keeps its Stripe
+        customer id (reused if the org resubscribes later). Returns
+        False if the org doesn't exist."""
+        raise NotImplementedError
+
+    def get_org_by_billing_customer_id(self, customer_id: str) -> Optional[dict]:
+        """Reverse lookup for webhook handling: a Stripe event carries a
+        customer id, not an org id."""
+        raise NotImplementedError
+
     # -- per-account quotas (Part 6, P4) ---------------------------------------
 
     def increment_quota_usage(self, user_id: str, kind: str, day: str) -> int:
@@ -478,6 +496,7 @@ class InMemoryAccountStore(AccountStore):
             "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": time.time(),
             "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
             "sso_issuer": None, "sso_client_id": None, "sso_client_secret": None, "sso_domain": None,
+            "billing_customer_id": None, "billing_subscription_id": None, "billing_plan": "free", "billing_status": None,
         }
         self._orgs[org_id] = org
         self._org_members[(org_id, created_by_user_id)] = {"role": "admin", "status": "active"}
@@ -585,6 +604,31 @@ class InMemoryAccountStore(AccountStore):
                 org.get("sso_domain") == domain
                 and org.get("sso_issuer") and org.get("sso_client_id") and org.get("sso_client_secret")
             ):
+                return dict(org)
+        return None
+
+    # -- billing ----------------------------------------------------------------
+
+    def set_org_billing(
+        self, org_id: str, customer_id: Optional[str] = None, subscription_id: Optional[str] = None,
+        plan: Optional[str] = None, status: Optional[str] = None,
+    ) -> bool:
+        org = self._orgs.get(org_id)
+        if not org:
+            return False
+        if customer_id is not None:
+            org["billing_customer_id"] = customer_id
+        if subscription_id is not None:
+            org["billing_subscription_id"] = subscription_id
+        if plan is not None:
+            org["billing_plan"] = plan
+        if status is not None:
+            org["billing_status"] = status
+        return True
+
+    def get_org_by_billing_customer_id(self, customer_id: str) -> Optional[dict]:
+        for org in self._orgs.values():
+            if org.get("billing_customer_id") == customer_id:
                 return dict(org)
         return None
 
@@ -819,6 +863,15 @@ class SQLiteAccountStore(AccountStore):
                     conn.execute(f"ALTER TABLE orgs ADD COLUMN {column} TEXT")
                 except sqlite3.OperationalError:
                     pass  # already migrated
+            for column in ("billing_customer_id", "billing_subscription_id", "billing_status"):
+                try:
+                    conn.execute(f"ALTER TABLE orgs ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError:
+                    pass  # already migrated
+            try:
+                conn.execute("ALTER TABLE orgs ADD COLUMN billing_plan TEXT NOT NULL DEFAULT 'free'")
+            except sqlite3.OperationalError:
+                pass  # already migrated
             conn.execute(_ORG_MEMBERS_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id)")
             conn.execute(_QUOTA_USAGE_DDL_SQLITE)
@@ -1018,6 +1071,12 @@ class SQLiteAccountStore(AccountStore):
 
     # -- organizations & teams -----------------------------------------------
 
+    _ORG_COLUMNS = (
+        "org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+        "sso_issuer, sso_client_id, sso_client_secret, sso_domain, "
+        "billing_customer_id, billing_subscription_id, billing_plan, billing_status"
+    )
+
     @staticmethod
     def _org_row_to_dict(row) -> dict:
         return {
@@ -1027,6 +1086,10 @@ class SQLiteAccountStore(AccountStore):
             "sso_client_id": row[7] if len(row) > 7 else None,
             "sso_client_secret": row[8] if len(row) > 8 else None,
             "sso_domain": row[9] if len(row) > 9 else None,
+            "billing_customer_id": row[10] if len(row) > 10 else None,
+            "billing_subscription_id": row[11] if len(row) > 11 else None,
+            "billing_plan": (row[12] if len(row) > 12 and row[12] else "free"),
+            "billing_status": row[13] if len(row) > 13 else None,
         }
 
     def create_org(self, name: str, created_by_user_id: str) -> dict:
@@ -1046,13 +1109,13 @@ class SQLiteAccountStore(AccountStore):
             "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": created,
             "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
             "sso_issuer": None, "sso_client_id": None, "sso_client_secret": None, "sso_domain": None,
+            "billing_customer_id": None, "billing_subscription_id": None, "billing_plan": "free", "billing_status": None,
         }
 
     def get_org(self, org_id: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
-                "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs WHERE org_id = ?",
+                f"SELECT {self._ORG_COLUMNS} FROM orgs WHERE org_id = ?",
                 (org_id,),
             ).fetchone()
             return self._org_row_to_dict(row) if row else None
@@ -1170,11 +1233,43 @@ class SQLiteAccountStore(AccountStore):
     def get_org_by_sso_domain(self, domain: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
-                "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs "
+                f"SELECT {self._ORG_COLUMNS} FROM orgs "
                 "WHERE sso_domain = ? AND sso_issuer IS NOT NULL AND sso_client_id IS NOT NULL "
                 "AND sso_client_secret IS NOT NULL",
                 (domain.strip().lower(),),
+            ).fetchone()
+            return self._org_row_to_dict(row) if row else None
+
+    # -- billing ------------------------------------------------------------------
+
+    def set_org_billing(
+        self, org_id: str, customer_id: Optional[str] = None, subscription_id: Optional[str] = None,
+        plan: Optional[str] = None, status: Optional[str] = None,
+    ) -> bool:
+        sets, params = [], []
+        if customer_id is not None:
+            sets.append("billing_customer_id = ?")
+            params.append(customer_id)
+        if subscription_id is not None:
+            sets.append("billing_subscription_id = ?")
+            params.append(subscription_id)
+        if plan is not None:
+            sets.append("billing_plan = ?")
+            params.append(plan)
+        if status is not None:
+            sets.append("billing_status = ?")
+            params.append(status)
+        if not sets:
+            return self.get_org(org_id) is not None
+        params.append(org_id)
+        with self._connect() as conn:
+            cur = conn.execute(f"UPDATE orgs SET {', '.join(sets)} WHERE org_id = ?", params)
+            return cur.rowcount > 0
+
+    def get_org_by_billing_customer_id(self, customer_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._ORG_COLUMNS} FROM orgs WHERE billing_customer_id = ?", (customer_id,)
             ).fetchone()
             return self._org_row_to_dict(row) if row else None
 
@@ -1203,10 +1298,7 @@ class SQLiteAccountStore(AccountStore):
 
     def list_all_orgs(self) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
-                "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs"
-            ).fetchall()
+            rows = conn.execute(f"SELECT {self._ORG_COLUMNS} FROM orgs").fetchall()
             return [self._org_row_to_dict(r) for r in rows]
 
     def list_all_owned_rooms(self) -> list[dict]:
@@ -1427,6 +1519,12 @@ class PostgresAccountStore(AccountStore):
                 # Part 6 P4 added these columns after P3 shipped.
                 for column in ("sso_issuer", "sso_client_id", "sso_client_secret", "sso_domain"):
                     await conn.execute(f"ALTER TABLE orgs ADD COLUMN IF NOT EXISTS {column} TEXT")
+                # Part 6 P6 added these after P4 shipped.
+                for column in ("billing_customer_id", "billing_subscription_id", "billing_status"):
+                    await conn.execute(f"ALTER TABLE orgs ADD COLUMN IF NOT EXISTS {column} TEXT")
+                await conn.execute(
+                    "ALTER TABLE orgs ADD COLUMN IF NOT EXISTS billing_plan TEXT NOT NULL DEFAULT 'free'"
+                )
                 await conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS org_members (
@@ -1760,14 +1858,20 @@ class PostgresAccountStore(AccountStore):
             "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": created,
             "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
             "sso_issuer": None, "sso_client_id": None, "sso_client_secret": None, "sso_domain": None,
+            "billing_customer_id": None, "billing_subscription_id": None, "billing_plan": "free", "billing_status": None,
         }
+
+    _ORG_COLUMNS = (
+        "org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+        "sso_issuer, sso_client_id, sso_client_secret, sso_domain, "
+        "billing_customer_id, billing_subscription_id, billing_plan, billing_status"
+    )
 
     def get_org(self, org_id: str) -> Optional[dict]:
         async def _go():
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
-                    "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs WHERE org_id = $1",
+                    f"SELECT {self._ORG_COLUMNS} FROM orgs WHERE org_id = $1",
                     org_id,
                 )
                 return self._org_row_to_dict(row) if row else None
@@ -1926,11 +2030,52 @@ class PostgresAccountStore(AccountStore):
         async def _go():
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
-                    "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs "
+                    f"SELECT {self._ORG_COLUMNS} FROM orgs "
                     "WHERE sso_domain = $1 AND sso_issuer IS NOT NULL AND sso_client_id IS NOT NULL "
                     "AND sso_client_secret IS NOT NULL",
                     domain.strip().lower(),
+                )
+                return self._org_row_to_dict(row) if row else None
+
+        return self._call(_go())
+
+    # -- billing ------------------------------------------------------------------
+
+    def set_org_billing(
+        self, org_id: str, customer_id: Optional[str] = None, subscription_id: Optional[str] = None,
+        plan: Optional[str] = None, status: Optional[str] = None,
+    ) -> bool:
+        async def _go():
+            sets, params = [], []
+            if customer_id is not None:
+                params.append(customer_id)
+                sets.append(f"billing_customer_id = ${len(params)}")
+            if subscription_id is not None:
+                params.append(subscription_id)
+                sets.append(f"billing_subscription_id = ${len(params)}")
+            if plan is not None:
+                params.append(plan)
+                sets.append(f"billing_plan = ${len(params)}")
+            if status is not None:
+                params.append(status)
+                sets.append(f"billing_status = ${len(params)}")
+            async with self._pool.acquire() as conn:
+                if not sets:
+                    row = await conn.fetchrow("SELECT 1 FROM orgs WHERE org_id = $1", org_id)
+                    return row is not None
+                params.append(org_id)
+                result = await conn.execute(
+                    f"UPDATE orgs SET {', '.join(sets)} WHERE org_id = ${len(params)}", *params
+                )
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    def get_org_by_billing_customer_id(self, customer_id: str) -> Optional[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    f"SELECT {self._ORG_COLUMNS} FROM orgs WHERE billing_customer_id = $1", customer_id,
                 )
                 return self._org_row_to_dict(row) if row else None
 
@@ -1969,10 +2114,7 @@ class PostgresAccountStore(AccountStore):
     def list_all_orgs(self) -> list[dict]:
         async def _go():
             async with self._pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
-                    "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs"
-                )
+                rows = await conn.fetch(f"SELECT {self._ORG_COLUMNS} FROM orgs")
                 return [self._org_row_to_dict(r) for r in rows]
 
         return self._call(_go())

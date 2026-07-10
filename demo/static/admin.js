@@ -93,6 +93,7 @@ function renderOrgs(orgs) {
       <td>${escapeHtml(o.name)}</td>
       <td style="font-family:var(--font-mono);color:var(--text-secondary)">${escapeHtml(o.org_id)}</td>
       <td>${escapeHtml(o.default_visibility)}</td>
+      <td>${escapeHtml(o.billing_plan || "free")}${o.billing_status ? " (" + escapeHtml(o.billing_status) + ")" : ""}</td>
     `;
     body.appendChild(tr);
   }

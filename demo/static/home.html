@@ -156,6 +156,13 @@
               <p class="empty-hint">Once configured, any sign-in attempt from this domain is redirected to your identity provider instead of a magic link or generic OAuth.</p>
             </div>
           </div>
+          <div id="orgBillingSection" style="display:none">
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:6px">Billing <span id="orgBillingStatus" class="room-card-meta"></span></div>
+            <div id="orgBillingActions" class="tool-row" style="margin-bottom:14px;display:none">
+              <button id="orgUpgradeBtn">Upgrade to Pro</button>
+              <button id="orgManageBillingBtn" class="ghost-btn">Manage billing</button>
+            </div>
+          </div>
           <div style="font-size:13px;color:var(--text-secondary);margin-bottom:6px">Members</div>
           <div id="orgMembersList" style="margin-bottom:10px"></div>
           <div id="orgInviteRow" class="tool-row" style="display:none">
