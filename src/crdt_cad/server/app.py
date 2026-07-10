@@ -105,6 +105,7 @@ from crdt_cad.export.stl_export import mesh_to_stl
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 from crdt_cad.geometry.constraints import Constraint, Sketch
 from crdt_cad.geometry.mesh_validity import check_mesh_validity
+from crdt_cad.geometry.modify import OffsetError, offset_path
 from crdt_cad.geometry.validity import GeometryError, validate_new_point
 from crdt_cad.persistence.store import DocumentStore, PostgresStore, SQLiteStore
 from crdt_cad.server import auth
@@ -2287,6 +2288,31 @@ async def solve_endpoint(req: SolveRequest) -> SolveResponse:
         iterations=result.iterations,
         residual_norm=result.residual_norm,
     )
+
+
+# ---------------------------------------------------------------------------
+# Path offset (REST, stateless -- Part 7 C1, same "needs a real numerical
+# library" reasoning as the solver above)
+# ---------------------------------------------------------------------------
+
+
+class OffsetRequest(BaseModel):
+    points: list[tuple[float, float]]
+    distance: float
+    closed: bool = False
+
+
+class OffsetResponse(BaseModel):
+    points: list[tuple[float, float]]
+
+
+@app.post("/api/geometry/offset", response_model=OffsetResponse)
+async def offset_endpoint(req: OffsetRequest) -> OffsetResponse:
+    try:
+        result = await asyncio.to_thread(offset_path, req.points, req.distance, req.closed)
+    except OffsetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OffsetResponse(points=result)
 
 
 # ---------------------------------------------------------------------------

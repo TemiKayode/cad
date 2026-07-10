@@ -2855,6 +2855,79 @@ function arrayCircular(count, totalAngleDeg) {
   });
 }
 
+/** World-space point list for any path (freehand/polygon, or a shape
+ * primitive converted to an equivalent polygon) -- the shared input
+ * `/api/geometry/offset` needs, since shapely works in plain points,
+ * not shape parameters. Circle/ellipse become a 64-sided approximation
+ * (plenty for offsetting -- this is a visual/manufacturing tolerance
+ * question, not a precision one). Returns null for a shape offset
+ * doesn't meaningfully apply to (arc, text). */
+function pathAsWorldPolygon(pathId) {
+  const props = state.pathProps.get(pathId) || {};
+  const toWorld = (p) => applyPathTransform(pathId, props, p);
+  if (!props.shape) return liveValues(state.pathNodes.get(pathId)).map(toWorld);
+  if (props.shape === "line") return [toWorld([props.x1, props.y1]), toWorld([props.x2, props.y2])];
+  if (props.shape === "rect") {
+    return [
+      [props.x, props.y], [props.x + props.w, props.y],
+      [props.x + props.w, props.y + props.h], [props.x, props.y + props.h],
+    ].map(toWorld);
+  }
+  if (props.shape === "circle" || props.shape === "ellipse") {
+    const rx = props.shape === "circle" ? props.r : props.rx;
+    const ry = props.shape === "circle" ? props.r : props.ry;
+    const pts = [];
+    for (let i = 0; i < 64; i++) {
+      const a = (2 * Math.PI * i) / 64;
+      pts.push([props.cx + rx * Math.cos(a), props.cy + ry * Math.sin(a)]);
+    }
+    return pts.map(toWorld);
+  }
+  return null; // arc, text: offset doesn't meaningfully apply
+}
+
+/** Offsets the single selected path by `distance` (server-computed via
+ * shapely -- see geometry/modify.py's docstring for why this one C1
+ * tool needs a real numerical library instead of client-side math) and
+ * creates a brand new freehand path from the result, identity
+ * transform, geometry baked directly into its points -- non-destructive,
+ * same "create a copy" pattern mirror/array/duplicate already use. */
+async function offsetSelectedPath(distance, closed) {
+  const ids = [...ui.selectedPaths];
+  if (ids.length !== 1) return;
+  const pathId = ids[0];
+  const pts = pathAsWorldPolygon(pathId);
+  if (!pts || pts.length < 2) {
+    showToast("This shape can't be offset", "error");
+    return;
+  }
+  const props = state.pathProps.get(pathId) || {};
+  let resp;
+  try {
+    resp = await fetch("/api/geometry/offset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ points: pts, distance, closed }),
+    });
+  } catch (err) {
+    showToast(`Could not reach the server: ${err.message}`, "error");
+    return;
+  }
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not offset: ${detail}`, "error");
+    return;
+  }
+  const { points: offsetPts } = await resp.json();
+  const { id } = addPath(
+    props.layer_id || ui.activeLayer, offsetPts, props.color || actorColor, props.stroke_width || 2.5,
+    closed ? { fill: props.fill && props.fill !== "none" ? props.fill : null, fill_opacity: props.fill_opacity ?? 1 } : {},
+  );
+  ui.selectedPaths = new Set([id]);
+  renderAll();
+  showUndoToast("Path offset", () => { removePath(id); renderAll(); });
+}
+
 function deleteSelection() {
   const ids = [...ui.selectedPaths];
   if (!ids.length) return;
@@ -3943,6 +4016,16 @@ function renderSelectionPanel() {
   const ungroupButton = props.group_id
     ? '<button style="width:100%;margin-top:4px" id="selUngroup">Ungroup</button>'
     : "";
+  const canOffset = props.shape !== "arc" && props.shape !== "text";
+  const offsetHtml = canOffset
+    ? `
+    <div class="field-row" style="margin-top:6px"><label>Offset</label></div>
+    <div class="tool-row">
+      <input id="selOffsetDist" type="number" step="1" value="10" style="width:60px" title="Distance (+ outward / - inward)" />
+      <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input id="selOffsetClosed" type="checkbox" ${props.shape === "rect" || props.shape === "circle" || props.shape === "ellipse" || (props.fill && props.fill !== "none") ? "checked" : ""}/>Closed</label>
+      <button id="selOffsetApply">Apply</button>
+    </div>`
+    : "";
   panel.innerHTML = `
     <div class="field-row"><label>Color</label><input id="selColor" type="text" value="${escapeHtml(props.color || "#ffffff")}" style="width:90px"/></div>
     ${typeSpecificFields}
@@ -3951,9 +4034,17 @@ function renderSelectionPanel() {
     <button style="width:100%;margin-top:4px" id="selDuplicate">Duplicate (Ctrl/Cmd+D)</button>
     ${ungroupButton}
     ${modifyPanelHtml("sel")}
+    ${offsetHtml}
     <button class="danger" id="selDelete" style="width:100%;margin-top:6px">Delete path</button>
   `;
   wireModifyPanel("sel");
+  if (canOffset) {
+    document.getElementById("selOffsetApply").onclick = () => {
+      const distance = parseFloat(document.getElementById("selOffsetDist").value) || 0;
+      const closed = document.getElementById("selOffsetClosed").checked;
+      offsetSelectedPath(distance, closed);
+    };
+  }
   document.getElementById("selColor").onchange = (e) => setPathProp(pathId, "color", e.target.value);
   if (isText) {
     document.getElementById("selContent").onchange = (e) => setPathProp(pathId, "content", e.target.value);

@@ -219,6 +219,73 @@ def test_solve_endpoint_unknown_kind_returns_400():
     assert resp.status_code == 400
 
 
+# -- path offset (Part 7 C1) ------------------------------------------------------
+
+
+def test_offset_endpoint_closed_polygon_outward():
+    client = _client()
+    resp = client.post(
+        "/api/geometry/offset",
+        json={"points": [[0, 0], [10, 0], [10, 10], [0, 10]], "distance": 2, "closed": True},
+    )
+    assert resp.status_code == 200, resp.text
+    pts = resp.json()["points"]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    assert min(xs) == -2 and max(xs) == 12
+    assert min(ys) == -2 and max(ys) == 12
+
+
+def test_offset_endpoint_closed_polygon_inward():
+    client = _client()
+    resp = client.post(
+        "/api/geometry/offset",
+        json={"points": [[0, 0], [10, 0], [10, 10], [0, 10]], "distance": -2, "closed": True},
+    )
+    assert resp.status_code == 200, resp.text
+    pts = resp.json()["points"]
+    xs = [p[0] for p in pts]
+    assert min(xs) == 2 and max(xs) == 8
+
+
+def test_offset_endpoint_open_polyline():
+    client = _client()
+    resp = client.post(
+        "/api/geometry/offset",
+        json={"points": [[0, 0], [10, 0], [10, 10]], "distance": 2, "closed": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["points"]) == 3
+
+
+def test_offset_endpoint_concave_polygon_does_not_self_intersect():
+    """The case a naive "shift every edge outward" offset gets wrong --
+    an L-shaped polygon's inner (concave) corner needs a real geometry
+    library, not hand-rolled edge-shifting, to offset without crossing
+    itself."""
+    client = _client()
+    lshape = [[0, 0], [10, 0], [10, 5], [5, 5], [5, 10], [0, 10]]
+    resp = client.post("/api/geometry/offset", json={"points": lshape, "distance": 1, "closed": True})
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["points"]) == len(lshape)
+
+
+def test_offset_endpoint_collapsing_inward_offset_returns_400():
+    client = _client()
+    resp = client.post(
+        "/api/geometry/offset",
+        json={"points": [[0, 0], [10, 0], [10, 10], [0, 10]], "distance": -10, "closed": True},
+    )
+    assert resp.status_code == 400
+    assert "collapses" in resp.json()["detail"]
+
+
+def test_offset_endpoint_too_few_points_returns_400():
+    client = _client()
+    resp = client.post("/api/geometry/offset", json={"points": [[0, 0]], "distance": 2, "closed": False})
+    assert resp.status_code == 400
+
+
 # -- geometry validity gate -----------------------------------------------------
 
 
