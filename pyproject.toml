@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Real-time collaborative CAD engine built on pure-Python CRDTs"
 readme = "README.md"
 license = { file = "LICENSE" }
+authors = [
+    { name = "Temitayo Kayode" },
+]
 requires-python = ">=3.11"
 keywords = [
     "cad",
@@ -21,7 +24,7 @@ keywords = [
     "text-to-3d",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
@@ -53,6 +56,10 @@ dependencies = [
     "manifold3d>=3.0",
     "shapely>=2.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/TemiKayode/cad"
+Issues = "https://github.com/TemiKayode/cad/issues"
 
 [project.optional-dependencies]
 postgres = [

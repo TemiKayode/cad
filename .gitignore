@@ -8,3 +8,7 @@ __pycache__/
 *.log
 node_modules/
 data/
+.env
+.env.*
+.vscode/
+.idea/
