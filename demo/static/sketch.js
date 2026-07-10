@@ -2704,6 +2704,157 @@ function duplicateSelection() {
   renderAll();
 }
 
+// -- modify tools: mirror, arrays, offset (Part 7 C1) ----------------------------
+//
+// Scoped deliberately: mirror reflects across a horizontal/vertical axis
+// through the selection's own center (not an arbitrary user-picked mirror
+// line -- the common case in practice, and it needs no new canvas-click
+// tool state); circular array likewise pivots around the selection's own
+// center rather than an externally-picked point. Both build on the
+// existing {tx,ty,rotation,scale} transform system clonePath already
+// uses, so a transformed source path arrays/mirrors correctly too. Arc
+// shapes are excluded from mirror -- flipping start_angle/end_angle
+// correctly needs the arc-angle convention formalized (see the C2 "first-
+// class arcs" phase), so an arc is left out rather than mirrored wrong.
+
+function reflectPointAxis([x, y], center, axis) {
+  return axis === "horizontal" ? [x, 2 * center[1] - y] : [2 * center[0] - x, y];
+}
+
+function mirrorPath(pathId, axis, center) {
+  const props = state.pathProps.get(pathId) || {};
+  const isFreehand = !props.shape;
+  const extraProps = {};
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "layer_id" || k === "color" || k === "stroke_width" || k.startsWith("curve:") || k === "transform") continue;
+    extraProps[k] = v;
+  }
+  if (isFreehand) {
+    const oldEntries = liveEntries(state.pathNodes.get(pathId));
+    const pts = oldEntries.map((e) => reflectPointAxis(e.v, center, axis));
+    const { id, pointIds } = addPath(props.layer_id || ui.activeLayer, pts, props.color || actorColor, props.stroke_width || 2.5, extraProps);
+    for (let i = 0; i < oldEntries.length; i++) {
+      const seg = props[curvePropKey(oldEntries[i].id)];
+      if (!seg) continue;
+      const mirroredSeg = { ...seg };
+      if (seg.kind === "cubic") {
+        mirroredSeg.c1 = reflectPointAxis(seg.c1, center, axis);
+        mirroredSeg.c2 = reflectPointAxis(seg.c2, center, axis);
+      } else if (seg.kind === "quad") {
+        mirroredSeg.c = reflectPointAxis(seg.c, center, axis);
+      }
+      setPathProp(id, curvePropKey(pointIds[i]), mirroredSeg);
+    }
+    return id;
+  }
+  if (props.shape === "arc") return null; // see module comment above
+  if (props.shape === "line") {
+    const [x1, y1] = reflectPointAxis([props.x1, props.y1], center, axis);
+    const [x2, y2] = reflectPointAxis([props.x2, props.y2], center, axis);
+    Object.assign(extraProps, { x1, y1, x2, y2 });
+  } else if (props.shape === "rect") {
+    const [cx, cy] = reflectPointAxis([props.x + props.w / 2, props.y + props.h / 2], center, axis);
+    Object.assign(extraProps, { x: cx - props.w / 2, y: cy - props.h / 2, w: props.w, h: props.h });
+  } else if (props.shape === "circle" || props.shape === "ellipse") {
+    const [cx, cy] = reflectPointAxis([props.cx, props.cy], center, axis);
+    Object.assign(extraProps, { cx, cy });
+  } else if (props.shape === "text") {
+    const [x, y] = reflectPointAxis([props.x, props.y], center, axis);
+    Object.assign(extraProps, { x, y });
+  }
+  const { id } = addPath(props.layer_id || ui.activeLayer, [], props.color || actorColor, props.stroke_width || 2.5, extraProps);
+  return id;
+}
+
+/** The shared pivot every path in the selection mirrors/orbits around
+ * -- the average of each path's own base-space center. A symmetric
+ * shape (rect/circle/ellipse) mirrored *by itself* around its own
+ * center is correctly a no-op (it maps exactly onto itself either
+ * way); this shared, selection-wide center is what makes mirroring or
+ * arraying a *group* actually move things relative to each other. */
+function selectionPivot(ids) {
+  const centers = ids.map((id) => pathBaseCenter(id, state.pathProps.get(id) || {}));
+  return [
+    centers.reduce((s, c) => s + c[0], 0) / centers.length,
+    centers.reduce((s, c) => s + c[1], 0) / centers.length,
+  ];
+}
+
+function mirrorSelection(axis) {
+  const ids = [...ui.selectedPaths];
+  if (!ids.length) return;
+  const center = selectionPivot(ids);
+  const newIds = ids.map((id) => mirrorPath(id, axis, center)).filter((id) => id !== null);
+  if (newIds.length < ids.length) showToast("Arc shapes can't be mirrored yet -- skipped", "info");
+  if (!newIds.length) return;
+  ui.selectedPaths = new Set(newIds);
+  renderAll();
+  showUndoToast(newIds.length === 1 ? "Path mirrored" : `${newIds.length} paths mirrored`, () => {
+    for (const id of newIds) removePath(id);
+    renderAll();
+  });
+}
+
+/** Linear array: `count` total copies (including the originals) spaced
+ * `dx`,`dy` apart -- reuses clonePath exactly like duplicateSelection,
+ * just repeated with a growing offset. */
+function arrayLinear(count, dx, dy) {
+  const ids = [...ui.selectedPaths];
+  if (!ids.length || count < 2) return;
+  const newIds = [];
+  for (let k = 1; k < count; k++) {
+    for (const id of ids) newIds.push(clonePath(id, dx * k, dy * k));
+  }
+  ui.selectedPaths = new Set(newIds);
+  renderAll();
+  showUndoToast(`Arrayed to ${count} copies`, () => {
+    for (const id of newIds) removePath(id);
+    renderAll();
+  });
+}
+
+/** Circular/polar array: `count` total copies spaced evenly across
+ * `totalAngleDeg` (360 for a full ring), pivoting around the *selection's
+ * own* center -- each copy both orbits that center and rotates to match
+ * its position, the standard CAD polar-array look. Built directly on the
+ * `{tx,ty,rotation,scale}` transform model applyPathTransform already
+ * defines: a path's world-space center is exactly `pathBaseCenter(...) +
+ * (t.tx, t.ty)` (rotating/scaling a point *at* the pivot moves it by
+ * zero), so orbiting it is just rotating that sum around the array
+ * center and re-deriving tx/ty from the result. */
+function arrayCircular(count, totalAngleDeg) {
+  const ids = [...ui.selectedPaths];
+  if (!ids.length || count < 2) return;
+  const arrayCenter = selectionPivot(ids);
+  const step = totalAngleDeg / count;
+  const newIds = [];
+  for (let k = 1; k < count; k++) {
+    const angle = step * k;
+    const rad = (angle * Math.PI) / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    for (const id of ids) {
+      const props = state.pathProps.get(id) || {};
+      const t = getTransform(props);
+      const pivot = pathBaseCenter(id, props);
+      const worldCenter = [pivot[0] + t.tx, pivot[1] + t.ty];
+      const dx = worldCenter[0] - arrayCenter[0], dy = worldCenter[1] - arrayCenter[1];
+      const newWorldCenter = [arrayCenter[0] + dx * cos - dy * sin, arrayCenter[1] + dx * sin + dy * cos];
+      const clonedId = clonePath(id, 0, 0); // start from an identical copy, then override its transform below
+      setPathProp(clonedId, "transform", {
+        ...t, rotation: t.rotation + angle,
+        tx: newWorldCenter[0] - pivot[0], ty: newWorldCenter[1] - pivot[1],
+      });
+      newIds.push(clonedId);
+    }
+  }
+  ui.selectedPaths = new Set(newIds);
+  renderAll();
+  showUndoToast(`Arrayed to ${count} copies`, () => {
+    for (const id of newIds) removePath(id);
+    renderAll();
+  });
+}
+
 function deleteSelection() {
   const ids = [...ui.selectedPaths];
   if (!ids.length) return;
@@ -3685,8 +3836,10 @@ function renderBulkSelectionPanel(panel) {
       <button id="distH" ${count < 3 ? "disabled" : ""}>Horiz.</button>
       <button id="distV" ${count < 3 ? "disabled" : ""}>Vert.</button>
     </div>
+    ${modifyPanelHtml("bulk")}
     <button class="danger" id="bulkDelete" style="width:100%;margin-top:8px">Delete ${count} paths</button>
   `;
+  wireModifyPanel("bulk");
   document.getElementById("bulkDuplicate").onclick = duplicateSelection;
   document.getElementById("bulkDelete").onclick = deleteSelection;
   if (isExactlyOneGroup) {
@@ -3702,6 +3855,52 @@ function renderBulkSelectionPanel(panel) {
   document.getElementById("alignBottom").onclick = () => alignSelection("bottom");
   document.getElementById("distH").onclick = () => distributeSelection("h");
   document.getElementById("distV").onclick = () => distributeSelection("v");
+}
+
+/** Shared "Modify" section markup for both the single- and
+ * multi-selection panels (Part 7 C1: mirror + arrays) -- one definition,
+ * wired identically either way, so it works uniformly on any selection
+ * size. `idPrefix` keeps the two panels' DOM ids from colliding when
+ * both happen to exist at once (they never render simultaneously today,
+ * but this way neither panel's wiring depends on the other never doing
+ * so in the future). */
+function modifyPanelHtml(idPrefix) {
+  return `
+    <div class="field-row" style="margin-top:6px"><label>Mirror</label></div>
+    <div class="tool-row">
+      <button id="${idPrefix}MirrorH" style="flex:1" title="Mirror horizontally">Mirror &harr;</button>
+      <button id="${idPrefix}MirrorV" style="flex:1" title="Mirror vertically">Mirror &updownarrow;</button>
+    </div>
+    <div class="field-row" style="margin-top:6px"><label>Linear array</label></div>
+    <div class="tool-row">
+      <input id="${idPrefix}ArrCount" type="number" min="2" step="1" value="3" style="width:44px" title="Copies" />
+      <input id="${idPrefix}ArrDx" type="number" step="1" value="50" style="width:56px" title="dx" />
+      <input id="${idPrefix}ArrDy" type="number" step="1" value="0" style="width:56px" title="dy" />
+      <button id="${idPrefix}ArrApply">Apply</button>
+    </div>
+    <div class="field-row" style="margin-top:6px"><label>Circular array (around selection center)</label></div>
+    <div class="tool-row">
+      <input id="${idPrefix}ArrCCount" type="number" min="2" step="1" value="6" style="width:44px" title="Copies" />
+      <input id="${idPrefix}ArrCAngle" type="number" step="1" value="360" style="width:56px" title="Total angle" />
+      <button id="${idPrefix}ArrCApply">Apply</button>
+    </div>
+  `;
+}
+
+function wireModifyPanel(idPrefix) {
+  document.getElementById(`${idPrefix}MirrorH`).onclick = () => mirrorSelection("horizontal");
+  document.getElementById(`${idPrefix}MirrorV`).onclick = () => mirrorSelection("vertical");
+  document.getElementById(`${idPrefix}ArrApply`).onclick = () => {
+    const count = parseInt(document.getElementById(`${idPrefix}ArrCount`).value, 10) || 2;
+    const dx = parseFloat(document.getElementById(`${idPrefix}ArrDx`).value) || 0;
+    const dy = parseFloat(document.getElementById(`${idPrefix}ArrDy`).value) || 0;
+    arrayLinear(count, dx, dy);
+  };
+  document.getElementById(`${idPrefix}ArrCApply`).onclick = () => {
+    const count = parseInt(document.getElementById(`${idPrefix}ArrCCount`).value, 10) || 2;
+    const angle = parseFloat(document.getElementById(`${idPrefix}ArrCAngle`).value) || 360;
+    arrayCircular(count, angle);
+  };
 }
 
 function renderSelectionPanel() {
@@ -3751,8 +3950,10 @@ function renderSelectionPanel() {
     <div class="field-row"><label>Scale</label><input id="selScale" type="number" min="0.01" step="0.1" value="${t.scale}" style="width:70px"/></div>
     <button style="width:100%;margin-top:4px" id="selDuplicate">Duplicate (Ctrl/Cmd+D)</button>
     ${ungroupButton}
+    ${modifyPanelHtml("sel")}
     <button class="danger" id="selDelete" style="width:100%;margin-top:6px">Delete path</button>
   `;
+  wireModifyPanel("sel");
   document.getElementById("selColor").onchange = (e) => setPathProp(pathId, "color", e.target.value);
   if (isText) {
     document.getElementById("selContent").onchange = (e) => setPathProp(pathId, "content", e.target.value);
