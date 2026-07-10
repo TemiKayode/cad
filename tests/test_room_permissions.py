@@ -167,7 +167,7 @@ def test_account_role_grant_applies_to_grantee_only(monkeypatch):
 def test_fresh_room_opened_by_signed_in_user_is_claimed(monkeypatch):
     _enable_accounts(monkeypatch)
     client = _client()
-    cookie = _sign_in(client, "alice@example.com")
+    _sign_in(client, "alice@example.com")
     with client.websocket_connect("/ws/mesh/freshroom1") as ws:
         _hello(ws)
         snap = ws.receive_json()
@@ -209,7 +209,7 @@ def test_preexisting_room_is_never_retroactively_claimed(monkeypatch):
 
     _enable_accounts(monkeypatch)
     app_module.mesh_room_manager.rooms.clear()  # simulate a server restart: room reloads from the store
-    cookie = _sign_in(client, "alice@example.com")
+    _sign_in(client, "alice@example.com")
     token = security.mint_room_token("mesh", "oldroom1")  # see freshroom2's comment: CRDT_CAD_SECRET now gates every room
     with client.websocket_connect("/ws/mesh/oldroom1") as ws:
         _hello(ws, token=token)

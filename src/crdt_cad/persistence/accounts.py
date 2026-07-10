@@ -42,6 +42,7 @@ def _user_row_to_dict(row) -> dict:
         "display_name": row[2],
         "avatar_color": row[3],
         "created_at": row[4],
+        "disabled": bool(row[5]) if len(row) > 5 else False,
     }
 
 
@@ -69,6 +70,17 @@ class AccountStore:
     ) -> bool:
         """Updates only the fields given (None = leave unchanged).
         Returns False if the user doesn't exist."""
+        raise NotImplementedError
+
+    def set_user_disabled(self, user_id: str, disabled: bool) -> bool:
+        """Part 6 P4: a disabled account can't sign in (checked at every
+        sign-in completion point) and an existing session stops resolving
+        immediately (checked in ``current_user``). Returns False if the
+        user doesn't exist."""
+        raise NotImplementedError
+
+    def list_all_users(self) -> list[dict]:
+        """Every user, for the admin panel."""
         raise NotImplementedError
 
     # -- sessions ---------------------------------------------------------
@@ -212,6 +224,61 @@ class AccountStore:
         False if the room has no owner yet (nothing to transfer)."""
         raise NotImplementedError
 
+    # -- SSO (Part 6, P4) -----------------------------------------------------
+
+    def set_org_sso(
+        self, org_id: str, issuer: Optional[str], client_id: Optional[str],
+        client_secret: Optional[str], domain: Optional[str],
+    ) -> bool:
+        """Passing all four as None clears SSO configuration entirely.
+        Returns False if the org doesn't exist."""
+        raise NotImplementedError
+
+    def get_org_by_sso_domain(self, domain: str) -> Optional[dict]:
+        """The org whose ``sso_domain`` matches (case-insensitive) and has
+        a fully configured issuer/client, or None -- used to enforce
+        domain capture: an e-mail at a captured domain must sign in
+        through that org's own SSO, not a magic link or generic OAuth."""
+        raise NotImplementedError
+
+    # -- per-account quotas (Part 6, P4) ---------------------------------------
+
+    def increment_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        """Increments and returns the new usage count for
+        ``(user_id, kind, day)`` -- e.g. ``kind="generation"``,
+        ``day="2026-07-10"``. The caller decides what counts as "a day";
+        this just atomically bumps a counter and returns the new total."""
+        raise NotImplementedError
+
+    def get_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        raise NotImplementedError
+
+    # -- admin panel (Part 6, P4) -----------------------------------------------
+
+    def list_all_orgs(self) -> list[dict]:
+        """Every org, for the admin panel."""
+        raise NotImplementedError
+
+    def list_all_owned_rooms(self) -> list[dict]:
+        """Every room with an owner (personal or org), for the admin
+        panel -- ``[{"kind","room_id","owner_user_id","owner_org_id",
+        "visibility"}]``. Ownerless rooms aren't tracked here at all (see
+        the room store's own listing for those)."""
+        raise NotImplementedError
+
+    def admin_claim_room(self, kind: str, room_id: str, owner_user_id: str) -> bool:
+        """Unlike :meth:`claim_room` (first-touch only, private by
+        default), an admin can claim any currently-ownerless room
+        explicitly, defaulting it to ``public`` visibility (an admin
+        claiming an abandoned room isn't making it private by surprise).
+        Returns False if the room already has an owner."""
+        raise NotImplementedError
+
+    def delete_room_ownership(self, kind: str, room_id: str) -> None:
+        """Removes ownership and every grant for a room -- called when
+        an admin deletes the room's content outright."""
+        raise NotImplementedError
+
 
 class InMemoryAccountStore(AccountStore):
     """Non-durable accounts store used in tests."""
@@ -224,6 +291,7 @@ class InMemoryAccountStore(AccountStore):
         self._grants: dict[tuple[str, str, str], str] = {}
         self._orgs: dict[str, dict] = {}
         self._org_members: dict[tuple[str, str], dict] = {}
+        self._quota_usage: dict[tuple[str, str, str], int] = {}
 
     def create_or_get_user(self, email: str, display_name: Optional[str] = None) -> dict:
         email = email.strip().lower()
@@ -235,6 +303,7 @@ class InMemoryAccountStore(AccountStore):
             "display_name": display_name or email.split("@")[0],
             "avatar_color": None,
             "created_at": time.time(),
+            "disabled": False,
         }
         self._users[user["user_id"]] = user
         self._by_email[email] = user["user_id"]
@@ -259,6 +328,16 @@ class InMemoryAccountStore(AccountStore):
         if avatar_color is not None:
             user["avatar_color"] = avatar_color
         return True
+
+    def set_user_disabled(self, user_id: str, disabled: bool) -> bool:
+        user = self._users.get(user_id)
+        if not user:
+            return False
+        user["disabled"] = disabled
+        return True
+
+    def list_all_users(self) -> list[dict]:
+        return [dict(u) for u in self._users.values()]
 
     def create_session(self, token_hash: str, user_id: str, expires_at: float) -> None:
         now = time.time()
@@ -350,6 +429,7 @@ class InMemoryAccountStore(AccountStore):
         org = {
             "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": time.time(),
             "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
+            "sso_issuer": None, "sso_client_id": None, "sso_client_secret": None, "sso_domain": None,
         }
         self._orgs[org_id] = org
         self._org_members[(org_id, created_by_user_id)] = {"role": "admin", "status": "active"}
@@ -435,6 +515,65 @@ class InMemoryAccountStore(AccountStore):
         row["owner_org_id"] = org_id
         return True
 
+    # -- SSO ------------------------------------------------------------------
+
+    def set_org_sso(
+        self, org_id: str, issuer: Optional[str], client_id: Optional[str],
+        client_secret: Optional[str], domain: Optional[str],
+    ) -> bool:
+        org = self._orgs.get(org_id)
+        if not org:
+            return False
+        org["sso_issuer"] = issuer
+        org["sso_client_id"] = client_id
+        org["sso_client_secret"] = client_secret
+        org["sso_domain"] = domain.strip().lower() if domain else None
+        return True
+
+    def get_org_by_sso_domain(self, domain: str) -> Optional[dict]:
+        domain = domain.strip().lower()
+        for org in self._orgs.values():
+            if (
+                org.get("sso_domain") == domain
+                and org.get("sso_issuer") and org.get("sso_client_id") and org.get("sso_client_secret")
+            ):
+                return dict(org)
+        return None
+
+    # -- per-account quotas -----------------------------------------------------
+
+    def increment_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        key = (user_id, kind, day)
+        self._quota_usage[key] = self._quota_usage.get(key, 0) + 1
+        return self._quota_usage[key]
+
+    def get_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        return self._quota_usage.get((user_id, kind, day), 0)
+
+    # -- admin panel --------------------------------------------------------
+
+    def list_all_orgs(self) -> list[dict]:
+        return [dict(o) for o in self._orgs.values()]
+
+    def list_all_owned_rooms(self) -> list[dict]:
+        return [
+            {"kind": k, "room_id": r, "owner_user_id": row["owner_user_id"],
+             "owner_org_id": row.get("owner_org_id"), "visibility": row["visibility"]}
+            for (k, r), row in self._ownership.items()
+        ]
+
+    def admin_claim_room(self, kind: str, room_id: str, owner_user_id: str) -> bool:
+        key = (kind, room_id)
+        if key in self._ownership:
+            return False
+        self._ownership[key] = {"owner_user_id": owner_user_id, "visibility": "public", "owner_org_id": None}
+        return True
+
+    def delete_room_ownership(self, kind: str, room_id: str) -> None:
+        self._ownership.pop((kind, room_id), None)
+        for key in [k for k in self._grants if k[0] == kind and k[1] == room_id]:
+            del self._grants[key]
+
 
 _USERS_DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -499,6 +638,16 @@ CREATE TABLE IF NOT EXISTS org_members (
 )
 """
 
+_QUOTA_USAGE_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS quota_usage (
+    user_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    day TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, kind, day)
+)
+"""
+
 
 class SQLiteAccountStore(AccountStore):
     """Accounts in a SQLite file -- by default the same file as room
@@ -511,6 +660,12 @@ class SQLiteAccountStore(AccountStore):
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute(_USERS_DDL_SQLITE)
+            try:
+                # Part 6 P4 added this column after P1-P3 shipped -- same
+                # idempotent try/except-ALTER dance as owner_org_id below.
+                conn.execute("ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # already migrated
             conn.execute(_SESSIONS_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
             conn.execute(_ROOM_OWNERSHIP_DDL_SQLITE)
@@ -527,8 +682,14 @@ class SQLiteAccountStore(AccountStore):
             conn.execute(_ROOM_GRANTS_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_room_grants_user ON room_grants(user_id)")
             conn.execute(_ORGS_DDL_SQLITE)
+            for column in ("sso_issuer", "sso_client_id", "sso_client_secret", "sso_domain"):
+                try:
+                    conn.execute(f"ALTER TABLE orgs ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError:
+                    pass  # already migrated
             conn.execute(_ORG_MEMBERS_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id)")
+            conn.execute(_QUOTA_USAGE_DDL_SQLITE)
 
     @contextmanager
     def _connect(self):
@@ -545,7 +706,7 @@ class SQLiteAccountStore(AccountStore):
         email = email.strip().lower()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT user_id, email, display_name, avatar_color, created_at FROM users WHERE email = ?",
+                "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users WHERE email = ?",
                 (email,),
             ).fetchone()
             if row:
@@ -563,12 +724,13 @@ class SQLiteAccountStore(AccountStore):
                 "display_name": name,
                 "avatar_color": None,
                 "created_at": created,
+                "disabled": False,
             }
 
     def get_user(self, user_id: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT user_id, email, display_name, avatar_color, created_at FROM users WHERE user_id = ?",
+                "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
             return _user_row_to_dict(row) if row else None
@@ -576,7 +738,7 @@ class SQLiteAccountStore(AccountStore):
     def get_user_by_email(self, email: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT user_id, email, display_name, avatar_color, created_at FROM users WHERE email = ?",
+                "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users WHERE email = ?",
                 (email.strip().lower(),),
             ).fetchone()
             return _user_row_to_dict(row) if row else None
@@ -597,6 +759,18 @@ class SQLiteAccountStore(AccountStore):
         with self._connect() as conn:
             cur = conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE user_id = ?", params)
             return cur.rowcount > 0
+
+    def set_user_disabled(self, user_id: str, disabled: bool) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("UPDATE users SET disabled = ? WHERE user_id = ?", (1 if disabled else 0, user_id))
+            return cur.rowcount > 0
+
+    def list_all_users(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users"
+            ).fetchall()
+            return [_user_row_to_dict(r) for r in rows]
 
     def create_session(self, token_hash: str, user_id: str, expires_at: float) -> None:
         now = time.time()
@@ -711,6 +885,10 @@ class SQLiteAccountStore(AccountStore):
         return {
             "org_id": row[0], "name": row[1], "created_by": row[2], "created_at": row[3],
             "default_visibility": row[4], "allowed_share_link_roles": row[5].split(",") if row[5] else [],
+            "sso_issuer": row[6] if len(row) > 6 else None,
+            "sso_client_id": row[7] if len(row) > 7 else None,
+            "sso_client_secret": row[8] if len(row) > 8 else None,
+            "sso_domain": row[9] if len(row) > 9 else None,
         }
 
     def create_org(self, name: str, created_by_user_id: str) -> dict:
@@ -729,13 +907,14 @@ class SQLiteAccountStore(AccountStore):
         return {
             "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": created,
             "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
+            "sso_issuer": None, "sso_client_id": None, "sso_client_secret": None, "sso_domain": None,
         }
 
     def get_org(self, org_id: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles "
-                "FROM orgs WHERE org_id = ?",
+                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+                "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs WHERE org_id = ?",
                 (org_id,),
             ).fetchone()
             return self._org_row_to_dict(row) if row else None
@@ -836,6 +1015,86 @@ class SQLiteAccountStore(AccountStore):
             )
             return cur.rowcount > 0
 
+    # -- SSO ------------------------------------------------------------------
+
+    def set_org_sso(
+        self, org_id: str, issuer: Optional[str], client_id: Optional[str],
+        client_secret: Optional[str], domain: Optional[str],
+    ) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE orgs SET sso_issuer = ?, sso_client_id = ?, sso_client_secret = ?, sso_domain = ? "
+                "WHERE org_id = ?",
+                (issuer, client_id, client_secret, domain.strip().lower() if domain else None, org_id),
+            )
+            return cur.rowcount > 0
+
+    def get_org_by_sso_domain(self, domain: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+                "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs "
+                "WHERE sso_domain = ? AND sso_issuer IS NOT NULL AND sso_client_id IS NOT NULL "
+                "AND sso_client_secret IS NOT NULL",
+                (domain.strip().lower(),),
+            ).fetchone()
+            return self._org_row_to_dict(row) if row else None
+
+    # -- per-account quotas -----------------------------------------------------
+
+    def increment_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO quota_usage (user_id, kind, day, count) VALUES (?, ?, ?, 1) "
+                "ON CONFLICT (user_id, kind, day) DO UPDATE SET count = count + 1",
+                (user_id, kind, day),
+            )
+            row = conn.execute(
+                "SELECT count FROM quota_usage WHERE user_id = ? AND kind = ? AND day = ?", (user_id, kind, day)
+            ).fetchone()
+            return row[0]
+
+    def get_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT count FROM quota_usage WHERE user_id = ? AND kind = ? AND day = ?", (user_id, kind, day)
+            ).fetchone()
+            return row[0] if row else 0
+
+    # -- admin panel --------------------------------------------------------
+
+    def list_all_orgs(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+                "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs"
+            ).fetchall()
+            return [self._org_row_to_dict(r) for r in rows]
+
+    def list_all_owned_rooms(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, room_id, owner_user_id, owner_org_id, visibility FROM room_ownership"
+            ).fetchall()
+            return [
+                {"kind": r[0], "room_id": r[1], "owner_user_id": r[2], "owner_org_id": r[3], "visibility": r[4]}
+                for r in rows
+            ]
+
+    def admin_claim_room(self, kind: str, room_id: str, owner_user_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO room_ownership (kind, room_id, owner_user_id, visibility, created_at) "
+                "VALUES (?, ?, ?, 'public', ?)",
+                (kind, room_id, owner_user_id, time.time()),
+            )
+            return cur.rowcount > 0
+
+    def delete_room_ownership(self, kind: str, room_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM room_ownership WHERE kind = ? AND room_id = ?", (kind, room_id))
+            conn.execute("DELETE FROM room_grants WHERE kind = ? AND room_id = ?", (kind, room_id))
+
 
 class PostgresAccountStore(AccountStore):
     """Accounts in Postgres, for multi-process deployments (k8s Mode B).
@@ -887,6 +1146,10 @@ class PostgresAccountStore(AccountStore):
                         created_at DOUBLE PRECISION NOT NULL
                     )
                     """
+                )
+                # Part 6 P4 added this column after P1-P3 shipped.
+                await conn.execute(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT FALSE"
                 )
                 await conn.execute(
                     """
@@ -945,6 +1208,9 @@ class PostgresAccountStore(AccountStore):
                     )
                     """
                 )
+                # Part 6 P4 added these columns after P3 shipped.
+                for column in ("sso_issuer", "sso_client_id", "sso_client_secret", "sso_domain"):
+                    await conn.execute(f"ALTER TABLE orgs ADD COLUMN IF NOT EXISTS {column} TEXT")
                 await conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS org_members (
@@ -957,6 +1223,17 @@ class PostgresAccountStore(AccountStore):
                     """
                 )
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id)")
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS quota_usage (
+                        user_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        day TEXT NOT NULL,
+                        count INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (user_id, kind, day)
+                    )
+                    """
+                )
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1)", self._SCHEMA_LOCK_KEY)
         return pool
@@ -967,7 +1244,7 @@ class PostgresAccountStore(AccountStore):
         async def _go():
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT user_id, email, display_name, avatar_color, created_at FROM users WHERE email = $1",
+                    "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users WHERE email = $1",
                     email,
                 )
                 if row:
@@ -982,7 +1259,7 @@ class PostgresAccountStore(AccountStore):
                     INSERT INTO users (user_id, email, display_name, avatar_color, created_at)
                     VALUES ($1, $2, $3, NULL, $4)
                     ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-                    RETURNING user_id, email, display_name, avatar_color, created_at
+                    RETURNING user_id, email, display_name, avatar_color, created_at, disabled
                     """,
                     user_id, email, name, created,
                 )
@@ -994,7 +1271,7 @@ class PostgresAccountStore(AccountStore):
         async def _go():
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT user_id, email, display_name, avatar_color, created_at FROM users WHERE user_id = $1",
+                    "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users WHERE user_id = $1",
                     user_id,
                 )
                 return _user_row_to_dict(row) if row else None
@@ -1005,7 +1282,7 @@ class PostgresAccountStore(AccountStore):
         async def _go():
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT user_id, email, display_name, avatar_color, created_at FROM users WHERE email = $1",
+                    "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users WHERE email = $1",
                     email.strip().lower(),
                 )
                 return _user_row_to_dict(row) if row else None
@@ -1032,6 +1309,24 @@ class PostgresAccountStore(AccountStore):
                     f"UPDATE users SET {', '.join(sets)} WHERE user_id = ${len(params)}", *params
                 )
                 return result.endswith("1")
+
+        return self._call(_go())
+
+    def set_user_disabled(self, user_id: str, disabled: bool) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute("UPDATE users SET disabled = $1 WHERE user_id = $2", disabled, user_id)
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    def list_all_users(self) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT user_id, email, display_name, avatar_color, created_at, disabled FROM users"
+                )
+                return [_user_row_to_dict(r) for r in rows]
 
         return self._call(_go())
 
@@ -1217,14 +1512,15 @@ class PostgresAccountStore(AccountStore):
         return {
             "org_id": org_id, "name": name, "created_by": created_by_user_id, "created_at": created,
             "default_visibility": "private", "allowed_share_link_roles": ["viewer", "editor"],
+            "sso_issuer": None, "sso_client_id": None, "sso_client_secret": None, "sso_domain": None,
         }
 
     def get_org(self, org_id: str) -> Optional[dict]:
         async def _go():
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles "
-                    "FROM orgs WHERE org_id = $1",
+                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+                    "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs WHERE org_id = $1",
                     org_id,
                 )
                 return self._org_row_to_dict(row) if row else None
@@ -1361,3 +1657,105 @@ class PostgresAccountStore(AccountStore):
                 return not result.endswith(" 0")
 
         return self._call(_go())
+
+    # -- SSO ------------------------------------------------------------------
+
+    def set_org_sso(
+        self, org_id: str, issuer: Optional[str], client_id: Optional[str],
+        client_secret: Optional[str], domain: Optional[str],
+    ) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE orgs SET sso_issuer = $1, sso_client_id = $2, sso_client_secret = $3, "
+                    "sso_domain = $4 WHERE org_id = $5",
+                    issuer, client_id, client_secret, domain.strip().lower() if domain else None, org_id,
+                )
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    def get_org_by_sso_domain(self, domain: str) -> Optional[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+                    "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs "
+                    "WHERE sso_domain = $1 AND sso_issuer IS NOT NULL AND sso_client_id IS NOT NULL "
+                    "AND sso_client_secret IS NOT NULL",
+                    domain.strip().lower(),
+                )
+                return self._org_row_to_dict(row) if row else None
+
+        return self._call(_go())
+
+    # -- per-account quotas -----------------------------------------------------
+
+    def increment_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO quota_usage (user_id, kind, day, count) VALUES ($1, $2, $3, 1)
+                    ON CONFLICT (user_id, kind, day) DO UPDATE SET count = quota_usage.count + 1
+                    RETURNING count
+                    """,
+                    user_id, kind, day,
+                )
+                return row["count"]
+
+        return self._call(_go())
+
+    def get_quota_usage(self, user_id: str, kind: str, day: str) -> int:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT count FROM quota_usage WHERE user_id = $1 AND kind = $2 AND day = $3",
+                    user_id, kind, day,
+                )
+                return row["count"] if row else 0
+
+        return self._call(_go())
+
+    # -- admin panel --------------------------------------------------------
+
+    def list_all_orgs(self) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT org_id, name, created_by, created_at, default_visibility, allowed_share_link_roles, "
+                    "sso_issuer, sso_client_id, sso_client_secret, sso_domain FROM orgs"
+                )
+                return [self._org_row_to_dict(r) for r in rows]
+
+        return self._call(_go())
+
+    def list_all_owned_rooms(self) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT kind, room_id, owner_user_id, owner_org_id, visibility FROM room_ownership"
+                )
+                return [dict(r) for r in rows]
+
+        return self._call(_go())
+
+    def admin_claim_room(self, kind: str, room_id: str, owner_user_id: str) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "INSERT INTO room_ownership (kind, room_id, owner_user_id, visibility, created_at) "
+                    "VALUES ($1, $2, $3, 'public', $4) ON CONFLICT (kind, room_id) DO NOTHING",
+                    kind, room_id, owner_user_id, time.time(),
+                )
+                return result.endswith("1")
+
+        return self._call(_go())
+
+    def delete_room_ownership(self, kind: str, room_id: str) -> None:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute("DELETE FROM room_ownership WHERE kind = $1 AND room_id = $2", kind, room_id)
+                await conn.execute("DELETE FROM room_grants WHERE kind = $1 AND room_id = $2", kind, room_id)
+
+        self._call(_go())

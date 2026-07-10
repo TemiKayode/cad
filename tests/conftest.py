@@ -47,6 +47,7 @@ def isolated_account_store(monkeypatch):
     monkeypatch.delenv("CRDT_CAD_AUTH_MODE", raising=False)
     monkeypatch.delenv("CRDT_CAD_AUTH_DEV_ECHO", raising=False)
     monkeypatch.delenv("CRDT_CAD_SMTP_HOST", raising=False)
+    monkeypatch.delenv("CRDT_CAD_ADMIN_EMAILS", raising=False)
     yield fresh
 
 

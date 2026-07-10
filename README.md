@@ -33,7 +33,7 @@ A real-time, browser-based collaborative CAD engine whose geometric data is repr
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 718 tests
+./.venv/Scripts/python -m pytest tests/ -v   # 736 tests
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -154,8 +154,10 @@ Layered identity, ownership, and organizations, each opt-in and fully backward-c
 - **Accounts**: magic-link sign-in (no passwords — a time-limited signed link by e-mail, or console-echoed for local development) and OAuth (Google, GitHub via `authlib`). Sessions are server-side, cookie holds only a hash, so "sign out everywhere" is a real row deletion, not a client-side hope.
 - **Document ownership and sharing**: the first signed-in user to open a genuinely new room claims it automatically as private; visibility is private/link/public, and per-user roles (owner/editor/commenter/viewer) can be granted by e-mail — even to someone who's never signed in yet. The account-based permission system composes with (never replaces) the token system: an already-distributed share link keeps working even on a room that's since gone private.
 - **Organizations and teams**: an org has admin/member roles, and transferring a document to one makes it visible and editable to every active member automatically — an admin manages it like an owner, a member edits it like an editor, with no per-person invite needed for each new document. Invites carry a real pending state that activates the moment the invitee actually signs in for the first time. An org can also set per-org defaults (new-document visibility, which share-link roles it allows).
+- **Per-org SSO**: any organization can delegate sign-in to its own OIDC identity provider (Okta, Entra ID, Google Workspace, or anything else that publishes standard discovery) and capture its own e-mail domain — a sign-in attempt against that domain, magic link or generic OAuth, gets redirected straight to the org's own flow instead. Configured per-org, not per-deployment, with the client secret write-only from the moment it's set.
+- **Quotas and an operator admin panel**: opt-in per-user daily caps on AI generations, share links, and owned documents (`CRDT_CAD_QUOTA_*`), and a real operator surface at `/admin` — bootstrapped by `CRDT_CAD_ADMIN_EMAILS`, no database flag and no chicken-and-egg on who grants the first admin — for listing every user and org, disabling an abusive account, and claiming or deleting any room.
 
-The workspace home page reflects all of this: a visibility badge, an owner-only **Share** modal for managing grants and organization transfer, and an **Organizations** panel for membership and defaults.
+The workspace home page reflects all of this: a visibility badge, an owner-only **Share** modal for managing grants and organization transfer, and an **Organizations** panel for membership, defaults, and SSO.
 
 ## The apps
 
@@ -167,6 +169,8 @@ All three pages are plain HTML/CSS/vanilla JS — no build step, no npm project.
 
 **3D mesh** (`/3d`): click-to-place vertices and faces, drag to move, extrude with one bundled undo step, per-face color and material, parametric primitives (Box/Cylinder/Pyramid/Plane) with grid/vertex snapping, axis-aligned view shortcuts, the AI Generate panel, and export to JSON/STL/STEP.
 
+**Admin panel** (`/admin`, accounts mode + `CRDT_CAD_ADMIN_EMAILS` only): a real operator surface, not just REST endpoints — every user with a disable/re-enable toggle, every organization, and every owned room with a delete action, gated client-side on `is_platform_admin` and re-checked server-side on every request regardless of what the page shows.
+
 Both demos share a hand-written design token system (color for dark and light themes, typography, spacing, motion), a full icon set with no emoji glyphs, a command palette (Ctrl/Cmd+K) covering every action in the app, single-key tool shortcuts, a searchable keyboard-shortcut overlay, full keyboard reachability (skip links, focus traps, visible focus rings), smooth eased remote cursors with per-actor color, a "follow" mode that re-centers your viewport on another collaborator, and an honest connection/save status cluster that reflects exactly what this architecture actually guarantees rather than a generic autosave spinner. A 500-path 2D document renders in ~1.1ms per frame on average; cumulative layout shift across all three pages measures 0.002–0.010, an order of magnitude under the "good" threshold.
 
 ## Testing
@@ -175,7 +179,7 @@ Both demos share a hand-written design token system (color for dark and light th
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-**718 non-browser tests**: unit tests for every CRDT type and geometry module, serialization round-trips, a full-mesh merge-convergence test for RGA, a Hypothesis property test fuzzing random concurrent insert/delete programs across three replicas, import/export round-trips for every supported format, the constraint solver's independent correctness checks, persistence save/load/restart-hydration, WebSocket protocol tests covering the relay, reconnect-with-delta, the validity gate, and the WebRTC signaling relay's targeted delivery, the full AI generation pipeline (heuristic and mocked-LLM interpretation, every generator's geometry invariants, the DSL's validation/repair/fallback loop, the 66-case eval harness), security hardening (every auth gate, every rate limit and resource ceiling actually tripping), account/permission/organization storage and REST/WS enforcement, and Postgres/Redis integration tests that skip cleanly when neither is reachable.
+**736 non-browser tests**: unit tests for every CRDT type and geometry module, serialization round-trips, a full-mesh merge-convergence test for RGA, a Hypothesis property test fuzzing random concurrent insert/delete programs across three replicas, import/export round-trips for every supported format, the constraint solver's independent correctness checks, persistence save/load/restart-hydration, WebSocket protocol tests covering the relay, reconnect-with-delta, the validity gate, and the WebRTC signaling relay's targeted delivery, the full AI generation pipeline (heuristic and mocked-LLM interpretation, every generator's geometry invariants, the DSL's validation/repair/fallback loop, the 66-case eval harness), security hardening (every auth gate, every rate limit and resource ceiling actually tripping), account/permission/organization storage and REST/WS enforcement, SSO domain capture, disabled-account gating, per-user quotas, and the admin panel's own access control, and Postgres/Redis integration tests that skip cleanly when neither is reachable.
 
 **91 browser tests** (Playwright, opt-in via `pytest -m e2e`, excluded from the default run so a fresh checkout without Chromium still passes): two tabs drawing concurrently and converging; the full offline → edit both sides → reconnect → Time-Travel Merge → converge sequence; a real `RTCPeerConnection` negotiating between two headless Chrome tabs; the offline outbox surviving a hard refresh; the full account sign-in, sharing, and organization flow end to end with multiple real browser contexts; and a dedicated regression test per non-trivial bug found during development. Each spins up a real `uvicorn` subprocess against its own temp SQLite file, exercising the actual client JS against the actual relay, not an in-process test double.
 
@@ -237,9 +241,10 @@ scripts/
   k8s_smoke_test.py    post-deploy WebSocket round-trip check
 demo/static/
   common.js            relay client, P2PManager, actor identity, shared UI helpers
-  home.html/home.js         workspace home page
+  home.html/home.js         workspace home page (rooms, sharing, organizations + SSO)
   index.html/sketch.js      2D sketch demo
   mesh3d.html/mesh3d.js     3D mesh demo (Three.js via CDN, incl. AI Generate panel)
+  admin.html/admin.js       operator admin panel (users, orgs, rooms)
   tokens.css/styles.css/icons.svg  design tokens, themed styles, icon sprite
 docs/
   deployment.md        VPS/Caddy runbook, Fly.io, backups, monitoring, load-test findings

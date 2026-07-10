@@ -52,7 +52,9 @@ def test_tokens_mode_me_reports_mode_and_nothing_else():
     resp = client.get("/api/auth/me")
     assert resp.status_code == 200
     body = resp.json()
-    assert body == {"mode": "tokens", "signed_in": False, "user": None, "oauth_providers": []}
+    assert body == {
+        "mode": "tokens", "signed_in": False, "user": None, "oauth_providers": [], "is_platform_admin": False,
+    }
 
 
 def test_tokens_mode_sign_in_routes_are_404(monkeypatch):

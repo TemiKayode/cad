@@ -54,6 +54,25 @@ endpoints; per-org defaults (new-document visibility, allowed
 share-link roles) are per-organization settings stored in the database,
 not deployment-level configuration.
 
+| Variable | Default | Effect |
+|---|---|---|
+| `CRDT_CAD_ADMIN_EMAILS` | unset | Comma-separated e-mail addresses (case-insensitive) granted the operator admin panel (`/admin`) and its `/api/admin/*` REST endpoints -- list every user, disable/re-enable an account, list every org, list/claim/delete any room. A deployment env var, not a database flag, so there's no bootstrap chicken-and-egg for who grants the first admin. |
+| `CRDT_CAD_QUOTA_GENERATIONS_PER_DAY` | `0` (unlimited) | Per-signed-in-user daily cap on AI mesh generations, on top of the always-on per-IP `CRDT_CAD_GENERATE_PER_MINUTE` limiter above. `0` leaves it unlimited; the check is a no-op entirely for anonymous/token-only rooms, which have no per-user identity to key a quota on. |
+| `CRDT_CAD_QUOTA_SHARE_LINKS_PER_DAY` | `0` (unlimited) | Per-signed-in-user daily cap on minting new read-only share links. |
+| `CRDT_CAD_QUOTA_OWNED_DOCUMENTS` | `0` (unlimited) | Per-user cap on how many rooms claim-on-first-touch will own for one account. Over quota, a brand-new room simply isn't claimed (stays ownerless/public) rather than the connection being refused -- a quota never turns into a broken collaboration session. |
+
+SSO (Part 6 Phase P4) lets one organization delegate sign-in to its own
+OIDC identity provider (Okta, Entra ID, Google Workspace, or anything
+else that publishes standard `.well-known/openid-configuration`
+discovery) instead of magic links or the fixed Google/GitHub OAuth
+apps above -- configured per-org, not via env var, through
+`POST /api/orgs/{org_id}/sso` (org admin only; issuer URL, client id,
+client secret, and the e-mail domain it should capture). Once
+configured, any sign-in attempt against that domain -- magic link or
+generic OAuth -- is redirected to the org's own SSO flow instead. Needs
+the `accounts` extra (the same `authlib` dependency the Google/GitHub
+flow already needs); SAML is out of scope.
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

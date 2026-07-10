@@ -69,10 +69,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import socket
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
+from datetime import date
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -138,6 +140,12 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_STATIC_DIR = Path(os.environ.get("CRDT_CAD_STATIC_DIR", str(REPO_ROOT / "demo" / "static")))
 DB_PATH = os.environ.get("CRDT_CAD_DB_PATH", str(REPO_ROOT / "data" / "crdt_cad.db"))
 DATABASE_URL = os.environ.get("CRDT_CAD_DATABASE_URL")
+# Part 6 P4: per-signed-in-user quotas, accounts mode only -- 0 (the
+# default) means unlimited, so a deployment that never sets these stays
+# exactly as unbounded as before this phase existed.
+QUOTA_GENERATIONS_PER_DAY = int(os.environ.get("CRDT_CAD_QUOTA_GENERATIONS_PER_DAY", "0"))
+QUOTA_SHARE_LINKS_PER_DAY = int(os.environ.get("CRDT_CAD_QUOTA_SHARE_LINKS_PER_DAY", "0"))
+QUOTA_OWNED_DOCUMENTS = int(os.environ.get("CRDT_CAD_QUOTA_OWNED_DOCUMENTS", "0"))
 
 # CRDT_CAD_DATABASE_URL opts into Postgres -- the one persistence backend
 # that lets more than one server *process* share room state (see
@@ -650,6 +658,16 @@ async def index_3d() -> FileResponse:
     return FileResponse(str(DEMO_STATIC_DIR / "mesh3d.html"))
 
 
+@app.get("/admin")
+async def index_admin() -> FileResponse:
+    """Static shell for the operator admin panel (Part 6 P4) -- gated
+    client-side by rendering nothing useful until /api/auth/me reports
+    is_platform_admin; every actual admin action goes through the
+    /api/admin/* routes, which enforce require_platform_admin() again
+    server-side regardless of what this page shows."""
+    return FileResponse(str(DEMO_STATIC_DIR / "admin.html"))
+
+
 @app.get("/favicon.ico")
 async def favicon() -> FileResponse:
     return FileResponse(str(DEMO_STATIC_DIR / "favicon.svg"), media_type="image/svg+xml")
@@ -934,6 +952,23 @@ _VALID_VISIBILITIES = {"private", "link", "public"}
 _VALID_GRANT_ROLES = {"editor", "commenter", "viewer"}
 
 
+def _enforce_daily_quota(user: Optional[dict], kind: str, limit: int, label: str) -> None:
+    """Soft per-user daily cap (Part 6 P4). A no-op for token-only rooms
+    (``user`` is None) and whenever the deployment leaves ``limit`` at
+    its default of 0 -- quotas are opt-in, never a surprise regression
+    for an existing accounts-mode deployment that never configured one.
+    """
+    if user is None or limit <= 0:
+        return
+    day = date.today().isoformat()
+    current = auth.get_account_store().get_quota_usage(user["user_id"], kind, day)
+    if current >= limit:
+        raise HTTPException(
+            status_code=429, detail=f"daily {label} quota exceeded ({limit}/day) -- resets tomorrow"
+        )
+    auth.get_account_store().increment_quota_usage(user["user_id"], kind, day)
+
+
 async def _get_sharing(kind: str, room_id: str) -> dict:
     ownership = auth.get_account_store().get_room_ownership(kind, room_id)
     if ownership is None:
@@ -1164,6 +1199,55 @@ async def set_org_defaults(org_id: str, req: OrgDefaultsRequest) -> dict:
     return {"ok": True}
 
 
+class OrgSSORequest(BaseModel):
+    issuer: str
+    client_id: str
+    client_secret: str
+    domain: str
+
+
+@app.get("/api/orgs/{org_id}/sso", dependencies=[Depends(require_org_admin())])
+async def get_org_sso(org_id: str) -> dict:
+    org = auth.get_account_store().get_org(org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    # The client secret is write-only from the API's point of view -- an
+    # admin can tell it's configured, never read it back.
+    return {
+        "configured": bool(org.get("sso_issuer") and org.get("sso_client_id") and org.get("sso_client_secret")),
+        "issuer": org.get("sso_issuer"),
+        "domain": org.get("sso_domain"),
+        "start_url": f"/api/auth/sso/{org_id}/start" if org.get("sso_issuer") else None,
+    }
+
+
+@app.post("/api/orgs/{org_id}/sso", dependencies=[Depends(require_org_admin())])
+async def set_org_sso(org_id: str, req: OrgSSORequest) -> dict:
+    issuer = req.issuer.strip()
+    client_id = req.client_id.strip()
+    client_secret = req.client_secret.strip()
+    domain = req.domain.strip().lower()
+    if not (issuer.startswith("https://") or issuer.startswith("http://")):
+        raise HTTPException(status_code=400, detail="issuer must be a URL")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="client_id and client_secret are required")
+    if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", domain):
+        raise HTTPException(status_code=400, detail="domain must look like a bare domain, e.g. example.com")
+    existing = auth.get_account_store().get_org_by_sso_domain(domain)
+    if existing is not None and existing["org_id"] != org_id:
+        raise HTTPException(status_code=409, detail="another organization has already claimed this domain")
+    auth.get_account_store().set_org_sso(org_id, issuer, client_id, client_secret, domain)
+    auth.forget_org_oidc_client(org_id)
+    return {"ok": True}
+
+
+@app.delete("/api/orgs/{org_id}/sso", dependencies=[Depends(require_org_admin())])
+async def clear_org_sso(org_id: str) -> dict:
+    auth.get_account_store().set_org_sso(org_id, None, None, None, None)
+    auth.forget_org_oidc_client(org_id)
+    return {"ok": True}
+
+
 async def _transfer_room_to_org(kind: str, room_id: str, org_id: str, user: Optional[dict]) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="sign in required")
@@ -1191,6 +1275,84 @@ async def transfer_drawing_room(room_id: str, req: TransferRequest, request: Req
 @app.post("/api/mesh/{room_id}/transfer", dependencies=[Depends(require_owner_access("mesh"))])
 async def transfer_mesh_room(room_id: str, req: TransferRequest, request: Request) -> dict:
     return await _transfer_room_to_org("mesh", room_id, req.org_id, auth.current_user(request))
+
+
+# -- operator admin panel (Part 6 P4) ------------------------------------------
+#
+# Gated by CRDT_CAD_ADMIN_EMAILS (see auth.platform_admin_emails), not a
+# database flag -- an operator sets the env var, signs in with that
+# address, and gets in. No bootstrap chicken-and-egg where the first
+# admin has to be granted by an admin who doesn't exist yet.
+
+
+def require_platform_admin():
+    async def _dep(request: Request) -> None:
+        if not auth.accounts_enabled():
+            raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+        if not auth.is_platform_admin(auth.current_user(request)):
+            raise HTTPException(status_code=403, detail="platform admin access required")
+
+    return _dep
+
+
+@app.get("/api/admin/users", dependencies=[Depends(require_platform_admin())])
+async def admin_list_users() -> list[dict]:
+    return auth.get_account_store().list_all_users()
+
+
+class AdminSetDisabledRequest(BaseModel):
+    disabled: bool
+
+
+@app.post("/api/admin/users/{user_id}/disabled", dependencies=[Depends(require_platform_admin())])
+async def admin_set_user_disabled(user_id: str, req: AdminSetDisabledRequest) -> dict:
+    if not auth.get_account_store().set_user_disabled(user_id, req.disabled):
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"ok": True}
+
+
+@app.get("/api/admin/orgs", dependencies=[Depends(require_platform_admin())])
+async def admin_list_orgs() -> list[dict]:
+    return auth.get_account_store().list_all_orgs()
+
+
+@app.get("/api/admin/rooms", dependencies=[Depends(require_platform_admin())])
+async def admin_list_rooms() -> list[dict]:
+    return auth.get_account_store().list_all_owned_rooms()
+
+
+class AdminClaimRoomRequest(BaseModel):
+    kind: str  # "drawing" | "mesh"
+    room_id: str
+    owner_user_id: str
+
+
+@app.post("/api/admin/rooms/claim", dependencies=[Depends(require_platform_admin())])
+async def admin_claim_room(req: AdminClaimRoomRequest) -> dict:
+    if req.kind not in ("drawing", "mesh"):
+        raise HTTPException(status_code=400, detail="kind must be 'drawing' or 'mesh'")
+    if auth.get_account_store().get_user(req.owner_user_id) is None:
+        raise HTTPException(status_code=404, detail="owner_user_id does not exist")
+    if not auth.get_account_store().admin_claim_room(req.kind, req.room_id, req.owner_user_id):
+        raise HTTPException(status_code=409, detail="this room already has an owner")
+    return {"ok": True}
+
+
+@app.delete("/api/admin/rooms/{kind}/{room_id}", dependencies=[Depends(require_platform_admin())])
+async def admin_delete_room(kind: str, room_id: str) -> dict:
+    if kind not in ("drawing", "mesh"):
+        raise HTTPException(status_code=400, detail="kind must be 'drawing' or 'mesh'")
+    manager = drawing_room_manager if kind == "drawing" else mesh_room_manager
+    room = manager.rooms.pop(room_id, None)
+    if room is not None:
+        for ws in list(room.clients.values()):
+            try:
+                await ws.close(code=WS_CLOSE_GOING_AWAY)
+            except Exception:
+                pass  # already disconnecting -- nothing to clean up
+    store.delete(kind, room_id)
+    auth.get_account_store().delete_room_ownership(kind, room_id)
+    return {"ok": True}
 
 
 class RenameRequest(BaseModel):
@@ -1310,7 +1472,7 @@ class ShareLinkResponse(BaseModel):
     role: str
 
 
-async def _create_share_link(kind: str, room_id: str, role: str) -> ShareLinkResponse:
+async def _create_share_link(kind: str, room_id: str, role: str, request: Request) -> ShareLinkResponse:
     if not security.auth_enabled():
         raise HTTPException(
             status_code=400,
@@ -1318,6 +1480,7 @@ async def _create_share_link(kind: str, room_id: str, role: str) -> ShareLinkRes
         )
     if role not in ("viewer", "editor"):
         raise HTTPException(status_code=400, detail="role must be 'viewer' or 'editor'")
+    _enforce_daily_quota(auth.current_user(request), "share_link", QUOTA_SHARE_LINKS_PER_DAY, "share link")
     # Part 6 P3: an org can restrict which roles a share link may carry
     # for one of its own documents (e.g. "no editor links, viewer only")
     # -- checked here so it applies no matter which room this link is
@@ -1342,8 +1505,8 @@ async def _create_share_link(kind: str, room_id: str, role: str) -> ShareLinkRes
     response_model=ShareLinkResponse,
     dependencies=[Depends(require_editor_access("drawing"))],
 )
-async def create_drawing_share_link(room_id: str, req: ShareLinkRequest) -> ShareLinkResponse:
-    return await _create_share_link("drawing", room_id, req.role)
+async def create_drawing_share_link(room_id: str, req: ShareLinkRequest, request: Request) -> ShareLinkResponse:
+    return await _create_share_link("drawing", room_id, req.role, request)
 
 
 @app.post(
@@ -1351,8 +1514,8 @@ async def create_drawing_share_link(room_id: str, req: ShareLinkRequest) -> Shar
     response_model=ShareLinkResponse,
     dependencies=[Depends(require_editor_access("mesh"))],
 )
-async def create_mesh_share_link(room_id: str, req: ShareLinkRequest) -> ShareLinkResponse:
-    return await _create_share_link("mesh", room_id, req.role)
+async def create_mesh_share_link(room_id: str, req: ShareLinkRequest, request: Request) -> ShareLinkResponse:
+    return await _create_share_link("mesh", room_id, req.role, request)
 
 
 # ---------------------------------------------------------------------------
@@ -1689,6 +1852,7 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
     client_ip = security.client_ip(request)
     if not security.generate_rate_limiter.allow(client_ip):
         raise HTTPException(status_code=429, detail="generation rate limit exceeded -- try again shortly")
+    _enforce_daily_quota(auth.current_user(request), "generation", QUOTA_GENERATIONS_PER_DAY, "AI generation")
 
     room = await mesh_room_manager.get_or_create(room_id)
     request_start = time.monotonic()
@@ -1930,7 +2094,13 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
         # accounts mode was ever turned on -- is never retroactively
         # claimed this way; it stays ownerless-public until an admin
         # tool claims it (Part 6 P4, not yet built).
-        auth.get_account_store().claim_room(manager.kind, room_id, user["user_id"])
+        # Part 6 P4: an opt-in cap on how many rooms one user can own.
+        # Over quota, the claim is simply skipped -- the room stays
+        # ownerless-public rather than the connection being refused, so
+        # a quota never turns into a broken collaboration session.
+        account_store = auth.get_account_store()
+        if QUOTA_OWNED_DOCUMENTS <= 0 or len(account_store.list_owned_rooms(user["user_id"])) < QUOTA_OWNED_DOCUMENTS:
+            account_store.claim_room(manager.kind, room_id, user["user_id"])
         room.was_freshly_created = False
 
     role = _effective_role(manager.kind, room_id, hello.get("token"), user)

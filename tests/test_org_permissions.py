@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from crdt_cad.server import app as app_module
-from crdt_cad.server import auth, security
+from crdt_cad.server import auth
 from crdt_cad.server.app import app
 
 
@@ -291,7 +291,6 @@ def test_transfer_requires_target_org_admin(monkeypatch):
     _enable_accounts(monkeypatch)
     owner = _client()
     _sign_in(owner, "alice@example.com")
-    org = _create_org(owner, "Acme")
     with owner.websocket_connect("/ws/mesh/transferroom2") as ws:
         _hello(ws)
         ws.receive_json()
@@ -412,7 +411,6 @@ def test_explicit_room_grant_overrides_org_member_default(monkeypatch):
     bob = _client()
     _sign_in(bob, "bob@example.com")
     owner.post(f"/api/orgs/{org['org_id']}/invite", json={"email": "bob@example.com", "role": "member"})
-    bob_id = auth.get_account_store().get_user_by_email("bob@example.com")["user_id"]
     owner.post("/api/mesh/teamroom4/grant", json={"email": "bob@example.com", "role": "viewer"})
 
     with bob.websocket_connect("/ws/mesh/teamroom4") as ws:

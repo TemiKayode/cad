@@ -552,9 +552,49 @@ async function loadOrgDetail() {
     document.getElementById("orgDefaultVisibility").value = org.default_visibility;
     document.getElementById("orgAllowViewerLinks").checked = org.allowed_share_link_roles.includes("viewer");
     document.getElementById("orgAllowEditorLinks").checked = org.allowed_share_link_roles.includes("editor");
+    await loadOrgSSO();
   }
   renderOrgMembers(org.members, isAdmin);
 }
+
+async function loadOrgSSO() {
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/sso`);
+  if (!resp.ok) return;
+  const sso = await resp.json();
+  document.getElementById("orgSSOStatus").textContent = sso.configured ? `(configured -- ${sso.domain})` : "(not configured)";
+  document.getElementById("orgSSOIssuer").value = sso.issuer || "";
+  document.getElementById("orgSSODomain").value = sso.domain || "";
+  document.getElementById("orgSSOClientId").value = "";
+  document.getElementById("orgSSOClientSecret").value = "";
+}
+
+document.getElementById("orgSSOSaveBtn").onclick = async () => {
+  if (!currentOrgId) return;
+  const resp = await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/sso`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      issuer: document.getElementById("orgSSOIssuer").value.trim(),
+      client_id: document.getElementById("orgSSOClientId").value.trim(),
+      client_secret: document.getElementById("orgSSOClientSecret").value.trim(),
+      domain: document.getElementById("orgSSODomain").value.trim(),
+    }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not save SSO configuration: ${typeof detail === "string" ? detail : JSON.stringify(detail)}`, "error");
+    return;
+  }
+  showToast("SSO configuration saved", "success");
+  await loadOrgSSO();
+};
+
+document.getElementById("orgSSOClearBtn").onclick = async () => {
+  if (!currentOrgId) return;
+  if (!window.confirm("Clear this organization's SSO configuration? Sign-in from its captured domain will fall back to magic links / OAuth.")) return;
+  await fetch(`/api/orgs/${encodeURIComponent(currentOrgId)}/sso`, { method: "DELETE" });
+  await loadOrgSSO();
+};
 
 function renderOrgMembers(members, isAdmin) {
   const list = document.getElementById("orgMembersList");
@@ -750,11 +790,14 @@ async function signOut(everywhere) {
 function renderAccountArea(acct) {
   const area = document.getElementById("accountArea");
   const orgsBtn = document.getElementById("orgsBtn");
+  const adminLink = document.getElementById("adminLink");
   area.innerHTML = "";
   if (acct.mode !== "accounts") {
     orgsBtn.style.display = "none";
+    adminLink.style.display = "none";
     return;
   }
+  adminLink.style.display = acct.signed_in && acct.is_platform_admin ? "" : "none";
   if (!acct.signed_in) {
     orgsBtn.style.display = "none";
     const btn = document.createElement("button");

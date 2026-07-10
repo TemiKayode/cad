@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>crdt-cad — Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <meta name="theme-color" content="#0f172a" />
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <script>
+    (function () {
+      var stored = localStorage.getItem("crdt_cad_theme");
+      var theme = stored || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/tokens.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <style>
+    .admin-main { max-width: 1040px; margin: 0 auto; padding: 24px 20px 60px; }
+    .admin-section { margin-top: 28px; }
+    .admin-section h2 { font-size: 15px; margin: 0 0 10px; }
+    .admin-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    .admin-table th { text-align: left; color: var(--text-secondary); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    .admin-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .admin-table tr:last-child td { border-bottom: none; }
+    .admin-gate { padding: 60px 20px; text-align: center; color: var(--text-secondary); }
+  </style>
+</head>
+<body class="home-body">
+  <div class="home-topbar">
+    <div class="brand">crdt-cad admin</div>
+    <div class="spacer"></div>
+    <a href="/" class="ghost-btn" style="text-decoration:none">&larr; Workspace</a>
+    <button id="themeToggleBtn" class="ghost-btn" title="Toggle theme" aria-label="Toggle theme" style="border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 8px"></button>
+  </div>
+
+  <div id="adminGate" class="admin-gate" style="display:none">
+    This deployment either isn't running in accounts mode, or your signed-in
+    account isn't listed in <code>CRDT_CAD_ADMIN_EMAILS</code>.
+  </div>
+
+  <div id="adminMain" class="admin-main" style="display:none">
+    <div class="admin-section">
+      <h2>Users</h2>
+      <table class="admin-table">
+        <thead><tr><th>E-mail</th><th>Name</th><th>Status</th><th></th></tr></thead>
+        <tbody id="usersTableBody"></tbody>
+      </table>
+    </div>
+
+    <div class="admin-section">
+      <h2>Organizations</h2>
+      <table class="admin-table">
+        <thead><tr><th>Name</th><th>Org ID</th><th>Default visibility</th></tr></thead>
+        <tbody id="orgsTableBody"></tbody>
+      </table>
+    </div>
+
+    <div class="admin-section">
+      <h2>Rooms</h2>
+      <table class="admin-table">
+        <thead><tr><th>Kind</th><th>Room ID</th><th>Owner</th><th>Visibility</th><th></th></tr></thead>
+        <tbody id="roomsTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/admin.js"></script>
+</body>
+</html>

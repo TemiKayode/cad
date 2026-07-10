@@ -115,6 +115,20 @@ def oauth_providers_configured() -> dict[str, dict]:
     return providers
 
 
+def platform_admin_emails() -> set[str]:
+    """The operator's own bootstrap mechanism for the first admin(s):
+    a comma-separated allowlist of e-mail addresses, never a database
+    flag -- there is no chicken-and-egg "who grants the first admin"
+    problem to solve, since the deployer already controls the process
+    environment. Case-insensitive."""
+    raw = os.environ.get("CRDT_CAD_ADMIN_EMAILS", "")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
+def is_platform_admin(user: Optional[dict]) -> bool:
+    return bool(user) and user["email"].strip().lower() in platform_admin_emails()
+
+
 # -- store selection -------------------------------------------------------------
 
 _account_store: Optional[AccountStore] = None
@@ -165,7 +179,11 @@ def create_session(user_id: str) -> str:
 
 def current_user(request: Request) -> Optional[dict]:
     """The signed-in user for this request, or None. Never raises --
-    endpoints that *require* a user do their own 401."""
+    endpoints that *require* a user do their own 401. Part 6 P4: a
+    disabled account resolves to None here too -- disabling takes effect
+    on the account's *existing* sessions immediately, not just future
+    sign-in attempts, without needing any session-invalidation machinery
+    of its own."""
     if not accounts_enabled():
         return None
     token = request.cookies.get(SESSION_COOKIE)
@@ -176,7 +194,10 @@ def current_user(request: Request) -> Optional[dict]:
     if not sess:
         return None
     store.touch_session(_hash_token(token))
-    return store.get_user(sess["user_id"])
+    user = store.get_user(sess["user_id"])
+    if user is None or user.get("disabled"):
+        return None
+    return user
 
 
 def _set_session_cookie(response: Response, token: str, request: Request) -> None:
@@ -284,7 +305,30 @@ async def me(request: Request) -> dict:
         if user
         else None,
         "oauth_providers": sorted(oauth_providers_configured()) if accounts_enabled() else [],
+        "is_platform_admin": is_platform_admin(user),
     }
+
+
+def _domain_requires_sso(email: str) -> Optional[dict]:
+    """Part 6 P4 domain capture: an org can require every sign-in from
+    its own e-mail domain to go through its configured SSO, not a magic
+    link or generic OAuth. Returns that org, or None if no org captures
+    this address's domain (the overwhelmingly common case -- most
+    deployments never configure this at all)."""
+    domain = email.rsplit("@", 1)[-1].lower()
+    return get_account_store().get_org_by_sso_domain(domain)
+
+
+def _reject_for_sso(org: dict) -> None:
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": "sso_required",
+            "org_id": org["org_id"],
+            "org_name": org["name"],
+            "sso_start_url": f"/api/auth/sso/{org['org_id']}/start",
+        },
+    )
 
 
 @router.post("/request-link")
@@ -293,6 +337,9 @@ async def request_link(body: RequestLinkBody, request: Request) -> dict:
     email = body.email.strip().lower()
     if not _EMAIL_RE.match(email):
         raise HTTPException(status_code=422, detail="that does not look like an e-mail address")
+    captured_by = _domain_requires_sso(email)
+    if captured_by is not None:
+        _reject_for_sso(captured_by)
     token = mint_magic_token(email)
     link = str(request.base_url).rstrip("/") + f"/api/auth/verify?token={token}"
     sent = await asyncio.to_thread(_send_magic_link, email, link)
@@ -308,7 +355,12 @@ async def request_link(body: RequestLinkBody, request: Request) -> dict:
 async def verify(token: str, request: Request) -> RedirectResponse:
     _require_accounts_mode()
     email = verify_magic_token(token)
+    captured_by = _domain_requires_sso(email)
+    if captured_by is not None:
+        _reject_for_sso(captured_by)
     user = get_account_store().create_or_get_user(email)
+    if user.get("disabled"):
+        raise HTTPException(status_code=403, detail="this account has been disabled")
     session_token = create_session(user["user_id"])
     response = RedirectResponse(url="/", status_code=303)
     _set_session_cookie(response, session_token, request)
@@ -435,8 +487,126 @@ async def oauth_callback(provider: str, request: Request) -> RedirectResponse:
                 break
     if not email:
         raise HTTPException(status_code=403, detail=f"{provider} did not supply a verified e-mail address")
+    captured_by = _domain_requires_sso(email)
+    if captured_by is not None:
+        # An org that's captured this domain wants identity to flow
+        # through *its own* SSO, not a generic Google/GitHub sign-in --
+        # even one that happens to use the same address.
+        _reject_for_sso(captured_by)
 
     user = get_account_store().create_or_get_user(email, display_name=name)
+    if user.get("disabled"):
+        raise HTTPException(status_code=403, detail="this account has been disabled")
+    session_token = create_session(user["user_id"])
+    response = RedirectResponse(url="/", status_code=303)
+    _set_session_cookie(response, session_token, request)
+    return response
+
+
+# -- OIDC SSO (optional, per-org, needs the `accounts` extra) -------------------
+#
+# Distinct from the fixed Google/GitHub providers above: any org can
+# configure its *own* issuer/client (Okta, Entra, Google Workspace --
+# anything that speaks standard OIDC discovery), via
+# POST /api/orgs/{org_id}/sso (see app.py, org-admin only; the client
+# secret is stored but never echoed back once set). SAML is explicitly
+# out of scope: OIDC covers the realistic self-host audience, and this
+# project doesn't claim SAML support it has no real IdP to verify
+# against -- see the README.
+
+_org_oidc_clients: dict[str, object] = {}
+_org_oidc_registry = None
+
+
+def _get_org_oidc_client(org_id: str, org: dict):
+    """Lazily registers (once per org_id) and returns an authlib client
+    for that org's own OIDC issuer -- the same lazy-registry pattern
+    ``_get_oauth`` uses for Google/GitHub, just keyed dynamically by org
+    instead of a fixed small set of provider names. Cached so a repeat
+    sign-in doesn't re-fetch the issuer's discovery document every time."""
+    global _org_oidc_registry
+    if org_id in _org_oidc_clients:
+        return _org_oidc_clients[org_id]
+    if _org_oidc_registry is None:
+        try:
+            from authlib.integrations.starlette_client import OAuth
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="SSO needs authlib -- install with `pip install crdt-cad[accounts]`",
+            ) from exc
+        _org_oidc_registry = OAuth()
+    name = f"org_{org_id}"
+    _org_oidc_registry.register(
+        name=name,
+        client_id=org["sso_client_id"],
+        client_secret=org["sso_client_secret"],
+        server_metadata_url=org["sso_issuer"].rstrip("/") + "/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+    client = getattr(_org_oidc_registry, name)
+    _org_oidc_clients[org_id] = client
+    return client
+
+
+def forget_org_oidc_client(org_id: str) -> None:
+    """Drops a cached authlib client so the next sign-in re-reads the
+    org's current SSO config, instead of a stale one from before an
+    admin changed or cleared it."""
+    _org_oidc_clients.pop(org_id, None)
+
+
+def _require_org_sso(org_id: str) -> dict:
+    org = get_account_store().get_org(org_id)
+    if org is None or not (org.get("sso_issuer") and org.get("sso_client_id") and org.get("sso_client_secret")):
+        raise HTTPException(status_code=404, detail="this organization has no SSO configured")
+    return org
+
+
+@router.get("/sso/{org_id}/start")
+async def sso_start(org_id: str, request: Request):
+    _require_accounts_mode()
+    org = _require_org_sso(org_id)
+    client = _get_org_oidc_client(org_id, org)
+    redirect_uri = str(request.base_url).rstrip("/") + f"/api/auth/sso/{org_id}/callback"
+    return await client.authorize_redirect(request, redirect_uri)
+
+
+@router.get("/sso/{org_id}/callback")
+async def sso_callback(org_id: str, request: Request) -> RedirectResponse:
+    _require_accounts_mode()
+    org = _require_org_sso(org_id)
+    client = _get_org_oidc_client(org_id, org)
+    token = await client.authorize_access_token(request)
+    info = token.get("userinfo") or {}
+    # Unlike the Google path above, a missing email_verified claim isn't
+    # treated as untrusted here: the org's own admin deliberately chose
+    # this issuer for their organization, a materially different trust
+    # model than "any visitor signing up with a Google account."
+    if not info.get("email") or info.get("email_verified") is False:
+        raise HTTPException(status_code=403, detail="the identity provider did not supply a verified e-mail address")
+    email = info["email"].strip().lower()
+    name = info.get("name")
+
+    # Defense in depth: if a *different* org has captured this domain,
+    # this org's own SSO shouldn't be a backdoor around that rule.
+    captured_by = _domain_requires_sso(email)
+    if captured_by is not None and captured_by["org_id"] != org_id:
+        _reject_for_sso(captured_by)
+
+    store = get_account_store()
+    user = store.create_or_get_user(email, display_name=name)
+    if user.get("disabled"):
+        raise HTTPException(status_code=403, detail="this account has been disabled")
+
+    # Signing in through an org's own SSO implies membership: default to
+    # "member" the first time, leave an existing role (e.g. admin, or a
+    # membership from before SSO was configured) untouched on repeat
+    # sign-ins.
+    if store.get_org_membership(org_id, user["user_id"]) is None:
+        store.invite_org_member(org_id, email, role="member")
+        store.activate_pending_memberships(user["user_id"])
+
     session_token = create_session(user["user_id"])
     response = RedirectResponse(url="/", status_code=303)
     _set_session_cookie(response, session_token, request)

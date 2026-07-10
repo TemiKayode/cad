@@ -35,6 +35,8 @@
     <!-- Part 6 P3: shown only once signed in (accounts mode) -- toggled
          alongside accountArea in home.js's renderAccountArea(). -->
     <button id="orgsBtn" style="display:none">Organizations</button>
+    <!-- Part 6 P4: shown only when /api/auth/me reports is_platform_admin. -->
+    <a id="adminLink" href="/admin" class="ghost-btn" style="display:none;text-decoration:none;border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 10px">Admin</a>
     <!-- Part 6 P1: populated by home.js from /api/auth/me -- stays empty
          (and invisible) on tokens-mode deployments. -->
     <span id="accountArea" style="display:contents"></span>
@@ -136,6 +138,20 @@
               </select>
               <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input id="orgAllowViewerLinks" type="checkbox" />Allow viewer links</label>
               <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input id="orgAllowEditorLinks" type="checkbox" />Allow editor links</label>
+            </div>
+            <div style="font-size:13px;color:var(--text-secondary);margin-bottom:6px">Single sign-on <span id="orgSSOStatus" class="room-card-meta"></span></div>
+            <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px">
+              <input id="orgSSOIssuer" type="text" placeholder="Issuer URL, e.g. https://your-org.okta.com" />
+              <div class="tool-row">
+                <input id="orgSSOClientId" type="text" placeholder="Client ID" style="flex:1" />
+                <input id="orgSSOClientSecret" type="password" placeholder="Client secret" style="flex:1" />
+              </div>
+              <div class="tool-row">
+                <input id="orgSSODomain" type="text" placeholder="Captured domain, e.g. acme.com" style="flex:1" />
+                <button id="orgSSOSaveBtn">Save</button>
+                <button id="orgSSOClearBtn" class="ghost-btn">Clear</button>
+              </div>
+              <p class="empty-hint">Once configured, any sign-in attempt from this domain is redirected to your identity provider instead of a magic link or generic OAuth.</p>
             </div>
           </div>
           <div style="font-size:13px;color:var(--text-secondary);margin-bottom:6px">Members</div>
