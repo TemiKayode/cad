@@ -540,6 +540,25 @@ a.pill-link { color: var(--text-secondary); text-decoration: none; }
 .room-kind-badge.mesh { color: var(--success); border-color: var(--success); }
 .room-kind-badge.drawing { color: var(--accent); border-color: var(--accent); }
 
+/* Part 6 P2: ownership/visibility -- only ever rendered in accounts
+   mode, on a room a signed-in user has actually claimed. */
+.room-visibility-badge {
+  display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 0.4px;
+  padding: 2px 6px; border-radius: var(--r-sm); width: fit-content;
+  background: var(--bg-raised); color: var(--text-secondary); border: 1px solid var(--border);
+}
+.room-visibility-badge.private { color: var(--warning); border-color: var(--warning); }
+.room-visibility-badge.link { color: var(--accent); border-color: var(--accent); }
+.room-visibility-badge.public { color: var(--success); border-color: var(--success); }
+
+.share-grant-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 0;
+  border-bottom: 1px solid var(--border); font-size: 12.5px;
+}
+.share-grant-row:last-child { border-bottom: none; }
+.share-grant-row .grant-email { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.share-grant-row select { font-size: 12px; }
+
 .room-card-name { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .room-card-meta { font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono); }
 

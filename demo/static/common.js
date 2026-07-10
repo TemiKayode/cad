@@ -758,7 +758,16 @@ function withToken(url, kind, room) {
  * configured. Checks (in order): a `?token=` query param (invite link),
  * a previously-stored token for this room, then -- only if the server
  * actually requires one -- prompts for the shared secret and exchanges it
- * for a token via POST /api/auth/token, retrying on a wrong guess. */
+ * for a token via POST /api/auth/token, retrying on a wrong guess.
+ *
+ * Part 6 P2: a signed-in account user skips the prompt entirely and
+ * returns null (no token) -- the server composes the (possibly absent)
+ * token with account-based ownership/grants (see app.py's
+ * `_effective_role`), so a signed-in owner/grantee/public-room visitor
+ * never needs a token at all. If their account genuinely has no access
+ * to a private room, the WS connection is refused (4401) and the demo
+ * shows its existing "unauthorized" status -- a clear, honest outcome,
+ * not the wrong prompt for a secret they were never meant to have. */
 async function ensureRoomAccess(kind, room) {
   const params = new URLSearchParams(location.search);
   const urlToken = params.get("token");
@@ -769,6 +778,9 @@ async function ensureRoomAccess(kind, room) {
 
   const stored = roomTokenFor(kind, room);
   if (stored) return stored;
+
+  const account = await fetchAccount();
+  if (account.signed_in) return null;
 
   let required = false;
   try {

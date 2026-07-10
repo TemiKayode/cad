@@ -190,6 +190,16 @@ class Room:
             logger.info("room %s/%s: hydrated from persisted snapshot (%d bytes)", kind, room_id, len(persisted))
         else:
             self.doc = doc_class(self.clock)
+        # Part 6 P2: true only for the very first Room object ever
+        # constructed for this room id in this server's lifetime (a
+        # RoomManager caches instances, so later opens of the same room
+        # reuse this same object and never see True again) *and* there
+        # was no prior snapshot -- i.e. this room is genuinely brand new,
+        # not a pre-existing room accounts mode was merely turned on for
+        # later. `_serve_room` uses this to claim ownership for whichever
+        # signed-in user opens it first; a room opened anonymously, or
+        # already claimed, is never auto-claimed.
+        self.was_freshly_created = persisted is None
 
         self.clients: dict[str, WebSocket] = {}
         # Phase 17: each connected actor's role ("editor" or "viewer"),
@@ -721,18 +731,67 @@ def _extract_token(request: Request) -> Optional[str]:
     return None
 
 
+_ROLE_RANK = {"viewer": 0, "commenter": 1, "editor": 2, "owner": 3}
+
+
+def _better_role(a: Optional[str], b: Optional[str]) -> Optional[str]:
+    """Whichever of two roles grants more access; None only if both are."""
+    candidates = [r for r in (a, b) if r is not None]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: _ROLE_RANK.get(r, -1))
+
+
+def _account_role_for_room(kind: str, room_id: str, user: Optional[dict]) -> Optional[str]:
+    """The role Part 6 P2 ownership/grants grants for this room, purely
+    from account identity -- independent of any room token. None when
+    accounts mode is off, or the room has no owner yet (every room
+    predating this phase, or one no signed-in user has ever opened --
+    see ``Room.was_freshly_created``), since there's no account-based
+    permission to check in either case. A room *with* an owner and
+    visibility ``"public"`` is open to everyone, signed in or not, the
+    same way an unowned room always has been."""
+    if not auth.accounts_enabled():
+        return None
+    ownership = auth.get_account_store().get_room_ownership(kind, room_id)
+    if ownership is None:
+        return None
+    if user is not None:
+        if user["user_id"] == ownership["owner_user_id"]:
+            return "owner"
+        grant = auth.get_account_store().get_room_grant(kind, room_id, user["user_id"])
+        if grant is not None:
+            return grant
+    return "editor" if ownership["visibility"] == "public" else None
+
+
+def _effective_role(kind: str, room_id: str, token: Optional[str], user: Optional[dict]) -> Optional[str]:
+    """The more permissive of the token-based role (the pre-P2 system,
+    entirely unchanged) and the account-based role (Part 6 P2) -- either
+    alone can grant access, so an already-distributed share-link token
+    keeps working even on a room that's since been made private, and a
+    signed-in owner/grantee gets in with no token at all. When accounts
+    mode is off, or a room has never been claimed by any account, this
+    reduces to exactly the token-only behavior every deployment already
+    has today."""
+    return _better_role(security.token_role(token, kind, room_id), _account_role_for_room(kind, room_id, user))
+
+
 def require_room_access(kind: str):
     """A FastAPI dependency gating one REST endpoint's ``{room_id}`` behind
-    a valid room token -- a no-op (always passes) when
-    ``CRDT_CAD_SECRET`` isn't configured, matching every other auth check
-    in this module. FastAPI binds the returned callable's ``room_id``
-    parameter from the route's own path parameter automatically. Accepts
-    *either* role (editor or viewer) -- read-only endpoints (export,
-    thumbnail, version history) use this; endpoints that mutate the room
-    use :func:`require_editor_access` instead."""
+    a valid room token *or* (Part 6 P2) account-based permission -- a
+    no-op (always passes) when neither ``CRDT_CAD_SECRET`` nor accounts
+    mode is configured, matching every other auth check in this module.
+    FastAPI binds the returned callable's ``room_id`` parameter from the
+    route's own path parameter automatically. Accepts *any* role --
+    read-only endpoints (export, thumbnail, version history) use this;
+    endpoints that mutate the room use :func:`require_editor_access`
+    instead."""
 
     async def _dep(room_id: str, request: Request) -> None:
-        if not security.verify_room_token(_extract_token(request), kind, room_id):
+        token = _extract_token(request)
+        user = auth.current_user(request)
+        if _effective_role(kind, room_id, token, user) is None:
             raise HTTPException(status_code=401, detail="missing or invalid room token")
 
     return _dep
@@ -740,17 +799,39 @@ def require_room_access(kind: str):
 
 def require_editor_access(kind: str):
     """Like :func:`require_room_access`, but additionally refuses a
-    verified **viewer**-role token (403) -- for REST endpoints that
+    **viewer** or **commenter** role (403) -- for REST endpoints that
     mutate a room (import, generate, rename, restore, minting further
-    share links), so a read-only share link recipient can't bypass the
-    WS-level ops rejection (Phase 17) just by calling these directly."""
+    share links), so a read-only share link recipient or comment-only
+    grantee can't bypass the WS-level ops rejection (Phase 17 / Part 6
+    P2) just by calling these directly."""
 
     async def _dep(room_id: str, request: Request) -> None:
         token = _extract_token(request)
-        if not security.verify_room_token(token, kind, room_id):
+        user = auth.current_user(request)
+        role = _effective_role(kind, room_id, token, user)
+        if role is None:
             raise HTTPException(status_code=401, detail="missing or invalid room token")
-        if security.token_role(token, kind, room_id) == "viewer":
+        if role in ("viewer", "commenter"):
             raise HTTPException(status_code=403, detail="editor access required -- this token is read-only")
+
+    return _dep
+
+
+def require_owner_access(kind: str):
+    """Part 6 P2: only a room's owner may change its visibility or manage
+    per-user grants -- editor access isn't enough. 404s (not 403) when
+    accounts mode is off or the room has no owner at all, since there is
+    nothing to manage in either case, not merely something forbidden."""
+
+    async def _dep(room_id: str, request: Request) -> None:
+        if not auth.accounts_enabled():
+            raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+        ownership = auth.get_account_store().get_room_ownership(kind, room_id)
+        if ownership is None:
+            raise HTTPException(status_code=404, detail="this room has no owner to manage")
+        user = auth.current_user(request)
+        if user is None or user["user_id"] != ownership["owner_user_id"]:
+            raise HTTPException(status_code=403, detail="only this room's owner can manage sharing")
 
     return _dep
 
@@ -765,22 +846,135 @@ class RoomSummary(BaseModel):
     room_id: str
     display_name: Optional[str] = None
     updated_at: float
+    # Part 6 P2, all None for a room no signed-in user has ever claimed
+    # (every room predating this phase, or one only ever opened
+    # anonymously) -- those keep exactly today's always-listed behavior.
+    visibility: Optional[str] = None  # "private" | "link" | "public"
+    owner_display_name: Optional[str] = None
+    your_role: Optional[str] = None
 
 
 @app.get("/api/workspace/rooms", response_model=list[RoomSummary])
-async def list_workspace_rooms() -> list[RoomSummary]:
-    """Backs the home page's room list. Deliberately ungated by any room
-    token -- like the pre-existing `/api/rooms`/`/api/mesh-rooms`, a room
-    id/kind/last-modified time isn't itself scoped to one room the way
-    its *contents* are, so there's nothing here for `require_room_access`
-    to check against. When auth is enabled, this still means every
-    room's existence and last-modified time is visible workspace-wide;
+async def list_workspace_rooms(request: Request) -> list[RoomSummary]:
+    """Backs the home page's room list. A room with no owner is listed
+    for everyone, ungated by any room token -- like the pre-existing
+    `/api/rooms`/`/api/mesh-rooms`, a room id/kind/last-modified time
+    isn't itself scoped to one room the way its *contents* are, so
+    there's nothing here for `require_room_access` to check against;
     its content, thumbnail, and rename action remain individually
     token-gated (see below) -- documented in the README as an accepted,
-    honest scope boundary, not a silent gap."""
-    rows = [RoomSummary(kind=kind, **row) for kind in ("drawing", "mesh") for row in store.list_rooms_detailed(kind)]
+    honest scope boundary, not a silent gap. A room WITH an owner (Part
+    6 P2) is different: `visibility="private"`/`"link"` rooms are
+    dropped from the list entirely for anyone who isn't the owner or an
+    explicit grantee -- existence itself, not just content, is what
+    "private" means once a room has an account attached to it."""
+    user = auth.current_user(request)
+    accounts_on = auth.accounts_enabled()
+    rows: list[RoomSummary] = []
+    for kind in ("drawing", "mesh"):
+        for row in store.list_rooms_detailed(kind):
+            summary = RoomSummary(kind=kind, **row)
+            if accounts_on:
+                ownership = auth.get_account_store().get_room_ownership(kind, summary.room_id)
+                if ownership is not None:
+                    role = _account_role_for_room(kind, summary.room_id, user)
+                    if role is None:
+                        continue
+                    summary.visibility = ownership["visibility"]
+                    summary.your_role = role
+                    owner = auth.get_account_store().get_user(ownership["owner_user_id"])
+                    summary.owner_display_name = owner["display_name"] if owner else None
+            rows.append(summary)
     rows.sort(key=lambda r: r.updated_at, reverse=True)
     return rows
+
+
+class VisibilityRequest(BaseModel):
+    visibility: str  # "private" | "link" | "public"
+
+
+class GrantRequest(BaseModel):
+    email: str
+    role: str  # "editor" | "commenter" | "viewer"
+
+
+_VALID_VISIBILITIES = {"private", "link", "public"}
+_VALID_GRANT_ROLES = {"editor", "commenter", "viewer"}
+
+
+async def _get_sharing(kind: str, room_id: str) -> dict:
+    ownership = auth.get_account_store().get_room_ownership(kind, room_id)
+    if ownership is None:
+        raise HTTPException(status_code=404, detail="this room has no owner")
+    owner = auth.get_account_store().get_user(ownership["owner_user_id"])
+    return {
+        "visibility": ownership["visibility"],
+        "owner": (
+            {"user_id": owner["user_id"], "email": owner["email"], "display_name": owner["display_name"]}
+            if owner else None
+        ),
+        "grants": auth.get_account_store().list_room_grants(kind, room_id),
+    }
+
+
+async def _set_visibility(kind: str, room_id: str, visibility: str) -> dict:
+    if visibility not in _VALID_VISIBILITIES:
+        raise HTTPException(status_code=400, detail=f"visibility must be one of {sorted(_VALID_VISIBILITIES)}")
+    auth.get_account_store().set_room_visibility(kind, room_id, visibility)
+    return {"ok": True, "visibility": visibility}
+
+
+async def _grant_room(kind: str, room_id: str, req: GrantRequest) -> dict:
+    if req.role not in _VALID_GRANT_ROLES:
+        raise HTTPException(status_code=400, detail=f"role must be one of {sorted(_VALID_GRANT_ROLES)}")
+    user = auth.get_account_store().create_or_get_user(req.email)
+    auth.get_account_store().set_room_grant(kind, room_id, user["user_id"], req.role)
+    return {"ok": True, "user_id": user["user_id"], "email": user["email"], "role": req.role}
+
+
+async def _revoke_grant(kind: str, room_id: str, user_id: str) -> dict:
+    auth.get_account_store().revoke_room_grant(kind, room_id, user_id)
+    return {"ok": True}
+
+
+@app.get("/api/rooms/{room_id}/sharing", dependencies=[Depends(require_owner_access("drawing"))])
+async def get_drawing_sharing(room_id: str) -> dict:
+    return await _get_sharing("drawing", room_id)
+
+
+@app.post("/api/rooms/{room_id}/visibility", dependencies=[Depends(require_owner_access("drawing"))])
+async def set_drawing_visibility(room_id: str, req: VisibilityRequest) -> dict:
+    return await _set_visibility("drawing", room_id, req.visibility)
+
+
+@app.post("/api/rooms/{room_id}/grant", dependencies=[Depends(require_owner_access("drawing"))])
+async def grant_drawing_room(room_id: str, req: GrantRequest) -> dict:
+    return await _grant_room("drawing", room_id, req)
+
+
+@app.delete("/api/rooms/{room_id}/grant/{user_id}", dependencies=[Depends(require_owner_access("drawing"))])
+async def revoke_drawing_grant(room_id: str, user_id: str) -> dict:
+    return await _revoke_grant("drawing", room_id, user_id)
+
+
+@app.get("/api/mesh/{room_id}/sharing", dependencies=[Depends(require_owner_access("mesh"))])
+async def get_mesh_sharing(room_id: str) -> dict:
+    return await _get_sharing("mesh", room_id)
+
+
+@app.post("/api/mesh/{room_id}/visibility", dependencies=[Depends(require_owner_access("mesh"))])
+async def set_mesh_visibility(room_id: str, req: VisibilityRequest) -> dict:
+    return await _set_visibility("mesh", room_id, req.visibility)
+
+
+@app.post("/api/mesh/{room_id}/grant", dependencies=[Depends(require_owner_access("mesh"))])
+async def grant_mesh_room(room_id: str, req: GrantRequest) -> dict:
+    return await _grant_room("mesh", room_id, req)
+
+
+@app.delete("/api/mesh/{room_id}/grant/{user_id}", dependencies=[Depends(require_owner_access("mesh"))])
+async def revoke_mesh_grant(room_id: str, user_id: str) -> dict:
+    return await _revoke_grant("mesh", room_id, user_id)
 
 
 class RenameRequest(BaseModel):
@@ -1495,12 +1689,24 @@ async def _serve_room(websocket: WebSocket, room_id: str, manager: RoomManager) 
         await websocket.close(code=WS_CLOSE_BAD_HELLO)
         return
 
-    if not security.verify_room_token(hello.get("token"), manager.kind, room_id):
+    user = auth.current_user(websocket)  # WebSocket exposes .cookies same as Request
+    if room.was_freshly_created and user is not None:
+        # Part 6 P2 claim-on-first-touch: a genuinely brand-new room
+        # (no persisted snapshot existed when this Room object was
+        # constructed) becomes owned by whichever signed-in user opens
+        # it first. A pre-existing room -- including one created before
+        # accounts mode was ever turned on -- is never retroactively
+        # claimed this way; it stays ownerless-public until an admin
+        # tool claims it (Part 6 P4, not yet built).
+        auth.get_account_store().claim_room(manager.kind, room_id, user["user_id"])
+        room.was_freshly_created = False
+
+    role = _effective_role(manager.kind, room_id, hello.get("token"), user)
+    if role is None:
         await websocket.close(code=WS_CLOSE_UNAUTHORIZED)
         return
 
     actor = str(hello["actor"])
-    role = security.token_role(hello.get("token"), manager.kind, room_id) or "editor"
     room.clients[actor] = websocket
     room.client_roles[actor] = role
     room.start_snapshot_loop()
@@ -1691,13 +1897,18 @@ async def _handle_message(room: Room, actor: str, message: dict, ops_bucket: sec
     if msg_type != "ops":
         return
 
-    if room.client_roles.get(actor) == "viewer":
+    if room.client_roles.get(actor) in ("viewer", "commenter"):
         # Phase 17 read-only share links: a viewer-role connection still
         # receives every snapshot/delta/ops broadcast normally (so it can
         # render the live document), but anything *it* submits as an edit
         # is refused here, server-side -- the UI also hides editing tools
         # and shows a "view only" badge (see mesh3d.js/sketch.js), but
         # that's a courtesy, not the actual enforcement boundary.
+        # "commenter" (Part 6 P2) gets the identical geometry-ops
+        # refusal -- it's a real, distinct role (comments allowed,
+        # geometry not), but comments themselves are a Phase P5 feature
+        # not yet built, so today a commenter's practical experience is
+        # the same read-only one a viewer gets.
         ws = room.clients.get(actor)
         if ws is not None:
             await ws.send_json({"type": "rejected", "reason": "connected as a read-only viewer -- editing is disabled"})

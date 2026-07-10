@@ -95,6 +95,7 @@ offline to see the **Time-Travel Merge** panel.
 | Bounded periodic self-heal traffic (frontier ping, not a full snapshot) | **Done** -- O(actor count), not O(document size), see below |
 | Security hardening (opt-in room tokens, CORS lockdown, rate limits, resource ceilings) | **Done** -- off/wide-open by default, see below |
 | User accounts: magic-link + OAuth sign-in, server-side sessions (Part 6 Phase P1) | **Done, opt-in** (`CRDT_CAD_AUTH_MODE=accounts`) -- magic-link flow verified end-to-end incl. a live browser run; OAuth (Google/GitHub via `authlib`, the `accounts` extra) is env-gated and **config/gating-tested only** (no real provider credentials were available to exercise the live redirect dance). Default `tokens` mode is byte-for-byte unchanged, tested as such. See "User accounts" below |
+| Document ownership & per-person permissions: private/link/public visibility, owner/editor/commenter/viewer grants by e-mail (Part 6 Phase P2) | **Done, opt-in** -- claim-on-first-touch (never retroactive), composes with (never replaces) the pre-existing room-token system, home page filters private rooms from anyone without access, Share modal for owners. Live-verified end to end in a real browser (3 signed-in accounts, one denied). See "Document ownership and per-person permissions" below |
 | Durable persistence (SQLite snapshots, survives restart) | **Done**; optional `PostgresStore` for multi-process sharing, see below |
 | Save / download (JSON, SVG, DXF for 2D; JSON, STL for 3D) | **Done** |
 | Import (SVG, DXF reference geometry) | **Done** -- SVG now includes quadratic/cubic Bezier curves (Phase 8), see below; arcs and DXF splines/arcs remain unsupported |
@@ -1639,6 +1640,80 @@ What P1 deliberately does **not** include (it's identity only): document
 ownership and per-person permissions (P2), organizations (P3), SSO and
 per-account quotas (P4) -- see `PLATFORM_PROMPT.md` for the rest of
 Part 6.
+
+## Document ownership and per-person permissions (Part 6 Phase P2)
+
+Layered on top of P1's identity, opt-in the same way: entirely inert in
+`tokens` mode, and inert even in `accounts` mode for any room no
+signed-in user has ever opened -- an unowned room keeps exactly today's
+"anyone with the right token gets in" behavior, listed for everyone on
+the workspace home page the same way it always has been. Storage is two
+new tables in the same accounts database (`room_ownership`,
+`room_grants` -- `src/crdt_cad/persistence/accounts.py`), never the
+`documents` table every deployment already has.
+
+- **Claim-on-first-touch, not an explicit "create" step.** The very
+  first time a signed-in user opens a genuinely brand-new room (no
+  persisted snapshot existed yet), the server claims it for them --
+  `Room.was_freshly_created` (`app.py`) is true only once, for the
+  first `Room` object this server process ever constructs for that
+  room id, and only a real account claims it (an anonymous first
+  visitor leaves the room unowned, exactly as before). A pre-existing
+  room -- created before accounts mode existed, or simply opened
+  anonymously first -- is **never** retroactively claimed just because
+  a signed-in user opens it later; per the brief's own migration
+  honesty, it stays ownerless-public until an admin tool claims it
+  (P4, not yet built).
+- **Visibility**: `private` (the default for a freshly claimed room --
+  owner + explicit grantees only), `link` (anyone holding a valid
+  room token, i.e. a Share link minted the Phase 17 way, same as
+  today -- plus the owner/grantees), `public` (open to everyone,
+  identical to an unowned room). Changing it is owner-only
+  (`POST /api/rooms/{room_id}/visibility` / the `/api/mesh/...`
+  equivalent).
+- **Per-user grants**: `owner` (implicit, the claiming account) /
+  `editor` / `commenter` / `viewer`, by e-mail
+  (`POST .../grant`, `DELETE .../grant/{user_id}`) -- granting an
+  address that's never signed in yet still works (it creates the user
+  row the same way a magic link would, so the grant is waiting for
+  them the first time they do). `commenter` gets the identical
+  geometry-ops refusal a `viewer` does at the WS boundary today
+  (comments themselves are a Phase P5 feature, not yet built) -- it's
+  a real, distinct, stored role, just not yet a different *experience*.
+- **Composition, not replacement.** The pre-existing room-token system
+  (Phase 17) and this new account-based one are evaluated independently
+  and the *more permissive* result wins (`app.py`'s `_effective_role`)
+  -- an already-distributed share-link token keeps working even on a
+  room that's since been made private, and a signed-in owner/grantee
+  needs no token at all. This is what makes the zero-config and
+  tokens-only guarantees hold without any special-casing: with accounts
+  mode off, or on an unowned room, the account-based side of the
+  comparison is simply always `None`, so the result is exactly what
+  the token system alone would have produced.
+- **The home page becomes account-aware**: a private/link room is
+  dropped from `GET /api/workspace/rooms` entirely for anyone who
+  isn't the owner or an explicit grantee -- existence, not just
+  content, is what "private" means once a room has an account attached
+  to it. An owned room's card gets a visibility badge and (owner only)
+  a **Share** button opening a modal to change visibility and manage
+  grants by e-mail; a room shared with you shows "shared by \<owner\>
+  -- your role: \<role\>". A signed-in user's own 2D/3D demo page visits
+  also stopped triggering the old shared-secret `window.prompt()` loop
+  regardless of account access (`ensureRoomAccess` in `common.js` now
+  checks sign-in state first and, if signed in, relies on the session
+  cookie alone -- a real integration gap the live-browser verification
+  below caught, not a hypothetical one).
+
+Live-verified end to end in a real browser, not just by the unit/e2e
+suites: Alice signs in, opens a fresh room (auto-claimed private),
+shares it with Bob as editor by e-mail; Bob signs in and sees it
+labeled "shared by alice"; Carol signs in and sees nothing -- the room
+doesn't exist as far as her workspace is concerned. 29 new tests in
+`tests/test_room_permissions.py` cover the storage layer, the role-
+composition helpers directly, claim-on-first-touch (including the
+never-retroactively-claim case), WS/REST visibility enforcement, the
+share-link-still-works-on-a-private-room guarantee, and the workspace
+listing filter.
 
 ## The home page and the two demos
 

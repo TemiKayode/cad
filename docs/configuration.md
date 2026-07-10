@@ -38,6 +38,14 @@ you add a new one, add a row here too.
 | `CRDT_CAD_OAUTH_GOOGLE_CLIENT_ID` / `_CLIENT_SECRET` | unset | Enables "Continue with Google" (needs the `accounts` extra: `pip install crdt-cad[accounts]`). Redirect URI: `<base>/api/auth/oauth/google/callback`. |
 | `CRDT_CAD_OAUTH_GITHUB_CLIENT_ID` / `_CLIENT_SECRET` | unset | Enables "Continue with GitHub", same pattern. |
 
+Document ownership and per-person permissions (Part 6 Phase P2 --
+private/link/public visibility, owner/editor/commenter/viewer grants by
+e-mail) need no configuration of their own: they activate automatically
+whenever `CRDT_CAD_AUTH_MODE=accounts` is already set, and are managed
+entirely through the workspace home page's Share modal and the
+`/api/rooms/{room_id}/{sharing,visibility,grant}` / `/api/mesh/...`
+REST endpoints, not further env vars.
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

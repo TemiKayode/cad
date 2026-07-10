@@ -91,6 +91,58 @@ class AccountStore:
         """Sign out everywhere. Returns how many sessions were removed."""
         raise NotImplementedError
 
+    # -- room ownership & per-user grants (Part 6, P2) ---------------------
+
+    def claim_room(self, kind: str, room_id: str, owner_user_id: str, visibility: str = "private") -> bool:
+        """Registers ``owner_user_id`` as this room's owner -- called once,
+        the first time a signed-in user opens a brand-new room (no
+        persisted CRDT content yet and no existing ownership row; see
+        app.py's claim-on-first-touch in ``_serve_room``). A no-op if the
+        room already has an owner (first claim wins; returns False so a
+        raced double claim can't silently steal ownership from whoever
+        got there first). Pre-existing rooms opened before accounts mode
+        existed are never retroactively claimed this way -- they stay
+        ownerless-public until an admin tool claims them (P4, not yet
+        built) -- see :meth:`get_room_ownership`."""
+        raise NotImplementedError
+
+    def get_room_ownership(self, kind: str, room_id: str) -> Optional[dict]:
+        """Returns ``{"owner_user_id", "visibility"}``, or None if this
+        room has no owner -- true for every room predating this phase,
+        and for any room never opened by a signed-in user. An unowned
+        room is treated as fully public, identical to today's behavior."""
+        raise NotImplementedError
+
+    def set_room_visibility(self, kind: str, room_id: str, visibility: str) -> bool:
+        """Returns False if the room has no owner yet (nothing to set)."""
+        raise NotImplementedError
+
+    def set_room_grant(self, kind: str, room_id: str, user_id: str, role: str) -> None:
+        """Grants (or updates) one user's role on one room. Idempotent."""
+        raise NotImplementedError
+
+    def revoke_room_grant(self, kind: str, room_id: str, user_id: str) -> None:
+        raise NotImplementedError
+
+    def get_room_grant(self, kind: str, room_id: str, user_id: str) -> Optional[str]:
+        raise NotImplementedError
+
+    def list_room_grants(self, kind: str, room_id: str) -> list[dict]:
+        """``[{"user_id", "email", "display_name", "role"}, ...]`` for a
+        sharing UI -- joined against ``users`` so the owner sees who
+        they've invited by name, not by opaque id."""
+        raise NotImplementedError
+
+    def list_owned_rooms(self, user_id: str) -> list[dict]:
+        """``[{"kind", "room_id", "visibility"}, ...]`` -- the home page's
+        "your documents"."""
+        raise NotImplementedError
+
+    def list_granted_rooms(self, user_id: str) -> list[dict]:
+        """``[{"kind", "room_id", "role"}, ...]`` -- the home page's
+        "shared with you"."""
+        raise NotImplementedError
+
 
 class InMemoryAccountStore(AccountStore):
     """Non-durable accounts store used in tests."""
@@ -99,6 +151,8 @@ class InMemoryAccountStore(AccountStore):
         self._users: dict[str, dict] = {}
         self._by_email: dict[str, str] = {}
         self._sessions: dict[str, dict] = {}
+        self._ownership: dict[tuple[str, str], dict] = {}
+        self._grants: dict[tuple[str, str, str], str] = {}
 
     def create_or_get_user(self, email: str, display_name: Optional[str] = None) -> dict:
         email = email.strip().lower()
@@ -166,6 +220,58 @@ class InMemoryAccountStore(AccountStore):
             del self._sessions[h]
         return len(doomed)
 
+    # -- room ownership & per-user grants -----------------------------------
+
+    def claim_room(self, kind: str, room_id: str, owner_user_id: str, visibility: str = "private") -> bool:
+        key = (kind, room_id)
+        if key in self._ownership:
+            return False
+        self._ownership[key] = {"owner_user_id": owner_user_id, "visibility": visibility}
+        return True
+
+    def get_room_ownership(self, kind: str, room_id: str) -> Optional[dict]:
+        row = self._ownership.get((kind, room_id))
+        return dict(row) if row else None
+
+    def set_room_visibility(self, kind: str, room_id: str, visibility: str) -> bool:
+        row = self._ownership.get((kind, room_id))
+        if not row:
+            return False
+        row["visibility"] = visibility
+        return True
+
+    def set_room_grant(self, kind: str, room_id: str, user_id: str, role: str) -> None:
+        self._grants[(kind, room_id, user_id)] = role
+
+    def revoke_room_grant(self, kind: str, room_id: str, user_id: str) -> None:
+        self._grants.pop((kind, room_id, user_id), None)
+
+    def get_room_grant(self, kind: str, room_id: str, user_id: str) -> Optional[str]:
+        return self._grants.get((kind, room_id, user_id))
+
+    def list_room_grants(self, kind: str, room_id: str) -> list[dict]:
+        out = []
+        for (k, r, user_id), role in self._grants.items():
+            if k == kind and r == room_id:
+                user = self.get_user(user_id) or {}
+                out.append({
+                    "user_id": user_id, "email": user.get("email"),
+                    "display_name": user.get("display_name"), "role": role,
+                })
+        return out
+
+    def list_owned_rooms(self, user_id: str) -> list[dict]:
+        return [
+            {"kind": k, "room_id": r, "visibility": row["visibility"]}
+            for (k, r), row in self._ownership.items() if row["owner_user_id"] == user_id
+        ]
+
+    def list_granted_rooms(self, user_id: str) -> list[dict]:
+        return [
+            {"kind": k, "room_id": r, "role": role}
+            for (k, r, u), role in self._grants.items() if u == user_id
+        ]
+
 
 _USERS_DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -187,6 +293,28 @@ CREATE TABLE IF NOT EXISTS sessions (
 )
 """
 
+_ROOM_OWNERSHIP_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS room_ownership (
+    kind TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    visibility TEXT NOT NULL DEFAULT 'private',
+    created_at REAL NOT NULL,
+    PRIMARY KEY (kind, room_id)
+)
+"""
+
+_ROOM_GRANTS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS room_grants (
+    kind TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    granted_at REAL NOT NULL,
+    PRIMARY KEY (kind, room_id, user_id)
+)
+"""
+
 
 class SQLiteAccountStore(AccountStore):
     """Accounts in a SQLite file -- by default the same file as room
@@ -201,6 +329,10 @@ class SQLiteAccountStore(AccountStore):
             conn.execute(_USERS_DDL_SQLITE)
             conn.execute(_SESSIONS_DDL_SQLITE)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+            conn.execute(_ROOM_OWNERSHIP_DDL_SQLITE)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_room_ownership_owner ON room_ownership(owner_user_id)")
+            conn.execute(_ROOM_GRANTS_DDL_SQLITE)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_room_grants_user ON room_grants(user_id)")
 
     @contextmanager
     def _connect(self):
@@ -304,6 +436,78 @@ class SQLiteAccountStore(AccountStore):
             cur = conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
             return cur.rowcount
 
+    # -- room ownership & per-user grants -----------------------------------
+
+    def claim_room(self, kind: str, room_id: str, owner_user_id: str, visibility: str = "private") -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO room_ownership (kind, room_id, owner_user_id, visibility, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (kind, room_id, owner_user_id, visibility, time.time()),
+            )
+            return cur.rowcount > 0
+
+    def get_room_ownership(self, kind: str, room_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT owner_user_id, visibility FROM room_ownership WHERE kind = ? AND room_id = ?",
+                (kind, room_id),
+            ).fetchone()
+            return {"owner_user_id": row[0], "visibility": row[1]} if row else None
+
+    def set_room_visibility(self, kind: str, room_id: str, visibility: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE room_ownership SET visibility = ? WHERE kind = ? AND room_id = ?",
+                (visibility, kind, room_id),
+            )
+            return cur.rowcount > 0
+
+    def set_room_grant(self, kind: str, room_id: str, user_id: str, role: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO room_grants (kind, room_id, user_id, role, granted_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (kind, room_id, user_id) DO UPDATE SET role = excluded.role",
+                (kind, room_id, user_id, role, time.time()),
+            )
+
+    def revoke_room_grant(self, kind: str, room_id: str, user_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM room_grants WHERE kind = ? AND room_id = ? AND user_id = ?", (kind, room_id, user_id)
+            )
+
+    def get_room_grant(self, kind: str, room_id: str, user_id: str) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT role FROM room_grants WHERE kind = ? AND room_id = ? AND user_id = ?",
+                (kind, room_id, user_id),
+            ).fetchone()
+            return row[0] if row else None
+
+    def list_room_grants(self, kind: str, room_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT g.user_id, u.email, u.display_name, g.role FROM room_grants g "
+                "JOIN users u ON u.user_id = g.user_id WHERE g.kind = ? AND g.room_id = ?",
+                (kind, room_id),
+            ).fetchall()
+            return [{"user_id": r[0], "email": r[1], "display_name": r[2], "role": r[3]} for r in rows]
+
+    def list_owned_rooms(self, user_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, room_id, visibility FROM room_ownership WHERE owner_user_id = ?", (user_id,)
+            ).fetchall()
+            return [{"kind": r[0], "room_id": r[1], "visibility": r[2]} for r in rows]
+
+    def list_granted_rooms(self, user_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT kind, room_id, role FROM room_grants WHERE user_id = ?", (user_id,)
+            ).fetchall()
+            return [{"kind": r[0], "room_id": r[1], "role": r[2]} for r in rows]
+
 
 class PostgresAccountStore(AccountStore):
     """Accounts in Postgres, for multi-process deployments (k8s Mode B).
@@ -368,6 +572,34 @@ class PostgresAccountStore(AccountStore):
                     """
                 )
                 await conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS room_ownership (
+                        kind TEXT NOT NULL,
+                        room_id TEXT NOT NULL,
+                        owner_user_id TEXT NOT NULL,
+                        visibility TEXT NOT NULL DEFAULT 'private',
+                        created_at DOUBLE PRECISION NOT NULL,
+                        PRIMARY KEY (kind, room_id)
+                    )
+                    """
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_room_ownership_owner ON room_ownership(owner_user_id)"
+                )
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS room_grants (
+                        kind TEXT NOT NULL,
+                        room_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        granted_at DOUBLE PRECISION NOT NULL,
+                        PRIMARY KEY (kind, room_id, user_id)
+                    )
+                    """
+                )
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_room_grants_user ON room_grants(user_id)")
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1)", self._SCHEMA_LOCK_KEY)
         return pool
@@ -495,5 +727,105 @@ class PostgresAccountStore(AccountStore):
             async with self._pool.acquire() as conn:
                 result = await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
                 return int(result.rsplit(" ", 1)[1])
+
+        return self._call(_go())
+
+    # -- room ownership & per-user grants -----------------------------------
+
+    def claim_room(self, kind: str, room_id: str, owner_user_id: str, visibility: str = "private") -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "INSERT INTO room_ownership (kind, room_id, owner_user_id, visibility, created_at) "
+                    "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (kind, room_id) DO NOTHING",
+                    kind, room_id, owner_user_id, visibility, time.time(),
+                )
+                return result.endswith("1")
+
+        return self._call(_go())
+
+    def get_room_ownership(self, kind: str, room_id: str) -> Optional[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT owner_user_id, visibility FROM room_ownership WHERE kind = $1 AND room_id = $2",
+                    kind, room_id,
+                )
+                return {"owner_user_id": row["owner_user_id"], "visibility": row["visibility"]} if row else None
+
+        return self._call(_go())
+
+    def set_room_visibility(self, kind: str, room_id: str, visibility: str) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE room_ownership SET visibility = $1 WHERE kind = $2 AND room_id = $3",
+                    visibility, kind, room_id,
+                )
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    def set_room_grant(self, kind: str, room_id: str, user_id: str, role: str) -> None:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO room_grants (kind, room_id, user_id, role, granted_at) VALUES ($1, $2, $3, $4, $5) "
+                    "ON CONFLICT (kind, room_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+                    kind, room_id, user_id, role, time.time(),
+                )
+
+        self._call(_go())
+
+    def revoke_room_grant(self, kind: str, room_id: str, user_id: str) -> None:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM room_grants WHERE kind = $1 AND room_id = $2 AND user_id = $3",
+                    kind, room_id, user_id,
+                )
+
+        self._call(_go())
+
+    def get_room_grant(self, kind: str, room_id: str, user_id: str) -> Optional[str]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT role FROM room_grants WHERE kind = $1 AND room_id = $2 AND user_id = $3",
+                    kind, room_id, user_id,
+                )
+                return row["role"] if row else None
+
+        return self._call(_go())
+
+    def list_room_grants(self, kind: str, room_id: str) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT g.user_id, u.email, u.display_name, g.role FROM room_grants g "
+                    "JOIN users u ON u.user_id = g.user_id WHERE g.kind = $1 AND g.room_id = $2",
+                    kind, room_id,
+                )
+                return [dict(r) for r in rows]
+
+        return self._call(_go())
+
+    def list_owned_rooms(self, user_id: str) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT kind, room_id, visibility FROM room_ownership WHERE owner_user_id = $1", user_id
+                )
+                return [dict(r) for r in rows]
+
+        return self._call(_go())
+
+    def list_granted_rooms(self, user_id: str) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT kind, room_id, role FROM room_grants WHERE user_id = $1", user_id
+                )
+                return [dict(r) for r in rows]
 
         return self._call(_go())

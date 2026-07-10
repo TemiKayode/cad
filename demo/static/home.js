@@ -37,7 +37,10 @@ async function fetchRooms() {
 }
 
 function renderRoomCard(room) {
-  const { kind, room_id: roomId, display_name: displayName, updated_at: updatedAt } = room;
+  const {
+    kind, room_id: roomId, display_name: displayName, updated_at: updatedAt,
+    visibility, owner_display_name: ownerDisplayName, your_role: yourRole,
+  } = room;
   const kindLabel = kind === "mesh" ? "3D" : "2D";
   const name = displayName || roomId;
 
@@ -60,11 +63,20 @@ function renderRoomCard(room) {
 
   const body = document.createElement("div");
   body.className = "room-card-body";
+  // Part 6 P2: visibility is only ever set on a room a signed-in user
+  // has claimed -- every pre-existing/anonymous room keeps exactly
+  // today's badge-free card.
+  const visBadge = visibility
+    ? `<span class="room-visibility-badge ${visibility}">${visibility}</span>` : "";
+  const sharedByMeta = yourRole && yourRole !== "owner" && ownerDisplayName
+    ? `<span class="room-card-meta">shared by ${escapeHtml(ownerDisplayName)} -- your role: ${yourRole}</span>` : "";
   body.innerHTML = `
     <span class="room-kind-badge ${kind}">${kindLabel}</span>
+    ${visBadge}
     <span class="room-card-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
     <span class="room-card-meta">room: ${escapeHtml(roomId)}</span>
     <span class="room-card-meta">updated ${relativeTime(updatedAt)}</span>
+    ${sharedByMeta}
   `;
   card.appendChild(body);
 
@@ -87,6 +99,13 @@ function renderRoomCard(room) {
   historyBtn.textContent = "History";
   historyBtn.onclick = () => openHistoryModal(kind, roomId, name);
   actions.appendChild(historyBtn);
+
+  if (yourRole === "owner") {
+    const shareBtn = document.createElement("button");
+    shareBtn.textContent = "Share";
+    shareBtn.onclick = () => openShareModal(kind, roomId, name);
+    actions.appendChild(shareBtn);
+  }
 
   card.appendChild(actions);
   return card;
@@ -253,6 +272,134 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (document.getElementById("historyModal").style.display === "flex") closeHistoryModal();
   else if (document.getElementById("renameModal").style.display === "flex") closeRenameModal();
+  else if (document.getElementById("shareModal").style.display === "flex") closeShareModal();
+});
+
+// -- sharing (Part 6 P2) -----------------------------------------------------
+// Only ever reachable via a room card's "Share" button, itself only
+// rendered when the room's list entry says `your_role === "owner"` --
+// the REST endpoints underneath enforce the same thing server-side
+// (require_owner_access), so this is a convenience gate, not the real
+// boundary. Plain fetch(), no `withToken()`: these endpoints authorize
+// off the signed-in session cookie, not a room token.
+
+let shareTarget = null; // { kind, roomId }
+
+function sharingBasePath(kind, roomId) {
+  return kind === "mesh" ? `/api/mesh/${encodeURIComponent(roomId)}` : `/api/rooms/${encodeURIComponent(roomId)}`;
+}
+
+async function openShareModal(kind, roomId, name) {
+  shareTarget = { kind, roomId };
+  document.getElementById("shareModalTitle").textContent = `Share -- ${name}`;
+  document.getElementById("shareModal").style.display = "flex";
+  _releaseModalFocus = trapFocusIn(document.querySelector("#shareModal .modal"));
+  await loadSharing();
+}
+
+function closeShareModal() {
+  document.getElementById("shareModal").style.display = "none";
+  shareTarget = null;
+  if (_releaseModalFocus) { _releaseModalFocus(); _releaseModalFocus = null; }
+}
+
+async function loadSharing() {
+  if (!shareTarget) return;
+  const { kind, roomId } = shareTarget;
+  const resp = await fetch(`${sharingBasePath(kind, roomId)}/sharing`);
+  if (!resp.ok) {
+    document.getElementById("shareVisibilityRow").textContent = "Could not load sharing settings.";
+    return;
+  }
+  const data = await resp.json();
+  renderShareVisibility(data.visibility);
+  renderShareGrants(data.grants);
+}
+
+function renderShareVisibility(current) {
+  const row = document.getElementById("shareVisibilityRow");
+  row.innerHTML = "";
+  for (const v of ["private", "link", "public"]) {
+    const btn = document.createElement("button");
+    btn.textContent = v[0].toUpperCase() + v.slice(1);
+    btn.className = v === current ? "primary-btn" : "";
+    btn.onclick = () => setVisibility(v);
+    row.appendChild(btn);
+  }
+}
+
+async function setVisibility(visibility) {
+  if (!shareTarget) return;
+  const { kind, roomId } = shareTarget;
+  const resp = await fetch(`${sharingBasePath(kind, roomId)}/visibility`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ visibility }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not change visibility: ${detail}`, "error");
+    return;
+  }
+  await loadSharing();
+  await loadRooms();
+}
+
+function renderShareGrants(grants) {
+  const list = document.getElementById("shareGrantsList");
+  list.innerHTML = "";
+  if (!grants.length) {
+    list.innerHTML = '<div class="empty-hint">Nobody else has access yet.</div>';
+    return;
+  }
+  for (const g of grants) {
+    const row = document.createElement("div");
+    row.className = "share-grant-row";
+    row.innerHTML = `
+      <span class="grant-email" title="${escapeHtml(g.email)}">${escapeHtml(g.display_name || g.email)}</span>
+      <span class="room-card-meta">${escapeHtml(g.role)}</span>
+    `;
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "ghost-btn";
+    removeBtn.title = "Remove access";
+    removeBtn.setAttribute("aria-label", "Remove access");
+    removeBtn.innerHTML = iconHtml("x");
+    removeBtn.onclick = () => revokeGrant(g.user_id);
+    row.appendChild(removeBtn);
+    list.appendChild(row);
+  }
+}
+
+async function revokeGrant(userId) {
+  if (!shareTarget) return;
+  const { kind, roomId } = shareTarget;
+  await fetch(`${sharingBasePath(kind, roomId)}/grant/${encodeURIComponent(userId)}`, { method: "DELETE" });
+  await loadSharing();
+}
+
+document.getElementById("shareGrantBtn").onclick = async () => {
+  if (!shareTarget) return;
+  const email = document.getElementById("shareGrantEmail").value.trim();
+  if (!email) return;
+  const role = document.getElementById("shareGrantRole").value;
+  const { kind, roomId } = shareTarget;
+  const resp = await fetch(`${sharingBasePath(kind, roomId)}/grant`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, role }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not grant access: ${detail}`, "error");
+    return;
+  }
+  document.getElementById("shareGrantEmail").value = "";
+  await loadSharing();
+};
+
+document.getElementById("shareModalClose").onclick = closeShareModal;
+document.getElementById("shareModal").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeShareModal();
 });
 
 // -- new room ------------------------------------------------------------------
