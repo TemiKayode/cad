@@ -1796,3 +1796,36 @@ async function renderActivityFeed(kind, room, containerId) {
     el.appendChild(row);
   }
 }
+
+// -- abuse reporting (Part 6 P7) -----------------------------------------------
+//
+// Shared between sketch.js and mesh3d.js: both call setupReportButton(kind,
+// room) once at startup. The button itself starts hidden in the HTML (only
+// accounts-mode deployments have anywhere for a report to actually go).
+
+async function reportRoom(kind, room) {
+  const reason = window.prompt("Why are you reporting this room? (e.g. spam, harassment, inappropriate content)");
+  if (!reason || !reason.trim()) return;
+  const details = window.prompt("Any additional details? (optional)") || "";
+  const path = kind === "mesh" ? `/api/mesh/${encodeURIComponent(room)}/report` : `/api/rooms/${encodeURIComponent(room)}/report`;
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason: reason.trim(), details: details.trim() }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not submit report: ${detail}`, "error");
+    return;
+  }
+  showToast("Report submitted -- thank you for flagging this", "success");
+}
+
+function setupReportButton(kind, room) {
+  const btn = document.getElementById("reportRoomBtn");
+  if (!btn) return;
+  fetchAccount().then((acct) => {
+    if (acct.mode === "accounts") btn.style.display = "";
+  });
+  btn.onclick = () => reportRoom(kind, room);
+}

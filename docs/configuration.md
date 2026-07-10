@@ -95,6 +95,14 @@ truthful. An org's Stripe customer is created lazily on its first
 checkout and reused on every subsequent one (a canceled-then-
 resubscribed org never accumulates duplicate Stripe customers).
 
+GDPR data export/account deletion and abuse reporting (Part 6 Phase
+P7) need no env vars either -- both are accounts-mode gated (`GET/POST
+/api/account/{export,delete}`, `POST /api/{rooms,mesh}/{room_id}/report`)
+for the same reason billing is: any call into the account store would
+otherwise lazily create the accounts schema even in a tokens-only
+deployment. Reports are reviewed and resolved from the `/admin` panel
+(`GET /api/admin/reports`, `POST /api/admin/reports/{id}/resolve`).
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

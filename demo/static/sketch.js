@@ -3853,3 +3853,4 @@ setTool("pen");
 // already-open WebSocket message.
 renderActivityFeed("drawing", room, "activityList");
 setInterval(() => renderActivityFeed("drawing", room, "activityList"), 20000);
+setupReportButton("drawing", room);

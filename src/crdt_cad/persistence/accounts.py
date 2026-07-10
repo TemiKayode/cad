@@ -343,6 +343,48 @@ class AccountStore:
         "room_id", "actor_user_id", "kind", "payload", "created_at"}``."""
         raise NotImplementedError
 
+    # -- abuse reports (Part 6, P7) -----------------------------------------------
+
+    def create_abuse_report(
+        self, reporter_user_id: Optional[str], room_kind: str, room_id: str, reason: str, details: str,
+    ) -> dict:
+        """``reporter_user_id`` is None for a report filed by a visitor
+        who's browsing this room without being signed in -- accounts
+        mode still gates this feature (see app.py), but signing in
+        isn't itself required to file one."""
+        raise NotImplementedError
+
+    def list_abuse_reports(self, status: Optional[str] = None) -> list[dict]:
+        """Newest first. ``status`` filters to ``"open"``/``"resolved"``/
+        ``"dismissed"`` when given, else every report. Each row:
+        ``{"report_id", "reporter_user_id", "room_kind", "room_id",
+        "reason", "details", "created_at", "status"}``."""
+        raise NotImplementedError
+
+    def resolve_abuse_report(self, report_id: str, status: str) -> bool:
+        """Returns False if no report with this id exists."""
+        raise NotImplementedError
+
+    # -- GDPR account deletion (Part 6, P7) ---------------------------------------
+
+    def delete_user_account(self, user_id: str) -> None:
+        """The 'right to erasure' -- deletes the account and everything
+        that's *exclusively theirs* (sessions, this account's own room
+        grants, org memberships, quota usage, notifications addressed
+        to them). A room they personally owned is released, not
+        deleted: it becomes ownerless (and so, per this codebase's
+        existing convention, effectively public again) rather than
+        destroying content other collaborators may still depend on --
+        the same reasoning `admin_claim_room`'s docstring already
+        applies to an abandoned room. Their comments/edits already
+        embedded in CRDT room history are untouched: `author` there
+        was always just a display-name snapshot taken at write time,
+        never a live reference to this account, so there's nothing in
+        room content that needs anonymizing after the fact. The caller
+        (app.py) is responsible for the "not the last admin of any
+        org" guard -- this method itself does not check that."""
+        raise NotImplementedError
+
 
 class InMemoryAccountStore(AccountStore):
     """Non-durable accounts store used in tests."""
@@ -358,6 +400,7 @@ class InMemoryAccountStore(AccountStore):
         self._quota_usage: dict[tuple[str, str, str], int] = {}
         self._notifications: dict[str, dict] = {}
         self._activity: list[dict] = []
+        self._abuse_reports: dict[str, dict] = {}
 
     def create_or_get_user(self, email: str, display_name: Optional[str] = None) -> dict:
         email = email.strip().lower()
@@ -727,6 +770,50 @@ class InMemoryAccountStore(AccountStore):
         rows.sort(key=lambda r: r["created_at"], reverse=True)
         return rows[:limit]
 
+    # -- abuse reports ------------------------------------------------------------
+
+    def create_abuse_report(
+        self, reporter_user_id: Optional[str], room_kind: str, room_id: str, reason: str, details: str,
+    ) -> dict:
+        report = {
+            "report_id": uuid.uuid4().hex, "reporter_user_id": reporter_user_id,
+            "room_kind": room_kind, "room_id": room_id, "reason": reason, "details": details,
+            "created_at": time.time(), "status": "open",
+        }
+        self._abuse_reports[report["report_id"]] = report
+        return dict(report)
+
+    def list_abuse_reports(self, status: Optional[str] = None) -> list[dict]:
+        rows = [dict(r) for r in self._abuse_reports.values() if status is None or r["status"] == status]
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        return rows
+
+    def resolve_abuse_report(self, report_id: str, status: str) -> bool:
+        report = self._abuse_reports.get(report_id)
+        if report is None:
+            return False
+        report["status"] = status
+        return True
+
+    # -- GDPR account deletion -----------------------------------------------------
+
+    def delete_user_account(self, user_id: str) -> None:
+        user = self._users.pop(user_id, None)
+        if user is not None:
+            self._by_email.pop(user["email"], None)
+        for token in [t for t, s in self._sessions.items() if s["user_id"] == user_id]:
+            del self._sessions[token]
+        for key in [k for k in self._grants if k[2] == user_id]:
+            del self._grants[key]
+        for key in [k for k, o in self._ownership.items() if o["owner_user_id"] == user_id]:
+            del self._ownership[key]
+        for key in [k for k in self._org_members if k[1] == user_id]:
+            del self._org_members[key]
+        for key in [k for k in self._quota_usage if k[0] == user_id]:
+            del self._quota_usage[key]
+        for nid in [n for n, row in self._notifications.items() if row["user_id"] == user_id]:
+            del self._notifications[nid]
+
 
 _USERS_DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -824,6 +911,19 @@ CREATE TABLE IF NOT EXISTS activity_log (
 )
 """
 
+_ABUSE_REPORTS_DDL_SQLITE = """
+CREATE TABLE IF NOT EXISTS abuse_reports (
+    report_id TEXT PRIMARY KEY,
+    reporter_user_id TEXT,
+    room_kind TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    details TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+)
+"""
+
 
 class SQLiteAccountStore(AccountStore):
     """Accounts in a SQLite file -- by default the same file as room
@@ -881,6 +981,8 @@ class SQLiteAccountStore(AccountStore):
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_activity_room ON activity_log(room_kind, room_id, created_at)"
             )
+            conn.execute(_ABUSE_REPORTS_DDL_SQLITE)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_abuse_reports_status ON abuse_reports(status)")
 
     @contextmanager
     def _connect(self):
@@ -1403,6 +1505,61 @@ class SQLiteAccountStore(AccountStore):
             for r in rows
         ]
 
+    # -- abuse reports --------------------------------------------------------
+
+    def create_abuse_report(
+        self, reporter_user_id: Optional[str], room_kind: str, room_id: str, reason: str, details: str,
+    ) -> dict:
+        report_id = uuid.uuid4().hex
+        created_at = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO abuse_reports (report_id, reporter_user_id, room_kind, room_id, reason, details, "
+                "created_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')",
+                (report_id, reporter_user_id, room_kind, room_id, reason, details, created_at),
+            )
+        return {
+            "report_id": report_id, "reporter_user_id": reporter_user_id, "room_kind": room_kind,
+            "room_id": room_id, "reason": reason, "details": details, "created_at": created_at, "status": "open",
+        }
+
+    def list_abuse_reports(self, status: Optional[str] = None) -> list[dict]:
+        query = (
+            "SELECT report_id, reporter_user_id, room_kind, room_id, reason, details, created_at, status "
+            "FROM abuse_reports"
+        )
+        params: tuple = ()
+        if status is not None:
+            query += " WHERE status = ?"
+            params = (status,)
+        query += " ORDER BY created_at DESC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "report_id": r[0], "reporter_user_id": r[1], "room_kind": r[2], "room_id": r[3],
+                "reason": r[4], "details": r[5], "created_at": r[6], "status": r[7],
+            }
+            for r in rows
+        ]
+
+    def resolve_abuse_report(self, report_id: str, status: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("UPDATE abuse_reports SET status = ? WHERE report_id = ?", (status, report_id))
+            return cur.rowcount > 0
+
+    # -- GDPR account deletion -------------------------------------------------
+
+    def delete_user_account(self, user_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM room_grants WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM room_ownership WHERE owner_user_id = ?", (user_id,))
+            conn.execute("DELETE FROM org_members WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM quota_usage WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM notifications WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+
 
 class PostgresAccountStore(AccountStore):
     """Accounts in Postgres, for multi-process deployments (k8s Mode B).
@@ -1578,6 +1735,23 @@ class PostgresAccountStore(AccountStore):
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_activity_room ON activity_log(room_kind, room_id, created_at)"
+                )
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS abuse_reports (
+                        report_id TEXT PRIMARY KEY,
+                        reporter_user_id TEXT,
+                        room_kind TEXT NOT NULL,
+                        room_id TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        details TEXT NOT NULL,
+                        created_at DOUBLE PRECISION NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'open'
+                    )
+                    """
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_abuse_reports_status ON abuse_reports(status)"
                 )
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1)", self._SCHEMA_LOCK_KEY)
@@ -2256,3 +2430,68 @@ class PostgresAccountStore(AccountStore):
                 ]
 
         return self._call(_go())
+
+    # -- abuse reports --------------------------------------------------------
+
+    def create_abuse_report(
+        self, reporter_user_id: Optional[str], room_kind: str, room_id: str, reason: str, details: str,
+    ) -> dict:
+        report_id = uuid.uuid4().hex
+        created_at = time.time()
+
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO abuse_reports (report_id, reporter_user_id, room_kind, room_id, reason, "
+                    "details, created_at, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')",
+                    report_id, reporter_user_id, room_kind, room_id, reason, details, created_at,
+                )
+
+        self._call(_go())
+        return {
+            "report_id": report_id, "reporter_user_id": reporter_user_id, "room_kind": room_kind,
+            "room_id": room_id, "reason": reason, "details": details, "created_at": created_at, "status": "open",
+        }
+
+    def list_abuse_reports(self, status: Optional[str] = None) -> list[dict]:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                if status is not None:
+                    rows = await conn.fetch(
+                        "SELECT report_id, reporter_user_id, room_kind, room_id, reason, details, created_at, "
+                        "status FROM abuse_reports WHERE status = $1 ORDER BY created_at DESC",
+                        status,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT report_id, reporter_user_id, room_kind, room_id, reason, details, created_at, "
+                        "status FROM abuse_reports ORDER BY created_at DESC"
+                    )
+                return [dict(r) for r in rows]
+
+        return self._call(_go())
+
+    def resolve_abuse_report(self, report_id: str, status: str) -> bool:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE abuse_reports SET status = $1 WHERE report_id = $2", status, report_id,
+                )
+                return not result.endswith(" 0")
+
+        return self._call(_go())
+
+    # -- GDPR account deletion -------------------------------------------------
+
+    def delete_user_account(self, user_id: str) -> None:
+        async def _go():
+            async with self._pool.acquire() as conn:
+                await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM room_grants WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM room_ownership WHERE owner_user_id = $1", user_id)
+                await conn.execute("DELETE FROM org_members WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM quota_usage WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM notifications WHERE user_id = $1", user_id)
+                await conn.execute("DELETE FROM users WHERE user_id = $1", user_id)
+
+        self._call(_go())

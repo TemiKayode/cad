@@ -36,6 +36,26 @@ async function loadRooms() {
   return resp.ok ? await resp.json() : [];
 }
 
+async function loadReports() {
+  const resp = await fetch("/api/admin/reports?status=open");
+  return resp.ok ? await resp.json() : [];
+}
+
+async function resolveReport(reportId, status) {
+  const resp = await fetch(`/api/admin/reports/${encodeURIComponent(reportId)}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not update report: ${detail}`, "error");
+    return;
+  }
+  showToast(status === "resolved" ? "Report resolved" : "Report dismissed", "success");
+  await refreshReports();
+}
+
 async function setUserDisabled(userId, disabled) {
   const resp = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/disabled`, {
     method: "POST",
@@ -124,9 +144,41 @@ function renderRooms(rooms) {
   }
 }
 
+function renderReports(reports) {
+  const body = document.getElementById("reportsTableBody");
+  body.innerHTML = "";
+  if (reports.length === 0) {
+    body.innerHTML = '<tr><td colspan="5" class="empty-hint">No open reports.</td></tr>';
+    return;
+  }
+  for (const r of reports) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(r.room_kind)}/${escapeHtml(r.room_id)}</td>
+      <td>${escapeHtml(r.reason)}</td>
+      <td>${escapeHtml(r.details || "")}</td>
+      <td>${escapeHtml(r.status)}</td>
+      <td></td>
+    `;
+    const actionCell = tr.lastElementChild;
+    const resolveBtn = document.createElement("button");
+    resolveBtn.className = "primary-btn";
+    resolveBtn.textContent = "Resolve";
+    resolveBtn.onclick = () => resolveReport(r.report_id, "resolved");
+    const dismissBtn = document.createElement("button");
+    dismissBtn.className = "ghost-btn";
+    dismissBtn.textContent = "Dismiss";
+    dismissBtn.onclick = () => resolveReport(r.report_id, "dismissed");
+    actionCell.appendChild(resolveBtn);
+    actionCell.appendChild(dismissBtn);
+    body.appendChild(tr);
+  }
+}
+
 async function refreshUsers() { renderUsers(await loadUsers()); }
 async function refreshOrgs() { renderOrgs(await loadOrgs()); }
 async function refreshRooms() { renderRooms(await loadRooms()); }
+async function refreshReports() { renderReports(await loadReports()); }
 
 async function init() {
   const acct = await fetchAccount();
@@ -138,6 +190,7 @@ async function init() {
   await refreshUsers();
   await refreshOrgs();
   await refreshRooms();
+  await refreshReports();
 }
 
 init();

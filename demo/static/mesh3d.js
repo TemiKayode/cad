@@ -2329,3 +2329,4 @@ renderPanels();
 // already-open WebSocket message.
 renderActivityFeed("mesh", room, "activityList");
 setInterval(() => renderActivityFeed("mesh", room, "activityList"), 20000);
+setupReportButton("mesh", room);

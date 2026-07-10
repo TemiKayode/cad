@@ -196,6 +196,29 @@
     </div>
   </div>
 
+  <div id="accountModal" class="modal-overlay" style="display:none">
+    <div class="modal modal-narrow">
+      <div class="modal-header">
+        <span>Account</span>
+        <button id="accountModalClose" class="ghost-btn" title="Close" aria-label="Close"><svg class="icon"><use href="#icon-x"></use></svg></button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Signed in as <b id="accountModalEmail"></b></p>
+        <div class="tool-row" style="margin-bottom:10px">
+          <button id="accountExportBtn" style="flex:1">Export my data</button>
+        </div>
+        <div class="tool-row" style="margin-bottom:14px">
+          <button id="accountSignOutBtn" style="flex:1">Sign out</button>
+          <button id="accountSignOutEverywhereBtn" class="ghost-btn" style="flex:1">Sign out everywhere</button>
+        </div>
+        <div style="border-top:1px solid var(--border);padding-top:14px">
+          <p class="empty-hint" style="margin-bottom:8px">Deleting your account releases any rooms you personally own (they stay accessible, just unowned) and removes your sessions, shares, and organization memberships. This can't be undone.</p>
+          <button id="accountDeleteBtn" class="danger-btn" style="width:100%">Delete my account</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="signInModal" class="modal-overlay" style="display:none">
     <div class="modal modal-narrow">
       <div class="modal-header">

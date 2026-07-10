@@ -865,11 +865,9 @@ function renderAccountArea(acct) {
   const chip = document.createElement("button");
   chip.id = "accountChip";
   chip.className = "status-pill";
-  chip.title = `Signed in as ${acct.user.email} -- click to sign out`;
+  chip.title = `Signed in as ${acct.user.email} -- click for account settings`;
   chip.textContent = acct.user.display_name || acct.user.email;
-  chip.onclick = () => {
-    if (window.confirm(`Sign out of ${acct.user.email}?`)) signOut(false);
-  };
+  chip.onclick = () => openAccountModal(acct.user);
   area.appendChild(chip);
 }
 
@@ -939,6 +937,59 @@ document.getElementById("notificationsMarkAllBtn").onclick = async () => {
   await fetch("/api/notifications/read-all", { method: "POST" });
   await openNotificationsModal();
   await refreshNotificationsBadge();
+};
+
+// -- account settings: GDPR export/delete (Part 6 P7) ----------------------------
+
+function openAccountModal(user) {
+  document.getElementById("accountModalEmail").textContent = user.email;
+  document.getElementById("accountModal").style.display = "flex";
+}
+
+function closeAccountModal() {
+  document.getElementById("accountModal").style.display = "none";
+}
+
+document.getElementById("accountModalClose").onclick = closeAccountModal;
+document.getElementById("accountModal").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeAccountModal();
+});
+
+document.getElementById("accountExportBtn").onclick = async () => {
+  const resp = await fetch("/api/account/export");
+  if (!resp.ok) {
+    showToast("Could not export your data", "error");
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "crdt-cad-account-export.json";
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
+document.getElementById("accountSignOutBtn").onclick = () => signOut(false);
+document.getElementById("accountSignOutEverywhereBtn").onclick = () => signOut(true);
+
+document.getElementById("accountDeleteBtn").onclick = async () => {
+  const email = document.getElementById("accountModalEmail").textContent;
+  const typed = window.prompt(
+    `This permanently deletes your account. Rooms you personally own become unowned (still reachable, just no longer private to you), and you'll be signed out everywhere. Type your e-mail address (${email}) to confirm:`
+  );
+  if (typed === null) return;
+  if (typed.trim().toLowerCase() !== email.trim().toLowerCase()) {
+    showToast("E-mail didn't match -- account not deleted", "error");
+    return;
+  }
+  const resp = await fetch("/api/account/delete", { method: "POST" });
+  if (!resp.ok) {
+    const detail = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+    showToast(`Could not delete account: ${detail}`, "error");
+    return;
+  }
+  location.reload();
 };
 
 loadRooms();

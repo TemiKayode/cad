@@ -1347,6 +1347,84 @@ async def stripe_webhook(request: Request) -> dict:
     return {"ok": True}
 
 
+# -- GDPR data export / account deletion (Part 6 P7) ---------------------------
+
+
+@app.get("/api/account/export")
+async def export_account_data(request: Request) -> dict:
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    store = auth.get_account_store()
+    return {
+        "exported_at": time.time(),
+        "profile": {k: v for k, v in user.items() if k != "disabled"},
+        "owned_rooms": store.list_owned_rooms(user["user_id"]),
+        "granted_rooms": store.list_granted_rooms(user["user_id"]),
+        "organizations": store.list_orgs_for_user(user["user_id"]),
+        "notifications": store.list_notifications(user["user_id"]),
+    }
+
+
+@app.post("/api/account/delete")
+async def delete_account(request: Request, response: Response) -> dict:
+    """The 'right to erasure' -- see `AccountStore.delete_user_account`'s
+    docstring for exactly what this does and doesn't remove (a room they
+    personally owned is released, not destroyed; their past comments/
+    edits in room history are untouched, since those only ever held a
+    display-name snapshot, never a live reference to this account)."""
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    user = auth.current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in required")
+    store = auth.get_account_store()
+    for org in store.list_orgs_for_user(user["user_id"]):
+        if org["role"] == "admin" and store.count_org_admins(org["org_id"]) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"you are the last admin of '{org['name']}' -- promote someone else "
+                    "or delete the organization first"
+                ),
+            )
+    store.delete_user_account(user["user_id"])
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+# -- abuse reports (Part 6 P7) --------------------------------------------------
+
+
+class ReportRequest(BaseModel):
+    reason: str
+    details: str = ""
+
+
+async def _create_report(kind: str, room_id: str, request: Request, req: ReportRequest) -> dict:
+    if not auth.accounts_enabled():
+        raise HTTPException(status_code=404, detail="accounts mode is not enabled on this server")
+    if not req.reason.strip():
+        raise HTTPException(status_code=400, detail="reason is required")
+    user = auth.current_user(request)
+    report = auth.get_account_store().create_abuse_report(
+        user["user_id"] if user else None, kind, room_id, req.reason.strip(), req.details.strip(),
+    )
+    return {"ok": True, "report_id": report["report_id"]}
+
+
+@app.post("/api/rooms/{room_id}/report", dependencies=[Depends(require_room_access("drawing"))])
+async def report_drawing_room(room_id: str, req: ReportRequest, request: Request) -> dict:
+    return await _create_report("drawing", room_id, request, req)
+
+
+@app.post("/api/mesh/{room_id}/report", dependencies=[Depends(require_room_access("mesh"))])
+async def report_mesh_room(room_id: str, req: ReportRequest, request: Request) -> dict:
+    return await _create_report("mesh", room_id, request, req)
+
+
 async def _transfer_room_to_org(kind: str, room_id: str, org_id: str, user: Optional[dict]) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="sign in required")
@@ -1451,6 +1529,24 @@ async def admin_delete_room(kind: str, room_id: str) -> dict:
                 pass  # already disconnecting -- nothing to clean up
     store.delete(kind, room_id)
     auth.get_account_store().delete_room_ownership(kind, room_id)
+    return {"ok": True}
+
+
+@app.get("/api/admin/reports", dependencies=[Depends(require_platform_admin())])
+async def admin_list_reports(status: Optional[str] = None) -> list[dict]:
+    return auth.get_account_store().list_abuse_reports(status=status)
+
+
+class ResolveReportRequest(BaseModel):
+    status: str  # "resolved" | "dismissed"
+
+
+@app.post("/api/admin/reports/{report_id}/resolve", dependencies=[Depends(require_platform_admin())])
+async def admin_resolve_report(report_id: str, req: ResolveReportRequest) -> dict:
+    if req.status not in ("resolved", "dismissed"):
+        raise HTTPException(status_code=400, detail="status must be 'resolved' or 'dismissed'")
+    if not auth.get_account_store().resolve_abuse_report(report_id, req.status):
+        raise HTTPException(status_code=404, detail="report not found")
     return {"ok": True}
 
 
