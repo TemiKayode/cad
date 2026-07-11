@@ -14,7 +14,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8
         with:
           version: "latest"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       # --locked fails the build outright if uv.lock is out of sync with
@@ -39,7 +39,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8
         with:
           version: "latest"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: uv sync --locked --extra dev
@@ -60,7 +60,7 @@ jobs:
       - uses: astral-sh/setup-uv@v8
         with:
           version: "latest"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: uv sync --locked --extra dev
@@ -88,7 +88,7 @@ jobs:
     needs: docker
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
