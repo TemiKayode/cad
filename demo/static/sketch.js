@@ -2855,6 +2855,14 @@ function arrayCircular(count, totalAngleDeg) {
   });
 }
 
+/** Short human-readable label for a path in a dropdown (trim/extend's
+ * boundary picker) -- same "shape name, or N pts" convention
+ * renderPathList already uses for the left panel's path list. */
+function pathLabel(pathId) {
+  const props = state.pathProps.get(pathId) || {};
+  return props.shape ? props.shape : `${pathPoints(pathId).length} pts`;
+}
+
 /** World-space point list for any path (freehand/polygon, or a shape
  * primitive converted to an equivalent polygon) -- the shared input
  * `/api/geometry/offset` needs, since shapely works in plain points,
@@ -3043,6 +3051,97 @@ function filletPathVertex(pathId, vertexIndex, radius) {
   renderAll();
   showUndoToast("Fillet applied", () => {
     replacePathPoints(pathId, newIds, afterId, [pCorner]);
+    renderAll();
+  });
+  return true;
+}
+
+/** Line-line intersection: p1+t*(p2-p1) = p3+u*(p4-p3). Returns
+ * {t, u, point}, or null for parallel (or coincident) lines. Neither
+ * t nor u is clamped here -- trimExtendEndpoint decides what range of
+ * each is meaningful for its own purpose. */
+function lineIntersection(p1, p2, p3, p4) {
+  const d1 = [p2[0] - p1[0], p2[1] - p1[1]];
+  const d2 = [p4[0] - p3[0], p4[1] - p3[1]];
+  const denom = d1[0] * d2[1] - d1[1] * d2[0];
+  if (Math.abs(denom) < 1e-12) return null;
+  const dx = p3[0] - p1[0], dy = p3[1] - p1[1];
+  const t = (dx * d2[1] - dy * d2[0]) / denom;
+  const u = (dx * d1[1] - dy * d1[0]) / denom;
+  return { t, u, point: [p1[0] + t * d1[0], p1[1] + t * d1[1]] };
+}
+
+/** Trim *and* extend are the same operation: shorten or lengthen an
+ * open path's endpoint segment until it meets a chosen boundary,
+ * whichever the geometry calls for -- simpler for the user than
+ * picking "trim" vs "extend" up front, and simpler to implement as one
+ * function than two nearly-identical ones. `pFrom` is the segment's
+ * fixed point, `pEndpoint` its current free end (t=1). Searches every
+ * boundary segment for a valid crossing (0<=u<=1) of the *infinite*
+ * line through pFrom->pEndpoint and returns the one whose t is closest
+ * to 1: t<1 shortens to it (trim), t>1 lengthens to it (extend).
+ * Throws a plain, user-facing-message Error if no boundary segment
+ * qualifies, or the only candidates are behind pFrom itself (which
+ * would collapse or reverse the segment). Scoped to straight
+ * boundaries/segments only -- a curved segment (Phase 8) on either
+ * path isn't intersected specially, just its endpoints' straight
+ * chord, an accepted limitation for this first pass. */
+function computeTrimExtend(pFrom, pEndpoint, boundaryPts) {
+  let best = null, bestDelta = Infinity;
+  for (let i = 0; i < boundaryPts.length - 1; i++) {
+    const hit = lineIntersection(pFrom, pEndpoint, boundaryPts[i], boundaryPts[i + 1]);
+    if (!hit) continue;
+    if (hit.t <= 1e-6) continue;
+    if (hit.u < -1e-9 || hit.u > 1 + 1e-9) continue;
+    const delta = Math.abs(hit.t - 1);
+    if (delta < bestDelta) { bestDelta = delta; best = hit; }
+  }
+  if (!best) throw new Error("this segment's line doesn't reach the chosen boundary");
+  return best.point;
+}
+
+/** Applies trim/extend to `pathId`'s Start or End point, against
+ * `boundaryPathId`'s geometry. Both paths' points are converted to
+ * *world* space first (a path may itself be transformed -- duplicate/
+ * rotate/scale apply to any path type, freehand included), and the
+ * result converted back to `pathId`'s own base space before being
+ * stored, the same "compute in world space, store in base space"
+ * discipline applyPathTransform/inversePathTransform already define
+ * for every other tool that touches a transformed path's points. */
+function trimExtendEndpoint(pathId, whichEnd, boundaryPathId) {
+  const entries = liveEntries(state.pathNodes.get(pathId));
+  if (entries.length < 2) {
+    showToast("This path needs at least 2 points", "error");
+    return false;
+  }
+  const props = state.pathProps.get(pathId) || {};
+  const toWorld = (p) => applyPathTransform(pathId, props, p);
+  const toBase = (p) => inversePathTransform(pathId, props, p);
+
+  const fromIdx = whichEnd === "start" ? 1 : entries.length - 2;
+  const endIdx = whichEnd === "start" ? 0 : entries.length - 1;
+  const afterId = whichEnd === "start" ? null : entries[fromIdx].id;
+  const oldNodeId = entries[endIdx].id;
+
+  const boundaryPts = pathAsWorldPolygon(boundaryPathId);
+  if (!boundaryPts || boundaryPts.length < 2) {
+    showToast("That boundary path has no usable geometry", "error");
+    return false;
+  }
+  let newWorldPoint;
+  try {
+    newWorldPoint = computeTrimExtend(toWorld(entries[fromIdx].v), toWorld(entries[endIdx].v), boundaryPts);
+  } catch (err) {
+    showToast(err.message, "error");
+    return false;
+  }
+  const newPos = toBase(newWorldPoint);
+  const oldPos = entries[endIdx].v;
+
+  const newIds = replacePathPoints(pathId, [oldNodeId], afterId, [newPos]);
+  renderAll();
+  showUndoToast("Trim/extend applied", () => {
+    replacePathPoints(pathId, newIds, afterId, [oldPos]);
     renderAll();
   });
   return true;
@@ -4161,6 +4260,25 @@ function renderSelectionPanel() {
       <button id="selFilletApply">Apply</button>
     </div>`
     : "";
+  // Trim and extend are one operation here (see trimExtendEndpoint's
+  // doc comment) -- only meaningful for a freehand/polygon path (2+
+  // points) against some *other* path in the room as the boundary.
+  const otherPathIds = [...state.pathIndex].filter((id) => id !== pathId);
+  const canTrimExtend = !props.shape && liveEntries(state.pathNodes.get(pathId)).length >= 2 && otherPathIds.length > 0;
+  const trimExtendHtml = canTrimExtend
+    ? `
+    <div class="field-row" style="margin-top:6px"><label>Trim / extend to</label></div>
+    <div class="tool-row">
+      <select id="selTrimEnd" style="width:56px">
+        <option value="start">Start</option>
+        <option value="end" selected>End</option>
+      </select>
+      <select id="selTrimBoundary" style="flex:1">
+        ${otherPathIds.map((id) => `<option value="${id}">${escapeHtml(pathLabel(id))}</option>`).join("")}
+      </select>
+      <button id="selTrimApply">Apply</button>
+    </div>`
+    : "";
   panel.innerHTML = `
     <div class="field-row"><label>Color</label><input id="selColor" type="text" value="${escapeHtml(props.color || "#ffffff")}" style="width:90px"/></div>
     ${typeSpecificFields}
@@ -4171,6 +4289,7 @@ function renderSelectionPanel() {
     ${modifyPanelHtml("sel")}
     ${offsetHtml}
     ${filletHtml}
+    ${trimExtendHtml}
     <button class="danger" id="selDelete" style="width:100%;margin-top:6px">Delete path</button>
   `;
   wireModifyPanel("sel");
@@ -4187,6 +4306,13 @@ function renderSelectionPanel() {
       const radius = parseFloat(document.getElementById("selFilletRadius").value) || 0;
       if (radius <= 0) { showToast("Radius must be positive", "error"); return; }
       filletPathVertex(pathId, vertexIndex, radius);
+    };
+  }
+  if (canTrimExtend) {
+    document.getElementById("selTrimApply").onclick = () => {
+      const whichEnd = document.getElementById("selTrimEnd").value;
+      const boundaryPathId = document.getElementById("selTrimBoundary").value;
+      trimExtendEndpoint(pathId, whichEnd, boundaryPathId);
     };
   }
   document.getElementById("selColor").onchange = (e) => setPathProp(pathId, "color", e.target.value);
