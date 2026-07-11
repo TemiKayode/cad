@@ -43,6 +43,7 @@ const state = {
   constraints: new Map(), // constraint_id -> {kind, anchors, param} (Phase 14)
   groups: new Set(),      // group_id -> just existence, like layers (Phase 15)
   sheets: new Map(),      // sheet_id -> {name, page_size, orientation, ...} (Part 7 C3)
+  components: new Map(),  // component_id -> {name, pivot: [x,y]} (Part 7 C5)
 };
 
 // -- document units (Phase 11) ------------------------------------------------
@@ -268,6 +269,7 @@ function observeSnapshotCounters(doc) {
   scanEntries(doc.groups);
   scanEntries(doc.sheets);
   for (const m of Object.values(doc.sheet_props || {})) scanEntries(m);
+  scanEntries(doc.components);
   clock.observe(maxCounter);
 }
 
@@ -317,6 +319,8 @@ function loadSnapshot(doc) {
     for (const e of m.entries) if (!e.d) props[e.k] = e.v;
     state.sheets.set(sid, props);
   }
+  state.components.clear();
+  for (const e of doc.components.entries) if (!e.d) state.components.set(e.k, e.v);
 
   if (!ui.activeLayer || !state.layers.has(ui.activeLayer)) {
     ui.activeLayer = state.layerOrder[0] || null;
@@ -375,6 +379,8 @@ function applyOp(op) {
     const props = state.sheets.get(op.scope) || {};
     if (!p.d) props[p.k] = p.v; else delete props[p.k];
     state.sheets.set(op.scope, props);
+  } else if (op.target === "component") {
+    if (!p.d) state.components.set(p.k, p.v); else state.components.delete(p.k);
   }
 }
 
@@ -973,6 +979,7 @@ function renderSheetsModal() {
 }
 
 document.getElementById("sheetsBtn").onclick = openSheetsModal;
+document.getElementById("makeComponentBtn").onclick = makeComponentFromSelection;
 
 // -- dimension annotations (Phase 13) --------------------------------------------
 // A dimension references its two anchors by (path_id, node_id) -- the
@@ -1630,6 +1637,24 @@ function hitTestPath(screenPt) {
   for (const pathId of state.pathIndex) {
     const props = state.pathProps.get(pathId) || {};
     if (ui.hiddenLayers.has(props.layer_id)) continue;
+    if (props.shape === "instance") {
+      // Part 7 C5: resolved fresh from the current definition geometry
+      // (see resolveInstanceGeometry) -- an orphaned instance (no live
+      // component/definition) simply isn't hit-testable, matching how
+      // it doesn't render either.
+      const resolved = resolveInstanceGeometry(pathId, props);
+      if (!resolved) continue;
+      if (resolved.kind === "shape") {
+        if (hitTestShape(resolved.props, screenPt)) return pathId;
+        continue;
+      }
+      const pts = resolved.points.map((p) => worldToScreen(...p));
+      for (let i = 0; i < pts.length - 1; i++) {
+        const d = distToSegment(screenPt, pts[i], pts[i + 1]);
+        if (d < bestDist) { bestDist = d; best = pathId; }
+      }
+      continue;
+    }
     if (props.shape) {
       // Shape primitives (Phase 11) have no path_geom points to walk --
       // hitTestShape has its own dedicated per-kind boundary math. Test
@@ -1871,6 +1896,72 @@ function groupMembersOf(pathId) {
   const gid = (state.pathProps.get(pathId) || {}).group_id;
   if (!gid) return [pathId];
   return [...state.pathIndex].filter((pid) => (state.pathProps.get(pid) || {}).group_id === gid);
+}
+
+// -- components with instances (Part 7 C5) -------------------------------------
+// Mirrors crdt_cad.crdt.document.DrawingDocument.add_component/
+// remove_component exactly -- see resolveInstanceGeometry's own
+// docstring (near pathBaseCenter) for the full design rationale and
+// this phase's deliberate "one definition path per component" scope.
+
+function addComponent(name, pivot) {
+  const id = "component_" + rid();
+  const op = { target: "component", payload: lwwOp(clock.tick(), id, { name, pivot }, false) };
+  applyOp(op);
+  sendOps([op]);
+  return id;
+}
+
+function removeComponent(id) {
+  const op = { target: "component", payload: lwwOp(clock.tick(), id, null, true) };
+  applyOp(op);
+  sendOps([op]);
+}
+
+/** Turns exactly one currently-selected path into a component
+ * definition: registers a fresh component (pivot = the path's own
+ * current *world* center, so an already-moved/rotated source still
+ * gets a sensible instance pivot) and tags that one path with the new
+ * `component_id`. Deliberately refuses a multi-path selection in this
+ * phase (see add_component's docstring) rather than silently picking
+ * one and ignoring the rest. */
+function makeComponentFromSelection() {
+  const ids = [...ui.selectedPaths];
+  if (ids.length !== 1) {
+    showToast("Select exactly one path to turn into a component", "error");
+    return;
+  }
+  const [pathId] = ids;
+  const props = state.pathProps.get(pathId) || {};
+  if (props.shape === "instance") {
+    showToast("An instance can't itself become a component definition", "error");
+    return;
+  }
+  if (props.component_id) {
+    showToast("This path is already a component definition", "error");
+    return;
+  }
+  const name = window.prompt("Component name:", "Component");
+  if (!name) return;
+  const pivot = applyPathTransform(pathId, props, pathBaseCenter(pathId, props));
+  const cid = addComponent(name, pivot);
+  setPathProp(pathId, "component_id", cid);
+  renderAll();
+  showToast(`"${name}" is now a reusable component`, "success");
+}
+
+/** Adds one new instance of `componentId`, offset from the component's
+ * own pivot by a small visible amount so it doesn't render exactly on
+ * top of the definition (or the previous instance) -- the same
+ * "duplicate offsets so the copy is visibly distinct" convention
+ * DUPLICATE_OFFSET already establishes for plain path duplication. */
+function placeComponentInstance(componentId) {
+  if (!ui.activeLayer) { ui.activeLayer = addLayer("Layer 1"); renderLayerList(); }
+  const transform = { tx: DUPLICATE_OFFSET, ty: DUPLICATE_OFFSET, rotation: 0, scale: 1 };
+  const { id } = addPath(ui.activeLayer, [], "#111111", 2.5, { shape: "instance", component_id: componentId, transform });
+  ui.selectedPaths = new Set([id]);
+  renderAll();
+  return id;
 }
 
 /** Solves the chosen constraint against the two currently-selected
@@ -2580,6 +2671,14 @@ function pathBaseCenter(pathId, props) {
   if (props.shape === "line") return [(props.x1 + props.x2) / 2, (props.y1 + props.y2) / 2];
   if (props.shape === "rect") return [props.x + props.w / 2, props.y + props.h / 2];
   if (props.shape === "circle" || props.shape === "ellipse" || props.shape === "arc") return [props.cx, props.cy];
+  // Instance (Part 7 C5): its own move/rotate/scale pivots around its
+  // component's fixed, once-captured world-space pivot -- not any
+  // geometry of its own (an instance has none). Falls back to [0,0] for
+  // an orphaned instance (component deleted) rather than throwing --
+  // renderResolveInstance's own null-check is what actually stops it
+  // from drawing; a sane pivot here just keeps the transform gizmo/
+  // duplicate/etc. from crashing on a selection that includes one.
+  if (props.shape === "instance") return (state.components.get(props.component_id) || {}).pivot || [0, 0];
   const pts = pathPoints(pathId);
   if (!pts.length) return [0, 0];
   const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
@@ -2669,6 +2768,100 @@ function transformedShapeProps(pathId, props) {
     if ("end_angle" in props) out.end_angle = props.end_angle + t.rotation;
   }
   return out;
+}
+
+// -- components with instances (Part 7 C5) -------------------------------------
+// Mirrors crdt_cad.crdt.document's resolve_component_instances/
+// _bake_with_pivot exactly (see that module's docstring for the full
+// design rationale) -- a definition is one ordinary path tagged with a
+// `component_id` path_prop; an instance is a separate path with
+// `shape: "instance"`, no geometry of its own, resolved fresh from the
+// definition's *current* geometry on every render/hit-test/bounds call
+// (never copied), which is exactly what makes editing the definition
+// update every instance live. Deliberately one definition path per
+// component in this phase, not a multi-path assembly -- see
+// add_component's docstring in document.py.
+
+/** Point-transform helper mirroring _apply_point_transform in
+ * document.py exactly -- rotates/scales `pt` around `pivot` by `t`,
+ * then translates. Distinct from applyPathTransform (which derives its
+ * own pivot from the *path's* base geometry): an instance's pivot is a
+ * fixed point captured once at add_component time, not derived from
+ * anything the instance itself owns. */
+function applyTransformAroundPivot([x, y], pivot, t) {
+  const dx = (x - pivot[0]) * t.scale, dy = (y - pivot[1]) * t.scale;
+  const rad = (t.rotation * Math.PI) / 180;
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  return [pivot[0] + dx * cos - dy * sin + t.tx, pivot[1] + dx * sin + dy * cos + t.ty];
+}
+
+/** The (first, in this phase) path currently tagged as this
+ * component's definition -- an O(n) scan over every path, same
+ * simplicity-over-premature-optimization choice `groups`/mirror
+ * already make elsewhere in this file; large-document performance is
+ * Part 7 C8's own separate scope, not addressed here. */
+function definitionPathIdForComponent(componentId) {
+  for (const pathId of state.pathIndex) {
+    const props = state.pathProps.get(pathId);
+    if (props && props.component_id === componentId && props.shape !== "instance") return pathId;
+  }
+  return null;
+}
+
+/** Resolves one instance path into concrete, drawable/hit-testable
+ * world-space geometry -- `{kind: "shape", props}` (feed straight into
+ * drawShapePath/hitTestShape, already fully world-space so no further
+ * canvas transform should be pushed) or `{kind: "points", points,
+ * color, stroke_width}` for a freehand-path definition, or `null` if
+ * the component was deleted or its definition path no longer exists
+ * (an orphaned instance -- renders/hit-tests as nothing, the same
+ * "silently unresolvable" contract resolve_component_instances commits
+ * to server-side). Curve segments on a freehand definition are
+ * deliberately NOT re-curved through the instance's own transform in
+ * this phase (a known, narrow visual approximation for a rotated/
+ * scaled instance of a *curved* freehand definition only -- straight-
+ * segment and shape-primitive definitions, the common case, are
+ * exact). */
+function resolveInstanceGeometry(instancePathId, instanceProps) {
+  const comp = state.components.get(instanceProps.component_id);
+  const defId = definitionPathIdForComponent(instanceProps.component_id);
+  if (!comp || !defId) return null;
+  const defProps = state.pathProps.get(defId) || {};
+  const pivot = comp.pivot;
+  let t = getTransform(instanceProps);
+  if (selectDrag && selectDrag.mode === "move" && selectDrag.selection.has(instancePathId)) {
+    t = { ...t, tx: t.tx + selectDrag.liveDelta[0], ty: t.ty + selectDrag.liveDelta[1] };
+  }
+  const color = instanceProps.color || defProps.color;
+  const strokeWidth = instanceProps.stroke_width || defProps.stroke_width;
+
+  if (defProps.shape) {
+    const baked = transformedShapeProps(defId, defProps); // definition's own transform, baked
+    const out = { ...baked, color, stroke_width: strokeWidth };
+    if (baked.shape === "line") {
+      [out.x1, out.y1] = applyTransformAroundPivot([baked.x1, baked.y1], pivot, t);
+      [out.x2, out.y2] = applyTransformAroundPivot([baked.x2, baked.y2], pivot, t);
+    } else if (baked.shape === "rect") {
+      [out.x, out.y] = applyTransformAroundPivot([baked.x, baked.y], pivot, t);
+      out.w = baked.w * t.scale;
+      out.h = baked.h * t.scale;
+    } else if (baked.shape === "text") {
+      [out.x, out.y] = applyTransformAroundPivot([baked.x, baked.y], pivot, t);
+      out.font_size = (baked.font_size || 16) * t.scale;
+    } else {
+      [out.cx, out.cy] = applyTransformAroundPivot([baked.cx, baked.cy], pivot, t);
+      if ("r" in baked) out.r = baked.r * t.scale;
+      if ("rx" in baked) out.rx = baked.rx * t.scale;
+      if ("ry" in baked) out.ry = baked.ry * t.scale;
+      if ("start_angle" in baked) out.start_angle = baked.start_angle + t.rotation;
+      if ("end_angle" in baked) out.end_angle = baked.end_angle + t.rotation;
+    }
+    return { kind: "shape", props: out };
+  }
+
+  const basePts = pathPoints(defId).map((pt) => applyPathTransform(defId, defProps, pt));
+  const points = basePts.map((pt) => applyTransformAroundPivot(pt, pivot, t));
+  return { kind: "points", points, color, stroke_width: strokeWidth };
 }
 
 /** Wraps the given path's drawing in canvas's own nested transform
@@ -2791,7 +2984,20 @@ function drawSnapGlyph(glyph) {
  * screen, not a path's untransformed base data. */
 function pathWorldBounds(pathId, props) {
   let pts;
-  if (props.shape) {
+  if (props.shape === "instance") {
+    const resolved = resolveInstanceGeometry(pathId, props);
+    if (!resolved) return null;
+    if (resolved.kind === "points") {
+      pts = resolved.points;
+    } else {
+      const t = resolved.props;
+      if (t.shape === "line") pts = [[t.x1, t.y1], [t.x2, t.y2]];
+      else if (t.shape === "rect") pts = [[t.x, t.y], [t.x + t.w, t.y + t.h]];
+      else if (t.shape === "ellipse") pts = [[t.cx - t.rx, t.cy - t.ry], [t.cx + t.rx, t.cy + t.ry]];
+      else if (t.shape === "text") pts = [[t.x, t.y], [t.x, t.y]];
+      else pts = [[t.cx - t.r, t.cy - t.r], [t.cx + t.r, t.cy + t.r]];
+    }
+  } else if (props.shape) {
     const t = transformedShapeProps(pathId, props);
     if (t.shape === "line") pts = [[t.x1, t.y1], [t.x2, t.y2]];
     else if (t.shape === "rect") pts = [[t.x, t.y], [t.x + t.w, t.y + t.h]];
@@ -2940,6 +3146,7 @@ function mirrorPath(pathId, axis, center) {
     return id;
   }
   if (props.shape === "arc") return null; // see module comment above
+  if (props.shape === "instance") return null; // Part 7 C5: not yet a supported tool for instances
   if (props.shape === "line") {
     const [x1, y1] = reflectPointAxis([props.x1, props.y1], center, axis);
     const [x2, y2] = reflectPointAxis([props.x2, props.y2], center, axis);
@@ -2977,7 +3184,7 @@ function mirrorSelection(axis) {
   if (!ids.length) return;
   const center = selectionPivot(ids);
   const newIds = ids.map((id) => mirrorPath(id, axis, center)).filter((id) => id !== null);
-  if (newIds.length < ids.length) showToast("Arc shapes can't be mirrored yet -- skipped", "info");
+  if (newIds.length < ids.length) showToast("Arc shapes and component instances can't be mirrored yet -- skipped", "info");
   if (!newIds.length) return;
   ui.selectedPaths = new Set(newIds);
   renderAll();
@@ -3559,6 +3766,7 @@ function buildCommands() {
     clickCmd("downloadPngFitBtn", "Export .png (fit to content)", "File", "", "file"),
     clickCmd("importBtn", "Import SVG/DXF", "File", "", "upload"),
     clickCmd("sheetsBtn", "Sheets (page setup, title block, PDF export)", "File", "", "file"),
+    clickCmd("makeComponentBtn", "Make component from selection", "Tools", "", "box"),
 
     clickCmd("shareBtn", "Copy full-access invite link", "Room", "", "link"),
     clickCmd("shareViewOnlyBtn", "Copy view-only invite link", "Room", "", "eye"),
@@ -3923,6 +4131,51 @@ function render() {
   for (const pathId of zOrderedPathIds()) {
     const props = state.pathProps.get(pathId) || {};
     if (ui.hiddenLayers.has(props.layer_id)) continue;
+    if (props.shape === "instance") {
+      // Part 7 C5: resolved to already-final world coordinates (see
+      // resolveInstanceGeometry) -- drawn directly, with no
+      // beginPathTransform push, since there's nothing further to
+      // transform. An orphaned instance (component/definition gone)
+      // resolves to null and simply isn't drawn -- not an error.
+      const resolved = resolveInstanceGeometry(pathId, props);
+      if (!resolved) continue;
+      const isSelected = ui.selectedPaths.has(pathId);
+      const isHovered = pathId === hoveredPathId;
+      const isFlashing = flashingPathIds.has(pathId);
+      const remoteColor = remoteEditFlashes.get(pathId) || remoteSelectionColorFor(pathId);
+      if (resolved.kind === "shape") {
+        drawShapePath(resolved.props, isSelected, false, isHovered, isFlashing, remoteColor);
+        continue;
+      }
+      const pts = resolved.points;
+      if (pts.length === 0) continue;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      const isClosed = pts.length > 2 && Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1e-6;
+      if (isClosed) applyFillIfSet(resolved);
+      ctx.strokeStyle = resolved.color || "#e7e9ee";
+      ctx.lineWidth = resolved.stroke_width || 2.5;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      if (isSelected) {
+        ctx.save();
+        ctx.strokeStyle = canvasColor("--accent");
+        ctx.lineWidth = (resolved.stroke_width || 2.5) + 4;
+        ctx.globalAlpha = 0.25;
+        ctx.stroke();
+        ctx.restore();
+      } else if (isHovered) {
+        ctx.save();
+        ctx.strokeStyle = canvasColor("--accent");
+        ctx.lineWidth = (resolved.stroke_width || 2.5) + 3;
+        ctx.globalAlpha = 0.15;
+        ctx.stroke();
+        ctx.restore();
+      }
+      continue;
+    }
     // Phase 12: wraps this path's own drawing in canvas's nested transform
     // stack (around its pivot) when it has a move/rotate/scale applied --
     // see beginPathTransform's docstring. Everything below keeps using raw,
@@ -4286,6 +4539,40 @@ function renderPathList() {
   }
 }
 
+/** Lists every component (Part 7 C5): "Place" adds a new instance
+ * (see placeComponentInstance), "Delete" removes just the registry
+ * entry -- the definition path itself, and any already-placed
+ * instances, are left alone (see remove_component's docstring in
+ * document.py for why: an existence tag left dangling, not a cascade
+ * delete). */
+function renderComponentList() {
+  const list = document.getElementById("componentList");
+  if (!list) return;
+  list.innerHTML = "";
+  if (state.components.size === 0) {
+    list.innerHTML = '<div class="empty-hint">Select one path and click "Make component" to create a reusable, live-updating definition.</div>';
+    return;
+  }
+  for (const [cid, comp] of state.components) {
+    const row = document.createElement("div");
+    row.className = "path-row";
+    row.innerHTML = `
+      <span class="name">${escapeHtml(comp.name || "Component")}</span>
+      <button class="ghost-btn" data-act="place" title="Place a new instance" aria-label="Place a new instance">${iconHtml("plus")}</button>
+      <button class="ghost-btn" data-act="del" title="Delete component" aria-label="Delete component">${iconHtml("x")}</button>
+    `;
+    row.querySelector('[data-act="place"]').onclick = () => {
+      placeComponentInstance(cid);
+      showToast(`Placed a new "${comp.name}" instance`, "success");
+    };
+    row.querySelector('[data-act="del"]').onclick = () => {
+      removeComponent(cid);
+      renderAll();
+    };
+    list.appendChild(row);
+  }
+}
+
 /** Bulk-action panel shown when more than one path is selected --
  * per-path fields (color/width/rotation) don't make sense for a mixed
  * group, so this offers group-level operations instead: duplicate,
@@ -4428,7 +4715,10 @@ function renderSelectionPanel() {
   const ungroupButton = props.group_id
     ? '<button style="width:100%;margin-top:4px" id="selUngroup">Ungroup</button>'
     : "";
-  const canOffset = props.shape !== "arc" && props.shape !== "text";
+  // Part 7 C5: an instance has no geometry of its own to send to the
+  // offset endpoint (empty points/point_ids) -- excluded the same way
+  // arc/text already are, not yet a supported tool for instances.
+  const canOffset = props.shape !== "arc" && props.shape !== "text" && props.shape !== "instance";
   const offsetHtml = canOffset
     ? `
     <div class="field-row" style="margin-top:6px"><label>Offset</label></div>
@@ -4580,6 +4870,7 @@ function renderAll() {
   render();
   renderLayerList();
   renderPathList();
+  renderComponentList();
   renderSelectionPanel();
   renderConstraintPanel();
   renderConstraintsListPanel();

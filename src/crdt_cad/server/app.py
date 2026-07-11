@@ -97,7 +97,7 @@ from crdt_cad.ai.interpreter import interpret_edit, interpret_prompt
 from crdt_cad.ai.meshy_adapter import generate_mesh_via_meshy_async, meshy_api_key
 from crdt_cad.ai.validation import GenerationValidationError
 from crdt_cad.crdt.clock import LamportClock, VectorClock
-from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
+from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform, resolve_component_instances
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
 from crdt_cad.crdt.mesh import new_id as mesh_new_id
 from crdt_cad.export.dxf_io import drawing_from_dxf_bytes, drawing_to_dxf_bytes
@@ -1644,6 +1644,7 @@ async def drawing_thumbnail(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     units = room.doc.settings_dict().get("units", "px")
     paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    paths = resolve_component_instances(paths, room.doc.component_list())
     layer_order = [layer["id"] for layer in room.doc.layer_list()]
     svg = drawing_to_svg_string(paths, units=units, dimensions=room.doc.dimension_list(), layer_order=layer_order)
     return Response(content=svg, media_type="image/svg+xml")
@@ -1797,6 +1798,7 @@ async def export_drawing_svg(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     units = room.doc.settings_dict().get("units", "px")
     paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    paths = resolve_component_instances(paths, room.doc.component_list())
     layer_order = [layer["id"] for layer in room.doc.layer_list()]
     svg = drawing_to_svg_string(paths, units=units, dimensions=room.doc.dimension_list(), layer_order=layer_order)
     return _attachment(svg, "image/svg+xml", f"{room_id}.svg")
@@ -1807,6 +1809,7 @@ async def export_drawing_dxf(room_id: str) -> Response:
     room = await drawing_room_manager.get_or_create(room_id)
     units = room.doc.settings_dict().get("units", "px")
     paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    paths = resolve_component_instances(paths, room.doc.component_list())
     layer_order = [layer["id"] for layer in room.doc.layer_list()]
     data = drawing_to_dxf_bytes(paths, units=units, dimensions=room.doc.dimension_list(), layer_order=layer_order)
     return _attachment(data, "application/dxf", f"{room_id}.dxf")
@@ -1826,6 +1829,7 @@ async def export_drawing_pdf(room_id: str, sheet_id: str | None = None) -> Respo
         raise HTTPException(status_code=404, detail="this room has no sheets yet -- create one first")
     sheet = next((s for s in sheets if s["id"] == sheet_id), sheets[0])
     paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    paths = resolve_component_instances(paths, room.doc.component_list())
     layer_order = [layer["id"] for layer in room.doc.layer_list()]
     data = sheet_to_pdf_bytes(paths, sheet, dimensions=room.doc.dimension_list(), layer_order=layer_order)
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", sheet.get("name") or "sheet")

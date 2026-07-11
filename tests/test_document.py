@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 from crdt_cad.crdt.clock import LamportClock
 from crdt_cad.crdt.document import (
     DocOp,
@@ -7,6 +9,7 @@ from crdt_cad.crdt.document import (
     bake_path_transform,
     curve_prop_key,
     flatten_path_to_polyline,
+    resolve_component_instances,
 )
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 
@@ -878,6 +881,151 @@ def test_remove_sheet_deletes_it():
         doc.apply(op)
     doc.apply(doc.remove_sheet(sid))
     assert doc.sheet_list() == []
+
+
+# -- components with instances (Part 7 C5) -------------------------------------
+
+
+def _make_circle_component(doc, name="MyCircle", cx=50.0, cy=50.0, r=10.0):
+    layer_id, layer_ops = doc.add_layer("L")
+    for op in layer_ops:
+        doc.apply(op)
+    def_id, def_ops = doc.add_path(layer_id, [], color="#ff0000")
+    for op in def_ops:
+        doc.apply(op)
+    doc.apply(doc.set_path_prop(def_id, "shape", "circle"))
+    doc.apply(doc.set_path_prop(def_id, "cx", cx))
+    doc.apply(doc.set_path_prop(def_id, "cy", cy))
+    doc.apply(doc.set_path_prop(def_id, "r", r))
+    cid, comp_op = doc.add_component(name, (cx, cy))
+    doc.apply(comp_op)
+    doc.apply(doc.set_path_prop(def_id, "component_id", cid))
+    return layer_id, def_id, cid
+
+
+def _add_instance(doc, layer_id, cid, transform=None):
+    inst_id, ops = doc.add_path(layer_id, [], color="#ff0000")
+    for op in ops:
+        doc.apply(op)
+    doc.apply(doc.set_path_prop(inst_id, "shape", "instance"))
+    doc.apply(doc.set_path_prop(inst_id, "component_id", cid))
+    if transform:
+        doc.apply(doc.set_path_prop(inst_id, "transform", transform))
+    return inst_id
+
+
+def test_add_component_registers_name_and_pivot():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    _, _, cid = _make_circle_component(doc)
+    assert doc.component_list() == [{"id": cid, "name": "MyCircle", "pivot": [50.0, 50.0]}]
+
+
+def test_components_merge_like_every_other_lww_map_component():
+    doc_a = DrawingDocument(LamportClock(actor="a"))
+    _, _, cid = _make_circle_component(doc_a)
+    doc_b = DrawingDocument(LamportClock(actor="b"))
+    doc_b.merge(doc_a)
+    assert doc_b.component_list() == doc_a.component_list()
+
+
+def test_components_survive_serialization_roundtrip():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    _, _, cid = _make_circle_component(doc)
+    restored = DrawingDocument.from_bytes(LamportClock(actor="b"), doc.to_bytes())
+    assert restored.component_list() == doc.component_list()
+
+
+def test_components_default_to_empty_when_absent_from_an_old_snapshot():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    d = doc.to_dict()
+    del d["components"]
+    restored = DrawingDocument.from_dict(LamportClock(actor="b"), d)
+    assert restored.component_list() == []
+    cid, op = restored.add_component("X", (0.0, 0.0))
+    restored.apply(op)
+    assert restored.component_list() == [{"id": cid, "name": "X", "pivot": [0.0, 0.0]}]
+
+
+def test_remove_component_deletes_registry_entry_but_leaves_tagged_paths():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, def_id, cid = _make_circle_component(doc)
+    doc.apply(doc.remove_component(cid))
+    assert doc.component_list() == []
+    # the definition path itself is untouched -- still tagged, still there
+    assert doc.path_props_dict(def_id)["component_id"] == cid
+
+
+def test_resolve_component_instances_identity_transform_matches_definition():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, def_id, cid = _make_circle_component(doc)
+    inst_id = _add_instance(doc, layer_id, cid)
+    paths = [bake_path_transform(p) for p in doc.path_list()]
+    resolved = resolve_component_instances(paths, doc.component_list())
+    inst = next(p for p in resolved if p["id"] == inst_id)
+    assert inst["shape"] == "circle"
+    assert inst["cx"] == 50.0 and inst["cy"] == 50.0 and inst["r"] == 10.0
+
+
+def test_resolve_component_instances_applies_translation_rotation_and_scale():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, def_id, cid = _make_circle_component(doc)
+    inst_id = _add_instance(doc, layer_id, cid, {"tx": 10.0, "ty": 0.0, "rotation": 90.0, "scale": 2.0})
+    paths = [bake_path_transform(p) for p in doc.path_list()]
+    resolved = resolve_component_instances(paths, doc.component_list())
+    inst = next(p for p in resolved if p["id"] == inst_id)
+    # the pivot (50,50) *is* the circle's own center, so rotation is a
+    # no-op on position here -- only the tx offset and the doubled radius
+    # should show up.
+    assert inst["cx"] == pytest.approx(60.0)
+    assert inst["cy"] == pytest.approx(50.0)
+    assert inst["r"] == pytest.approx(20.0)
+
+
+def test_resolve_component_instances_reflects_live_definition_edits():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, def_id, cid = _make_circle_component(doc)
+    inst_id = _add_instance(doc, layer_id, cid, {"tx": 0.0, "ty": 0.0, "rotation": 0.0, "scale": 2.0})
+    doc.apply(doc.set_path_prop(def_id, "r", 5.0))
+    paths = [bake_path_transform(p) for p in doc.path_list()]
+    resolved = resolve_component_instances(paths, doc.component_list())
+    inst = next(p for p in resolved if p["id"] == inst_id)
+    assert inst["r"] == pytest.approx(10.0)  # 5 (new def radius) * scale 2
+
+
+def test_resolve_component_instances_drops_an_instance_whose_component_was_deleted():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, def_id, cid = _make_circle_component(doc)
+    inst_id = _add_instance(doc, layer_id, cid)
+    doc.apply(doc.remove_component(cid))
+    paths = [bake_path_transform(p) for p in doc.path_list()]
+    resolved = resolve_component_instances(paths, doc.component_list())
+    assert not any(p["id"] == inst_id for p in resolved)
+
+
+def test_resolve_component_instances_drops_an_instance_whose_definition_path_was_removed():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, def_id, cid = _make_circle_component(doc)
+    inst_id = _add_instance(doc, layer_id, cid)
+    doc.apply(doc.remove_path(def_id))
+    live_paths = [p for p in doc.path_list() if p["id"] != def_id]  # path_list() only returns live (non-removed) paths anyway
+    paths = [bake_path_transform(p) for p in live_paths]
+    resolved = resolve_component_instances(paths, doc.component_list())
+    assert not any(p["id"] == inst_id for p in resolved)
+
+
+def test_resolve_component_instances_leaves_non_instance_paths_untouched():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    layer_id, layer_ops = doc.add_layer("L")
+    for op in layer_ops:
+        doc.apply(op)
+    plain_id, plain_ops = doc.add_path(layer_id, [(0.0, 0.0), (10.0, 10.0)])
+    for op in plain_ops:
+        doc.apply(op)
+    paths = [bake_path_transform(p) for p in doc.path_list()]
+    resolved = resolve_component_instances(paths, doc.component_list())
+    assert len(resolved) == 1
+    assert resolved[0]["id"] == plain_id
+    assert resolved[0]["points"] == [(0.0, 0.0), (10.0, 10.0)]
 
 
 def test_layer_list_and_path_list_preserve_creation_order():

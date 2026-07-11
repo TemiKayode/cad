@@ -51,6 +51,7 @@ DimId = str
 ConstraintId = str
 GroupId = str
 SheetId = str
+ComponentId = str
 Point = tuple[float, float]
 
 # Document units (Phase 11): stored/CRDT geometry is always in raw
@@ -209,6 +210,20 @@ def _ellipse_boundary(cx: float, cy: float, rx: float, ry: float, samples: int =
 _SHAPE_FIELD_KEYS = ("shape", "x", "y", "w", "h", "cx", "cy", "r", "rx", "ry", "start_angle", "end_angle")
 
 
+def _normalize_transform(raw_t: dict | None) -> dict:
+    raw_t = raw_t or _IDENTITY_TRANSFORM
+    return {
+        "tx": raw_t.get("tx", 0.0),
+        "ty": raw_t.get("ty", 0.0),
+        "rotation": raw_t.get("rotation", 0.0),
+        "scale": raw_t.get("scale", 1.0),
+    }
+
+
+def _is_identity_transform(t: dict) -> bool:
+    return t["tx"] == 0 and t["ty"] == 0 and t["rotation"] == 0 and t["scale"] == 1
+
+
 def bake_path_transform(path_dict: dict) -> dict:
     """Returns a copy of `path_dict` (as produced by `path_list()`) with
     its `transform` field (if any, and non-identity) applied directly to
@@ -228,19 +243,23 @@ def bake_path_transform(path_dict: dict) -> dict:
     points (any rotation is exact), a circle is rotation-invariant, and
     an arc's rotation is exactly "add rotation to both angles" -- all
     three stay native shape elements at any transform."""
-    raw_t = path_dict.get("transform") or _IDENTITY_TRANSFORM
-    t = {
-        "tx": raw_t.get("tx", 0.0),
-        "ty": raw_t.get("ty", 0.0),
-        "rotation": raw_t.get("rotation", 0.0),
-        "scale": raw_t.get("scale", 1.0),
-    }
-    if t["tx"] == 0 and t["ty"] == 0 and t["rotation"] == 0 and t["scale"] == 1:
+    t = _normalize_transform(path_dict.get("transform"))
+    if _is_identity_transform(t):
         return path_dict
+    points = path_dict.get("points") or []
+    pivot = _path_base_center(points, path_dict)
+    return _bake_with_pivot(path_dict, t, pivot)
 
+
+def _bake_with_pivot(path_dict: dict, t: dict, pivot: Point) -> dict:
+    """The field-by-field transform application `bake_path_transform`
+    uses, factored out so `resolve_component_instances` (Part 7 C5) can
+    apply an *instance's* transform to its component's definition
+    geometry around the component's own stored pivot -- a different
+    pivot source than a normal path's own base-geometry center, but
+    otherwise the exact same math."""
     out = dict(path_dict)
     points = out.get("points") or []
-    pivot = _path_base_center(points, out)
     if points:
         out["points"] = [_apply_point_transform(p, pivot, t) for p in points]
 
@@ -297,11 +316,75 @@ def bake_path_transform(path_dict: dict) -> dict:
     return out
 
 
+# -- components with instances (Part 7 C5) -------------------------------------
+#
+# A component *definition* is just an ordinary existing path (any kind --
+# freehand or shape primitive), tagged with a `component_id` path_prop (the
+# same "existence tag on an ordinary path_prop field" shape `group_id`
+# already uses for groups) -- v1 deliberately supports exactly one
+# definition path per component, not a multi-path assembly (see
+# `add_component`'s docstring for why). An *instance* is a separate,
+# lightweight path with `props["shape"] == "instance"`, no RGA points of
+# its own (the same "empty points, geometry lives entirely in props"
+# convention every shape primitive already uses), carrying only
+# `component_id` and the same `{tx, ty, rotation, scale}` transform field
+# every other path already has. Editing the definition updates every
+# instance live, since an instance never stores its own geometry -- it's
+# resolved fresh, every render/export, from whatever the definition
+# currently looks like.
+def resolve_component_instances(paths: list[dict], components: list[dict]) -> list[dict]:
+    """Replaces every `shape == "instance"` entry in `paths` (expected
+    to already be individually baked via `bake_path_transform`, i.e.
+    each path's *own* transform is already applied) with a resolved
+    copy of its component's definition geometry, transformed by the
+    instance's own transform around the component's stored pivot --
+    the exact same math `bake_path_transform` applies for a normal
+    path's own transform, just pivoting on a fixed point captured once
+    at `add_component` time rather than the path's own live base
+    center. Exporters (SVG/DXF/PDF) call this once, right after baking
+    every path's own transform, so nothing downstream ever needs to
+    know "instance" is a shape kind at all -- they see only concrete,
+    already-resolved geometry.
+
+    An instance whose component was deleted, or whose component's
+    definition path no longer exists (both real races: a concurrent
+    delete elsewhere), resolves to nothing (silently dropped) -- the
+    same "can't currently resolve this reference, don't error the
+    whole export" contract `resolve_dimension_points` already commits
+    to for a dimension's broken anchor.
+    """
+    pivot_by_component = {c["id"]: tuple(c["pivot"]) for c in components if c.get("pivot") is not None}
+    definition_by_component: dict[str, dict] = {}
+    for p in paths:
+        cid = p.get("component_id")
+        if cid and p.get("shape") != "instance" and cid not in definition_by_component:
+            definition_by_component[cid] = p
+
+    out: list[dict] = []
+    for p in paths:
+        if p.get("shape") != "instance":
+            out.append(p)
+            continue
+        cid = p.get("component_id")
+        definition = definition_by_component.get(cid)
+        pivot = pivot_by_component.get(cid)
+        if definition is None or pivot is None:
+            continue
+        t = _normalize_transform(p.get("transform"))
+        resolved = dict(definition)
+        resolved.pop("component_id", None)
+        resolved["id"] = p["id"]
+        resolved["color"] = p.get("color", definition.get("color"))
+        resolved["stroke_width"] = p.get("stroke_width", definition.get("stroke_width"))
+        out.append(_bake_with_pivot(resolved, t, pivot) if not _is_identity_transform(t) else resolved)
+    return out
+
+
 @dataclass(frozen=True)
 class DocOp:
     """Routable envelope around one op from one of the document's sub-CRDTs."""
 
-    target: str  # "layer" | "layer_prop" | "path_index" | "path_prop" | "path_geom" | "comment" | "presence" | "setting" | "dimension" | "constraint" | "group" | "sheet" | "sheet_prop"
+    target: str  # "layer" | "layer_prop" | "path_index" | "path_prop" | "path_geom" | "comment" | "presence" | "setting" | "dimension" | "constraint" | "group" | "sheet" | "sheet_prop" | "component"
     payload: dict
     scope: Optional[str] = None  # layer_id / path_id, when the target needs one
 
@@ -373,6 +456,19 @@ class DrawingDocument:
         # `layer_props` never writes a default `visible`/`color`.
         self.sheets: LWWElementSet[SheetId] = LWWElementSet(clock)
         self.sheet_props: dict[SheetId, LWWMap] = {}
+        # Components (Part 7 C5): one dict-per-id LWWMap, the same shape
+        # `dimensions`/`constraints` use -- unlike a sheet's title-block
+        # fields, a component only ever has two fields ("name", set once
+        # and rarely renamed, and "pivot", set once at creation and never
+        # touched again), so there's no realistic "concurrent edits to
+        # different fields" scenario worth a sheets-style per-field split
+        # for. `pivot` is the fixed world-space point every instance's own
+        # transform rotates/scales around (see `resolve_component_instances`
+        # in this module) -- captured once from the definition path's own
+        # live center at `add_component` time, deliberately never
+        # recomputed afterward so existing instances never jump as the
+        # definition's own geometry changes shape.
+        self.components: LWWMap[ComponentId, dict] = LWWMap(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -441,6 +537,36 @@ class DrawingDocument:
 
     def sheet_list(self) -> list[dict]:
         return [{"id": sid, **dict(self._sheet_props(sid).items())} for sid in self.sheets]
+
+    # -- components with instances (Part 7 C5) -------------------------------------
+    def add_component(self, name: str, pivot: Point, component_id: ComponentId | None = None) -> tuple[ComponentId, DocOp]:
+        """`pivot` is the definition path's own current *world*-space
+        center (its caller's responsibility to compute -- typically
+        `pathBaseCenter` transformed through the definition path's own
+        live transform, so a definition that's already been moved/
+        rotated still gets a sensible instance pivot). Deliberately
+        just one definition path per component in this phase -- the
+        caller tags that one path with `component_id` itself (an
+        ordinary `set_path_prop`, no new op kind needed, mirroring how
+        `group_id` already tags a path for `groups`); a multi-path
+        component "assembly" is a larger data-model change left for a
+        future phase."""
+        component_id = component_id or new_id("component")
+        op = self.components.set(component_id, {"name": name, "pivot": list(pivot)})
+        return component_id, DocOp("component", op.to_dict())
+
+    def remove_component(self, component_id: ComponentId) -> DocOp:
+        """Removes the component registry entry only -- any path still
+        tagged with this `component_id` (the definition, or a stray
+        instance) is left untouched, the same "existence tag left
+        dangling, not cascade-cleaned" choice `remove_group` already
+        makes for `group_id`. A dangling instance's component lookup
+        then simply fails to resolve (see `resolve_component_instances`),
+        rendering nothing rather than erroring."""
+        return DocOp("component", self.components.delete(component_id).to_dict())
+
+    def component_list(self) -> list[dict]:
+        return [{"id": cid, **payload} for cid, payload in self.components.items()]
 
     # -- paths ------------------------------------------------------------------
     def add_path(
@@ -674,6 +800,8 @@ class DrawingDocument:
         if op.target == "sheet_prop":
             assert op.scope is not None
             return self._sheet_props(op.scope).apply(LWWOp.from_dict(op.payload))
+        if op.target == "component":
+            return self.components.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown doc op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -700,6 +828,7 @@ class DrawingDocument:
         for sheet_id in set(self.sheet_props) | set(other.sheet_props):
             if sheet_id in other.sheet_props:
                 changed |= self._sheet_props(sheet_id).merge(other.sheet_props[sheet_id])
+        changed |= self.components.merge(other.components)
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -792,6 +921,7 @@ class DrawingDocument:
         vc = vc.merge(self.sheets.frontier())
         for m in self.sheet_props.values():
             vc = vc.merge(m.frontier())
+        vc = vc.merge(self.components.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[DocOp]:
@@ -812,6 +942,7 @@ class DrawingDocument:
         out += [DocOp("sheet", op.to_dict()) for op in self.sheets.ops_since(vc)]
         for sheet_id, m in self.sheet_props.items():
             out += [DocOp("sheet_prop", op.to_dict(), scope=sheet_id) for op in m.ops_since(vc)]
+        out += [DocOp("component", op.to_dict()) for op in self.components.ops_since(vc)]
         return out
 
     # -- serialization --------------------------------------------------------------
@@ -830,6 +961,7 @@ class DrawingDocument:
             "groups": self.groups.to_dict(),
             "sheets": self.sheets.to_dict(),
             "sheet_props": {sid: m.to_dict() for sid, m in self.sheet_props.items()},
+            "components": self.components.to_dict(),
         }
 
     @staticmethod
@@ -857,6 +989,8 @@ class DrawingDocument:
         doc.sheet_props = (
             {sid: LWWMap.from_dict(clock, m) for sid, m in d["sheet_props"].items()} if "sheet_props" in d else {}
         )
+        # Same backward-compat default for "components" (Part 7 C5).
+        doc.components = LWWMap.from_dict(clock, d["components"]) if "components" in d else LWWMap(clock)
         return doc
 
     def to_bytes(self) -> bytes:

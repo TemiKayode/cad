@@ -117,6 +117,63 @@ def test_export_drawing_pdf_selects_sheet_by_id_and_falls_back_for_a_stale_one()
     assert "Sheet_A" in resp_stale.headers["content-disposition"]
 
 
+def test_export_svg_dxf_pdf_resolve_a_component_instance_into_real_geometry():
+    """Part 7 C5: an "instance" shape kind has no geometry of its own --
+    every exporter must resolve it (via resolve_component_instances)
+    into the component definition's actual geometry, transformed by the
+    instance's own placement, before the format-specific writer ever
+    sees it. Checks all three 2D export formats off one shared room so
+    a regression in any one of them is caught."""
+    client = _client()
+    with client.websocket_connect("/ws/componentexport") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        doc = DrawingDocument(LamportClock(actor="a"))
+        layer_id, layer_ops = doc.add_layer("L")
+        def_id, def_ops = doc.add_path(layer_id, [], color="#ff0000")
+        prop_ops = [
+            doc.set_path_prop(def_id, "shape", "circle"),
+            doc.set_path_prop(def_id, "cx", 50.0),
+            doc.set_path_prop(def_id, "cy", 50.0),
+            doc.set_path_prop(def_id, "r", 10.0),
+        ]
+        comp_id, comp_op = doc.add_component("Bolt", (50.0, 50.0))
+        prop_ops.append(doc.set_path_prop(def_id, "component_id", comp_id))
+        inst_id, inst_ops = doc.add_path(layer_id, [], color="#ff0000")
+        inst_prop_ops = [
+            doc.set_path_prop(inst_id, "shape", "instance"),
+            doc.set_path_prop(inst_id, "component_id", comp_id),
+            doc.set_path_prop(inst_id, "transform", {"tx": 100.0, "ty": 0.0, "rotation": 0.0, "scale": 1.0}),
+        ]
+        all_ops = [*layer_ops, *def_ops, *prop_ops, comp_op, *inst_ops, *inst_prop_ops]
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in all_ops]})
+
+    # SVG: two <circle> elements, one at cx=150 (the instance, offset by +100)
+    svg_resp = client.get("/api/rooms/componentexport/export/svg")
+    assert svg_resp.status_code == 200
+    assert svg_resp.text.count("<circle") == 2
+    assert 'cx="150.000"' in svg_resp.text
+
+    # DXF: two real CIRCLE entities, not one plus an unrecognized "instance"
+    dxf_resp = client.get("/api/rooms/componentexport/export/dxf")
+    assert dxf_resp.status_code == 200
+    from crdt_cad.export.dxf_io import drawing_from_dxf_bytes
+
+    imported = drawing_from_dxf_bytes(dxf_resp.content)
+    assert len(imported) == 2
+
+    # PDF: needs a sheet first, then just confirm it renders without error
+    doc2 = DrawingDocument(LamportClock(actor="a"))
+    sheet_id, sheet_ops = doc2.add_sheet("Sheet 1")
+    with client.websocket_connect("/ws/componentexport") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in sheet_ops]})
+    pdf_resp = client.get("/api/rooms/componentexport/export/pdf")
+    assert pdf_resp.status_code == 200
+    assert pdf_resp.content[:4] == b"%PDF"
+
+
 def test_export_mesh_json_and_stl():
     client = _client()
     mesh = MeshCRDT(LamportClock(actor="a"))
