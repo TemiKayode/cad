@@ -126,6 +126,8 @@ deployment. Reports are reviewed and resolved from the `/admin` panel
 | `CRDT_CAD_GENERATE_BURST` | `3` | Per-client-IP burst capacity for the same limiter. |
 | `CRDT_CAD_GENERATION_TIMEOUT_SECONDS` | `60` | Max time a single AI generation call may run before the request fails with 504. |
 | `CRDT_CAD_GENERATION_BATCH_SIZE` | `150` | Ops per batch when committing a freshly generated mesh into a room (bounds any single batch's broadcast size). |
+| `MESHY_API_KEY` | unset | Enables the optional hosted Meshy AI mesh-generation tier; the heuristic/LLM procedural generators work fully without it. |
+| `CRDT_CAD_MESHY_FACE_BUDGET` | `4000` | Max triangle count a Meshy-imported mesh is decimated down to (`decimate_to_budget`, quadric-error simplification) before it's committed into a room. |
 
 ## Deployment plumbing
 
