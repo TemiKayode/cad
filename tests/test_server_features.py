@@ -172,6 +172,103 @@ def test_export_mesh_step_with_no_faces_returns_400():
     assert resp.status_code == 400
 
 
+def _tetrahedron_ops():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    ops = [
+        mesh.add_vertex("v0", (0.0, 0.0, 0.0)),
+        mesh.add_vertex("v1", (1.0, 0.0, 0.0)),
+        mesh.add_vertex("v2", (0.0, 1.0, 0.0)),
+        mesh.add_vertex("v3", (0.0, 0.0, 1.0)),
+    ]
+    for loop in (["v0", "v1", "v2"], ["v0", "v1", "v3"], ["v1", "v2", "v3"], ["v0", "v2", "v3"]):
+        ops.extend(mesh.add_face("f_" + "".join(loop), loop))
+    return ops
+
+
+def test_export_mesh_glb_is_a_real_binary_gltf():
+    client = _client()
+    with client.websocket_connect("/ws/mesh/meshglb") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in _tetrahedron_ops()]})
+
+    resp = client.get("/api/mesh/meshglb/export/glb")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "model/gltf-binary"
+    assert resp.content[:4] == b"glTF"
+
+
+def test_export_mesh_glb_with_no_faces_returns_400():
+    client = _client()
+    resp = client.get("/api/mesh/emptymeshglb/export/glb")
+    assert resp.status_code == 400
+
+
+def test_export_mesh_3mf_is_a_real_zip_container():
+    client = _client()
+    with client.websocket_connect("/ws/mesh/mesh3mf") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in _tetrahedron_ops()]})
+
+    resp = client.get("/api/mesh/mesh3mf/export/3mf")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "model/3mf"
+    assert resp.content[:2] == b"PK"
+
+
+def test_export_mesh_3mf_with_no_faces_returns_400():
+    client = _client()
+    resp = client.get("/api/mesh/emptymesh3mf/export/3mf")
+    assert resp.status_code == 400
+
+
+def test_import_mesh_step_creates_fresh_geometry_with_remapped_ids():
+    """Round-trips through the real STEP export endpoint (not a
+    hand-built fixture) to prove export and import actually agree with
+    each other, then imports into a room that already has its own
+    "v0"/"v1" ids to confirm the imported geometry gets fresh ids
+    rather than colliding."""
+    import pytest
+
+    pytest.importorskip("build123d")
+
+    client = _client()
+    with client.websocket_connect("/ws/mesh/meshstepimportsrc") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in _tetrahedron_ops()]})
+    step_data = client.get("/api/mesh/meshstepimportsrc/export/step").content
+
+    target_room = "meshstepimporttarget"
+    with client.websocket_connect(f"/ws/mesh/{target_room}") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        pre_existing = MeshCRDT(LamportClock(actor="a"))
+        ws.send_json({"type": "ops", "ops": [pre_existing.add_vertex("v0", (9.0, 9.0, 9.0)).to_dict()]})
+
+    resp = client.post(f"/api/mesh/{target_room}/import/step", content=step_data)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["vertex_count"] == 4
+    assert body["face_count"] == 4
+
+    exported = client.get(f"/api/mesh/{target_room}/export/json").json()
+    vertex_ids = {e["k"] for e in exported["vertices"]["entries"] if not e.get("d")}
+    assert len(vertex_ids) == 5  # the pre-existing vertex plus 4 freshly-imported ones
+    assert "v0" in vertex_ids  # the pre-existing vertex was untouched, not overwritten
+
+
+def test_import_mesh_step_rejects_a_malformed_file():
+    import pytest
+
+    pytest.importorskip("build123d")
+
+    client = _client()
+    resp = client.post("/api/mesh/meshstepimportbad/import/step", content=b"not a real step file")
+    assert resp.status_code == 400
+
+
 # -- import ---------------------------------------------------------------------
 
 

@@ -587,6 +587,56 @@ document.getElementById("downloadStepBtn").onclick = async () => {
   URL.revokeObjectURL(blobUrl);
 };
 
+// -- glTF/3MF export, STEP import (Part 7 C4) --------------------------------
+// glb/3mf share STEP's "can fail for an empty mesh" shape, so they use the
+// same fetch-check-then-blob-download pattern above rather than the plain
+// triggerDownload() the always-succeeding json/stl buttons use.
+async function downloadMeshFormat(format, extension, mimeCheck) {
+  const url = withToken(`/api/mesh/${encodeURIComponent(room)}/export/${format}`, "mesh", room);
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch {
+    showToast(`Could not reach the server for .${extension} export`, "error");
+    return;
+  }
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    showToast(body.detail || `.${extension} export failed`, "error");
+    return;
+  }
+  const blob = await resp.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = blobUrl;
+  a.download = `${room}.${extension}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(blobUrl);
+}
+document.getElementById("downloadGlbBtn").onclick = () => downloadMeshFormat("glb", "glb");
+document.getElementById("downloadThreeMfBtn").onclick = () => downloadMeshFormat("3mf", "3mf");
+
+document.getElementById("importStepBtn").onclick = () => document.getElementById("importStepFileInput").click();
+document.getElementById("importStepFileInput").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const body = await file.arrayBuffer();
+  try {
+    const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/import/step`, "mesh", room), { method: "POST", body });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    const result = await resp.json();
+    showToast(`Imported ${result.vertex_count} vertice(s), ${result.face_count} face(s)`, "success");
+  } catch (err) {
+    showToast(`STEP import failed: ${err.message}`, "error");
+  }
+  e.target.value = "";
+});
+
 document.getElementById("shareBtn").onclick = async () => {
   let url = `${location.origin}/3d?room=${encodeURIComponent(room)}`;
   const token = roomTokenFor("mesh", room);
@@ -1874,6 +1924,9 @@ function buildCommands() {
     clickCmd("downloadJsonBtn", "Export .json", "File", "", "file"),
     clickCmd("downloadStlBtn", "Export .stl", "File", "", "file"),
     clickCmd("downloadStepBtn", "Export .step", "File", "", "file"),
+    clickCmd("downloadGlbBtn", "Export .glb", "File", "", "file"),
+    clickCmd("downloadThreeMfBtn", "Export .3mf", "File", "", "file"),
+    clickCmd("importStepBtn", "Import STEP", "File", "", "upload"),
 
     (() => {
       const el = document.getElementById("genPromptInput");

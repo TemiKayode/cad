@@ -33,11 +33,23 @@ isn't a rare edge case worth ignoring.
 Deliberately not attempted: curved/NURBS surfaces, non-manifold repair,
 or any topology healing -- this is a straightforward faceted export of
 whatever ``MeshCRDT`` already has, not a CAD-quality solid-modeling step.
+
+``mesh_from_step_bytes`` (Part 7 C4) is the other direction: it reads a
+STEP file back in and *tessellates* it (``Shape.tessellate``, real
+OpenCascade faceting, not a re-derivation of the exact B-Rep) into a
+plain triangle mesh -- any curved/NURBS surface a real STEP file
+contains comes back as flat facets at the given tolerance, the same
+"faceted, not a CAD-quality solid-modeling step" honesty this module's
+export side already commits to.
 """
 
 from __future__ import annotations
 
 import io
+import os
+import tempfile
+
+from crdt_cad.ai.mesh_types import GeneratedMesh
 
 Position = tuple[float, float, float]
 
@@ -80,3 +92,59 @@ def mesh_to_step_bytes(vertex_positions: dict[str, Position], face_loops: dict[s
     buf = io.BytesIO()
     bd.export_step(shape, buf)
     return buf.getvalue()
+
+
+def mesh_from_step_bytes(data: bytes, tolerance: float = 0.1) -> GeneratedMesh:
+    """Part 7 C4 (STEP-import interop): reads a STEP file back in via
+    `build123d.import_step` and tessellates every solid/shell it
+    contains into a triangle mesh (`Shape.tessellate`, the same
+    OpenCascade-backed faceting `mesh_to_step_bytes`'s own round-trip
+    was verified against). `import_step` needs a real filesystem path
+    (it wraps `STEPCAFControl_Reader.ReadFile`, which reads a path, not
+    a stream) -- `data` is written to a throwaway temp file first and
+    always cleaned up, even on failure.
+
+    A malformed/unparseable STEP file doesn't raise from `import_step`
+    itself (OpenCascade logs a parser error to stderr and hands back an
+    empty `Compound` instead) -- `tessellate` raising `ValueError:
+    Cannot tessellate an empty shape` on that empty result is what
+    actually surfaces the failure to the caller, so no separate
+    emptiness check is needed here.
+
+    OpenCascade's tessellator emits one independent vertex triple per
+    triangle (no sharing across faces), so a naive pass-through would
+    inflate a modest STEP file into thousands of near-duplicate CRDT
+    vertices; positions are welded by rounding to 6 decimal places
+    first, the same precision `mesh_to_stl`'s own vertex formatting
+    already uses."""
+    import build123d as bd
+
+    fd, path = tempfile.mkstemp(suffix=".step")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        shape = bd.import_step(path)
+        raw_vertices, raw_triangles = shape.tessellate(tolerance)
+    finally:
+        os.unlink(path)
+
+    welded_index: dict[tuple[float, float, float], str] = {}
+    vertices: dict[str, Position] = {}
+    remap: list[str] = []
+    for v in raw_vertices:
+        key = (round(v.X, 6), round(v.Y, 6), round(v.Z, 6))
+        vid = welded_index.get(key)
+        if vid is None:
+            vid = f"v{len(welded_index)}"
+            welded_index[key] = vid
+            vertices[vid] = key
+        remap.append(vid)
+
+    faces: dict[str, list[str]] = {}
+    for i, (a, b, c) in enumerate(raw_triangles):
+        loop = [remap[a], remap[b], remap[c]]
+        if len({*loop}) < 3:
+            continue  # degenerate triangle collapsed by welding
+        faces[f"f{i}"] = loop
+
+    return GeneratedMesh(vertices=vertices, faces=faces)

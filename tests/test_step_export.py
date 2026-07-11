@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("build123d")
 
-from crdt_cad.export.step_export import mesh_to_step_bytes  # noqa: E402
+from crdt_cad.export.step_export import mesh_from_step_bytes, mesh_to_step_bytes  # noqa: E402
 
 
 def test_empty_mesh_returns_empty_bytes():
@@ -79,3 +79,42 @@ def test_nonplanar_face_falls_back_to_a_fan_triangulation_instead_of_failing():
     data = mesh_to_step_bytes(verts, faces)
     assert data.startswith(b"ISO-10303-21;")
     assert data.count(b"ADVANCED_FACE") >= 2  # fan of >= 2 triangles, not 1 quad
+
+
+# -- STEP import (Part 7 C4) ---------------------------------------------------
+
+
+def test_mesh_from_step_bytes_round_trips_a_closed_box():
+    """Exports a real closed box via the existing writer, re-imports it,
+    and confirms the tessellated result is welded back down to exactly
+    the 8 corners a naive OpenCascade tessellation would otherwise
+    triple/quadruple (one independent vertex triple per triangle,
+    per-face, with no cross-face sharing)."""
+    verts = {
+        "v0": (0.0, 0.0, 0.0), "v1": (1.0, 0.0, 0.0), "v2": (1.0, 1.0, 0.0), "v3": (0.0, 1.0, 0.0),
+        "v4": (0.0, 0.0, 1.0), "v5": (1.0, 0.0, 1.0), "v6": (1.0, 1.0, 1.0), "v7": (0.0, 1.0, 1.0),
+    }
+    faces = {
+        "bottom": ["v0", "v3", "v2", "v1"],
+        "top": ["v4", "v5", "v6", "v7"],
+        "front": ["v0", "v1", "v5", "v4"],
+        "back": ["v3", "v7", "v6", "v2"],
+        "left": ["v0", "v4", "v7", "v3"],
+        "right": ["v1", "v2", "v6", "v5"],
+    }
+    data = mesh_to_step_bytes(verts, faces)
+    mesh = mesh_from_step_bytes(data)
+    assert len(mesh.vertices) == 8
+    # every triangle references 3 distinct welded vertex ids
+    for loop in mesh.faces.values():
+        assert len(loop) == 3
+        assert len(set(loop)) == 3
+    # welded positions match the original 8 corners (order/ids may differ)
+    original_positions = {tuple(round(c, 6) for c in p) for p in verts.values()}
+    imported_positions = set(mesh.vertices.values())
+    assert imported_positions == original_positions
+
+
+def test_mesh_from_step_bytes_raises_on_a_malformed_file():
+    with pytest.raises(ValueError):
+        mesh_from_step_bytes(b"not a real step file")

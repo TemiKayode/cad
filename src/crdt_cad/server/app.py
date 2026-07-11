@@ -99,9 +99,11 @@ from crdt_cad.ai.validation import GenerationValidationError
 from crdt_cad.crdt.clock import LamportClock, VectorClock
 from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
+from crdt_cad.crdt.mesh import new_id as mesh_new_id
 from crdt_cad.export.dxf_io import drawing_from_dxf_bytes, drawing_to_dxf_bytes
+from crdt_cad.export.mesh_interop import mesh_to_3mf_bytes, mesh_to_glb_bytes
 from crdt_cad.export.pdf_io import sheet_to_pdf_bytes
-from crdt_cad.export.step_export import mesh_to_step_bytes
+from crdt_cad.export.step_export import mesh_from_step_bytes, mesh_to_step_bytes
 from crdt_cad.export.stl_export import mesh_to_stl
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 from crdt_cad.geometry.constraints import Constraint, Sketch
@@ -1915,6 +1917,70 @@ async def export_mesh_step(room_id: str) -> Response:
     if not data:
         raise HTTPException(status_code=400, detail="nothing to export -- no face has 3 or more live vertices")
     return _attachment(data, "application/step", f"{room_id}.step")
+
+
+@app.get("/api/mesh/{room_id}/export/glb", dependencies=[Depends(require_room_access("mesh"))])
+async def export_mesh_glb(room_id: str) -> Response:
+    room = await mesh_room_manager.get_or_create(room_id)
+    data = mesh_to_glb_bytes(room.doc.vertex_positions(), room.doc.face_loops())
+    if not data:
+        raise HTTPException(status_code=400, detail="nothing to export -- no face has 3 or more live vertices")
+    return _attachment(data, "model/gltf-binary", f"{room_id}.glb")
+
+
+@app.get("/api/mesh/{room_id}/export/3mf", dependencies=[Depends(require_room_access("mesh"))])
+async def export_mesh_3mf(room_id: str) -> Response:
+    room = await mesh_room_manager.get_or_create(room_id)
+    data = mesh_to_3mf_bytes(room.doc.vertex_positions(), room.doc.face_loops())
+    if not data:
+        raise HTTPException(status_code=400, detail="nothing to export -- no face has 3 or more live vertices")
+    return _attachment(data, "model/3mf", f"{room_id}.3mf")
+
+
+class ImportMeshResult(BaseModel):
+    vertex_count: int
+    face_count: int
+
+
+@app.post(
+    "/api/mesh/{room_id}/import/step",
+    response_model=ImportMeshResult,
+    dependencies=[Depends(require_editor_access("mesh"))],
+)
+async def import_mesh_step(room_id: str, request: Request) -> ImportMeshResult:
+    """Part 7 C4 (STEP-import interop). Tessellation is real OpenCascade
+    geometry work (like export_mesh_step above), so it runs off the
+    event loop via asyncio.to_thread. Every imported vertex/face id is
+    remapped to a fresh globally-unique one (`MeshCRDT.new_id`) before
+    minting ops, the same "never reuse a caller-supplied id, mint your
+    own" rule `_mint_ops_for_mesh` follows for AI-generated meshes --
+    otherwise importing into a room that already has a "v0" would
+    either collide or silently overwrite it."""
+    body = await request.body()
+    try:
+        mesh = await asyncio.to_thread(mesh_from_step_bytes, body)
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail=f"STEP import needs the optional 'step' extra -- install with `pip install crdt-cad[step]`: {exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"could not parse STEP: {exc}") from exc
+
+    room = await mesh_room_manager.get_or_create(room_id)
+    clock = LamportClock(actor=DEFAULT_ACTOR_ID)
+    scratch = MeshCRDT(clock)
+    vertex_ids = {old: mesh_new_id("v") for old in mesh.vertices}
+    ops: list[MeshOp] = [scratch.add_vertex(vertex_ids[old], pos) for old, pos in mesh.vertices.items()]
+    for loop in mesh.faces.values():
+        remapped = [vertex_ids[v] for v in loop]
+        face_id = mesh_new_id("f")
+        ops.extend(scratch.add_face(face_id, remapped))
+        for i in range(len(remapped)):
+            a, b = remapped[i], remapped[(i + 1) % len(remapped)]
+            ops.append(scratch.add_edge(a, b))
+    await room.commit_ops_batched(ops, actor=DEFAULT_ACTOR_ID)
+    return ImportMeshResult(vertex_count=len(mesh.vertices), face_count=len(mesh.faces))
 
 
 # ---------------------------------------------------------------------------

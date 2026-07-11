@@ -107,6 +107,14 @@
           <button id="downloadStlBtn" class="always-enabled" style="flex:1">.stl</button>
           <button id="downloadStepBtn" class="always-enabled" style="flex:1" title="Faceted B-Rep STEP export (build123d) -- needs the optional 'step' extra installed server-side">.step</button>
         </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="downloadGlbBtn" class="always-enabled" style="flex:1" title="Binary glTF export">.glb</button>
+          <button id="downloadThreeMfBtn" class="always-enabled" style="flex:1" title="3MF export">.3mf</button>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="importStepBtn" style="width:100%" title="Import a STEP file -- tessellated (faceted), not a curved/NURBS-preserving import; needs the optional 'step' extra installed server-side"><svg class="icon"><use href="#icon-upload"></use></svg>Import STEP</button>
+        </div>
+        <input id="importStepFileInput" type="file" accept=".step,.stp" style="display:none" />
 
         <div class="section-title"><svg class="icon"><use href="#icon-sparkles"></use></svg>AI Generate</div>
         <div class="tool-row">

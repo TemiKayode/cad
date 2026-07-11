@@ -59,6 +59,14 @@ dependencies = [
     # library (unlike a cairosvg/weasyprint route), same "just works
     # everywhere this project already runs" bar ezdxf/shapely are held to.
     "reportlab>=4.0",
+    # Part 7 C4: trimesh's own glTF/3MF exporters (trimesh itself is
+    # already core) need these two at import time -- both are ordinary
+    # wheel-installable packages (lxml ships prebuilt wheels for every
+    # platform this project targets), not a heavy/native-build dependency
+    # the way build123d's OpenCascade bindings are, so both stay core
+    # rather than becoming another optional extra.
+    "networkx>=3.0",
+    "lxml>=5.0",
 ]
 
 [project.urls]
