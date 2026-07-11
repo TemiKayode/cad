@@ -1829,3 +1829,18 @@ function setupReportButton(kind, room) {
   });
   btn.onclick = () => reportRoom(kind, room);
 }
+
+// -- PWA: service worker registration (Part 7 C7) ------------------------------
+// Registered from `common.js` (loaded by every page: home, 2D, 3D, admin) so
+// every entry point installs it, not just whichever page happens to load
+// first. `/sw.js` (not `/static/sw.js`) so its scope covers the whole app --
+// see the server route's own docstring in app.py for why. A registration
+// failure (unsupported browser, blocked by an extension, running over plain
+// HTTP on a non-localhost origin where the API is unavailable at all) is
+// silently swallowed -- this is a progressive enhancement, never something
+// the app's actual collaboration features depend on.
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  });
+}

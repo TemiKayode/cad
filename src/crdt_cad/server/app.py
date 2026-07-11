@@ -697,6 +697,26 @@ async def favicon() -> FileResponse:
     return FileResponse(str(DEMO_STATIC_DIR / "favicon.svg"), media_type="image/svg+xml")
 
 
+@app.get("/sw.js")
+async def service_worker() -> Response:
+    """Part 7 C7 (PWA): served from the root, not `/static/sw.js`, so
+    its default scope covers the whole app (a service worker's scope
+    is its own URL's directory unless `Service-Worker-Allowed` widens
+    it) -- registering it from `/static/` would only ever be able to
+    control requests under `/static/`, never the room pages themselves.
+    `_NoCacheStaticFiles`'s no-cache header (mounted at `/static`) never
+    applies here since this is its own route, but a fresh
+    `Cache-Control: no-cache` is set explicitly anyway -- a stale
+    *cached* service-worker script is exactly the class of bug that
+    makes a PWA impossible to update without a user manually clearing
+    site data."""
+    return FileResponse(
+        str(DEMO_STATIC_DIR / "sw.js"),
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+    )
+
+
 @app.get("/health")
 async def health() -> dict:
     return {

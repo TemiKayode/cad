@@ -1192,7 +1192,75 @@ function isPanGesture(e) {
   return e.button === 1 || (e.button === 0 && spacePressed);
 }
 
+// -- touch: two-finger pinch-zoom + pan (Part 7 C7) -----------------------------
+// Mouse gets a dedicated pan gesture (middle-drag/space-drag, above) and
+// wheel-zoom (below); touch has neither a middle button nor a wheel, so
+// this is the touch-native equivalent -- distance between the two active
+// touches drives zoom, their midpoint's own movement drives pan, both
+// computed independently and applied together every frame, the same
+// gesture every map/drawing app on a touchscreen already uses. One
+// finger is left alone entirely (still draws/selects/etc., matching
+// what a mouse click+drag at that tool would do) -- only a *second*
+// simultaneous touch changes behavior.
+const activeTouches = new Map(); // pointerId -> [x, y] in canvas-space
+let pinchState = null; // {startDist, startMid, zoom0, panX0, panY0}
+
+function touchGeometry() {
+  const pts = [...activeTouches.values()];
+  const [a, b] = pts;
+  const dist = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  return { dist, mid };
+}
+
+/** True if this pointerdown just brought the touch count to exactly 2 --
+ * the moment a pinch gesture begins. Cancels whatever single-pointer
+ * gesture (draw/select-drag/shape-draft/constrain-drag/mouse-pan) might
+ * already be mid-flight from the first finger, the same "second finger
+ * always wins, don't leave a half-finished single-touch gesture behind"
+ * choice a real drawing app's touch handling needs. */
+function beginPinchIfSecondTouch(e) {
+  if (e.pointerType !== "touch") return false;
+  activeTouches.set(e.pointerId, canvasPoint(e));
+  if (activeTouches.size !== 2) return activeTouches.size > 2; // 3rd+ finger: ignore, but don't fall through to tool logic either
+  drawing = null;
+  selectDrag = null;
+  shapeDraft = null;
+  constrainDrag = null;
+  panState = null;
+  const { dist, mid } = touchGeometry();
+  pinchState = { startDist: dist, startMid: mid, zoom0: view.zoom, panX0: view.panX, panY0: view.panY };
+  return true;
+}
+
+function updatePinch(e) {
+  if (!activeTouches.has(e.pointerId)) return false;
+  activeTouches.set(e.pointerId, canvasPoint(e));
+  if (!pinchState || activeTouches.size < 2) return activeTouches.size >= 2;
+  const { dist, mid } = touchGeometry();
+  const [wxBefore, wyBefore] = screenToWorld(pinchState.startMid[0], pinchState.startMid[1]);
+  view.zoom = Math.max(0.05, Math.min(20, pinchState.zoom0 * (dist / Math.max(1, pinchState.startDist))));
+  // Re-anchor so the world point under the gesture's *starting* midpoint
+  // stays under the *current* midpoint -- zoom anchored on the pinch,
+  // pan following the fingers' own movement, in one formula.
+  view.panX = mid[0] - wxBefore * view.zoom;
+  view.panY = mid[1] - wyBefore * view.zoom;
+  requestRender();
+  updateZoomIndicator();
+  return true;
+}
+
+function endPinchTouch(e) {
+  if (!activeTouches.delete(e.pointerId)) return false;
+  if (activeTouches.size < 2) pinchState = null;
+  return true;
+}
+
 canvas.addEventListener("pointerdown", (e) => {
+  if (beginPinchIfSecondTouch(e)) {
+    e.preventDefault();
+    return;
+  }
   if (isPanGesture(e)) {
     e.preventDefault();
     exitFollow(); // Phase D6: "any manual pan/zoom exits" follow mode
@@ -1236,6 +1304,7 @@ canvas.addEventListener("pointerdown", (e) => {
 });
 
 canvas.addEventListener("pointermove", (e) => {
+  if (updatePinch(e)) return;
   if (panState) {
     const [sx, sy] = canvasPoint(e);
     view.panX = panState.panX0 + (sx - panState.startSx);
@@ -1300,7 +1369,8 @@ canvas.addEventListener("pointerleave", () => {
 });
 
 let justPanned = false;
-window.addEventListener("pointerup", () => {
+window.addEventListener("pointerup", (e) => {
+  if (endPinchTouch(e)) return;
   if (panState) {
     panState = null;
     justPanned = true;
@@ -1334,6 +1404,13 @@ window.addEventListener("pointerup", () => {
   }
   drawing = null;
 });
+
+// Touch gestures can be interrupted by the OS (an incoming call, a
+// system gesture) without a matching pointerup ever firing -- without
+// this, a lifted finger the browser cancelled instead of "up"-ing would
+// leave a phantom entry in activeTouches, permanently confusing the
+// next pinch's math.
+window.addEventListener("pointercancel", (e) => { endPinchTouch(e); });
 
 canvas.addEventListener("click", (e) => {
   // A drag-to-pan (middle-button, or Space+left-button) still fires a

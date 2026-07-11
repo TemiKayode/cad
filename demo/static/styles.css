@@ -445,6 +445,13 @@ canvas { display: block; background: var(--bg-canvas); }
    never trigger a stray text selection on whatever's behind/around it. */
 .canvas-wrap { position: relative; min-height: 0; z-index: var(--z-canvas); user-select: none; }
 
+/* Part 7 C7: without this, a touch drag on the canvas fights the browser's
+   own native scroll/pinch-zoom gesture instead of reaching the app's own
+   pointer handlers (2D pan/draw, 3D OrbitControls) -- `touch-action: none`
+   tells the browser "this element handles all touch gestures itself,
+   don't intercept any of them." */
+canvas, .canvas-wrap { touch-action: none; }
+
 /* Phase D6: a remote cursor is a small always-visible dot (centered on
    the actual point) plus a name pill that fades out after 3s of no
    movement and fades back in the instant it moves -- the outer

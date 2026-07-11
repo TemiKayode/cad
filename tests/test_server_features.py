@@ -334,6 +334,28 @@ def test_api_config_exposes_parametric_prototype_flag(monkeypatch):
     assert client.get("/api/config").json() == {"parametric_prototype_enabled": True}
 
 
+def test_service_worker_is_served_root_scoped_with_no_cache():
+    client = _client()
+    resp = client.get("/sw.js")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/javascript")
+    assert resp.headers["service-worker-allowed"] == "/"
+    assert resp.headers["cache-control"] == "no-cache"
+
+
+def test_manifest_and_icons_are_served_as_static_assets():
+    client = _client()
+    manifest = client.get("/static/manifest.json")
+    assert manifest.status_code == 200
+    body = manifest.json()
+    assert body["start_url"] == "/"
+    assert {icon["sizes"] for icon in body["icons"]} == {"192x192", "512x512"}
+    for icon in body["icons"]:
+        icon_resp = client.get(icon["src"])
+        assert icon_resp.status_code == 200
+        assert icon_resp.headers["content-type"] == "image/png"
+
+
 def _cube_face_ids(mesh, x0, y0, z0, x1, y1, z1, prefix):
     ops = [
         mesh.add_vertex(f"{prefix}0", (x0, y0, z0)), mesh.add_vertex(f"{prefix}1", (x1, y0, z0)),
