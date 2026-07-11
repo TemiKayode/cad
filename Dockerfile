@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /app
 
@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --timeout=180 --retries=5 --prefix=/install ".[postgres,redis]"
 
 
-FROM python:3.12-slim AS final
+FROM python:3.14-slim AS final
 
 WORKDIR /app
 
