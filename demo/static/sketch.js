@@ -42,6 +42,7 @@ const state = {
   dimensions: new Map(),  // dim_id -> {a_path, a_node, b_path, b_node, offset} (Phase 13)
   constraints: new Map(), // constraint_id -> {kind, anchors, param} (Phase 14)
   groups: new Set(),      // group_id -> just existence, like layers (Phase 15)
+  sheets: new Map(),      // sheet_id -> {name, page_size, orientation, ...} (Part 7 C3)
 };
 
 // -- document units (Phase 11) ------------------------------------------------
@@ -265,6 +266,8 @@ function observeSnapshotCounters(doc) {
   scanEntries(doc.dimensions);
   scanEntries(doc.constraints);
   scanEntries(doc.groups);
+  scanEntries(doc.sheets);
+  for (const m of Object.values(doc.sheet_props || {})) scanEntries(m);
   clock.observe(maxCounter);
 }
 
@@ -306,6 +309,14 @@ function loadSnapshot(doc) {
   state.constraints.clear();
   for (const e of doc.constraints.entries) if (!e.d) state.constraints.set(e.k, e.v);
   state.groups = new Set(doc.groups.entries.filter((e) => !e.d).map((e) => e.k));
+  state.sheets.clear();
+  for (const e of doc.sheets.entries) if (!e.d) state.sheets.set(e.k, {});
+  for (const [sid, m] of Object.entries(doc.sheet_props || {})) {
+    if (!state.sheets.has(sid)) continue;
+    const props = {};
+    for (const e of m.entries) if (!e.d) props[e.k] = e.v;
+    state.sheets.set(sid, props);
+  }
 
   if (!ui.activeLayer || !state.layers.has(ui.activeLayer)) {
     ui.activeLayer = state.layerOrder[0] || null;
@@ -358,6 +369,12 @@ function applyOp(op) {
     if (!p.d) state.constraints.set(p.k, p.v); else state.constraints.delete(p.k);
   } else if (op.target === "group") {
     if (!p.d) state.groups.add(p.k); else state.groups.delete(p.k);
+  } else if (op.target === "sheet") {
+    if (!p.d) { if (!state.sheets.has(p.k)) state.sheets.set(p.k, {}); } else state.sheets.delete(p.k);
+  } else if (op.target === "sheet_prop") {
+    const props = state.sheets.get(op.scope) || {};
+    if (!p.d) props[p.k] = p.v; else delete props[p.k];
+    state.sheets.set(op.scope, props);
   }
 }
 
@@ -781,6 +798,181 @@ function removeComment(id) {
   applyOp(op);
   sendOps([op]);
 }
+
+// -- print sheets (Part 7 C3) -----------------------------------------------------
+// Mirrors crdt_cad.crdt.document.DrawingDocument.add_sheet/set_sheet_prop
+// exactly: existence ("sheet") + per-field LWWMap ("sheet_prop"), the same
+// shape `layers`/`layer_props` already use -- each title-block/page-setup
+// field is an independent op, so two people editing different fields never
+// clobber each other.
+
+function addSheet(name) {
+  const id = "sheet_" + rid();
+  const ops = [
+    { target: "sheet", payload: lwwOp(clock.tick(), id, true, false) },
+    { target: "sheet_prop", scope: id, payload: lwwOp(clock.tick(), "name", name, false) },
+  ];
+  for (const op of ops) applyOp(op);
+  sendOps(ops);
+  return id;
+}
+
+function removeSheet(id) {
+  const op = { target: "sheet", payload: lwwOp(clock.tick(), id, null, true) };
+  applyOp(op);
+  sendOps([op]);
+}
+
+function setSheetProp(sheetId, key, value) {
+  const op = { target: "sheet_prop", scope: sheetId, payload: lwwOp(clock.tick(), key, value, false) };
+  applyOp(op);
+  sendOps([op]);
+}
+
+// -- sheets modal (Part 7 C3) -------------------------------------------------
+// Dynamically built/torn down like common.js's showMergePreviewModal --
+// sketch.js has no static modal markup of its own to reuse, and this
+// mirrors that existing precedent rather than inventing a second pattern.
+// Field defaults mirror crdt_cad.export.pdf_io.SHEET_DEFAULTS exactly --
+// a sheet_prop with no field set yet (see add_sheet's docstring) still
+// needs something sensible to show in the form.
+const SHEET_FIELD_DEFAULTS = {
+  page_size: "a4", orientation: "landscape", margin_mm: 10, scale_mode: "fit", scale_ratio: 1,
+  title: "", drawn_by: "", date: "", drawing_number: "", revision: "", notes: "",
+};
+
+let sheetsModalOverlay = null;
+let sheetsModalReleaseFocus = null;
+
+function openSheetsModal() {
+  if (sheetsModalOverlay) return;
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.style.display = "flex";
+  const box = document.createElement("div");
+  box.className = "modal sheets-modal";
+  box.style.maxWidth = "620px";
+  box.style.width = "92vw";
+  box.style.maxHeight = "82vh";
+  box.style.overflowY = "auto";
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeSheetsModal(); });
+  sheetsModalOverlay = overlay;
+  sheetsModalReleaseFocus = trapFocusIn(box);
+  renderSheetsModal();
+}
+
+function closeSheetsModal() {
+  if (!sheetsModalOverlay) return;
+  sheetsModalOverlay.remove();
+  if (sheetsModalReleaseFocus) sheetsModalReleaseFocus();
+  sheetsModalOverlay = null;
+  sheetsModalReleaseFocus = null;
+}
+
+function exportSheetPdf(sheetId) {
+  triggerDownload(withToken(`/api/rooms/${encodeURIComponent(room)}/export/pdf?sheet_id=${encodeURIComponent(sheetId)}`, "drawing", room));
+}
+
+function renderSheetCard(id, rawProps) {
+  const d = { ...SHEET_FIELD_DEFAULTS, ...rawProps };
+  const card = document.createElement("div");
+  card.style.cssText = "border:1px solid var(--border);border-radius:var(--r-sm,6px);padding:10px;margin-bottom:12px";
+  const selectOptions = (options, current) =>
+    options.map((o) => `<option value="${o}" ${o === current ? "selected" : ""}>${o}</option>`).join("");
+  const field = (label, inner) =>
+    `<label style="font-size:11px;color:var(--text-secondary,#888);display:flex;flex-direction:column;gap:2px">${label}${inner}</label>`;
+  card.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:8px">
+      <input class="f-name" value="${escapeHtml(d.name || "")}" style="font-weight:600;flex:1;min-width:0" />
+      <button class="ghost-btn" data-act="export" title="Export this sheet as PDF">${iconHtml("save")}PDF</button>
+      <button class="ghost-btn" data-act="del" title="Delete sheet" aria-label="Delete sheet">${iconHtml("x")}</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      ${field("Page size", `<select class="f-page_size">${selectOptions(["a4", "a3", "letter", "tabloid"], d.page_size)}</select>`)}
+      ${field("Orientation", `<select class="f-orientation">${selectOptions(["landscape", "portrait"], d.orientation)}</select>`)}
+      ${field("Margin (mm)", `<input type="number" class="f-margin_mm" value="${d.margin_mm}" min="0" step="1" />`)}
+      ${field("Scale", `<select class="f-scale_mode">${selectOptions(["fit", "custom"], d.scale_mode)}</select>`)}
+      ${d.scale_mode === "custom" ? field("Scale 1 :", `<input type="number" class="f-scale-n" value="${Math.max(1, Math.round(1 / (d.scale_ratio || 1)))}" min="1" step="1" />`) : ""}
+    </div>
+    <div class="section-title" style="margin:10px 0 6px;font-size:12px">Title block</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      ${field("Title", `<input class="f-title" value="${escapeHtml(d.title)}" />`)}
+      ${field("Drawn by", `<input class="f-drawn_by" value="${escapeHtml(d.drawn_by)}" />`)}
+      ${field("Date", `<input class="f-date" value="${escapeHtml(d.date)}" placeholder="YYYY-MM-DD" />`)}
+      ${field("Dwg No", `<input class="f-drawing_number" value="${escapeHtml(d.drawing_number)}" />`)}
+      ${field("Revision", `<input class="f-revision" value="${escapeHtml(d.revision)}" />`)}
+      ${field("Notes", `<input class="f-notes" value="${escapeHtml(d.notes)}" />`)}
+    </div>
+  `;
+  card.querySelector('[data-act="export"]').onclick = () => exportSheetPdf(id);
+  card.querySelector('[data-act="del"]').onclick = () => { removeSheet(id); renderSheetsModal(); };
+  card.querySelector(".f-name").onchange = (e) => setSheetProp(id, "name", e.target.value);
+  card.querySelector(".f-page_size").onchange = (e) => setSheetProp(id, "page_size", e.target.value);
+  card.querySelector(".f-orientation").onchange = (e) => setSheetProp(id, "orientation", e.target.value);
+  card.querySelector(".f-margin_mm").onchange = (e) => setSheetProp(id, "margin_mm", parseFloat(e.target.value) || 0);
+  card.querySelector(".f-scale_mode").onchange = (e) => { setSheetProp(id, "scale_mode", e.target.value); renderSheetsModal(); };
+  const scaleN = card.querySelector(".f-scale-n");
+  if (scaleN) scaleN.onchange = (e) => setSheetProp(id, "scale_ratio", 1 / Math.max(1, parseFloat(e.target.value) || 1));
+  card.querySelector(".f-title").onchange = (e) => setSheetProp(id, "title", e.target.value);
+  card.querySelector(".f-drawn_by").onchange = (e) => setSheetProp(id, "drawn_by", e.target.value);
+  card.querySelector(".f-date").onchange = (e) => setSheetProp(id, "date", e.target.value);
+  card.querySelector(".f-drawing_number").onchange = (e) => setSheetProp(id, "drawing_number", e.target.value);
+  card.querySelector(".f-revision").onchange = (e) => setSheetProp(id, "revision", e.target.value);
+  card.querySelector(".f-notes").onchange = (e) => setSheetProp(id, "notes", e.target.value);
+  return card;
+}
+
+function renderSheetsModal() {
+  if (!sheetsModalOverlay) return;
+  const box = sheetsModalOverlay.querySelector(".modal");
+  const sheets = [...state.sheets.entries()];
+  // Preserve which field currently has focus (and its cursor position)
+  // across a re-render -- renderSheetsModal is called after every local
+  // AND remote op while the modal is open, so a naive full innerHTML
+  // rebuild would otherwise steal focus back from under someone mid-type
+  // on every keystroke-adjacent op elsewhere in the room.
+  const active = box.querySelector("input:focus, select:focus");
+  // `.closest("div")` would find the *nearest* div ancestor (e.g. the
+  // field's own grid-wrapper div), not necessarily the top-level card --
+  // walk the actual card list and ask each one whether it *contains* the
+  // focused element instead, regardless of nesting depth.
+  const cardsBeforeRerender = [...box.querySelectorAll(".sheets-list > div")];
+  const activeInfo = active
+    ? { cardIndex: cardsBeforeRerender.findIndex((c) => c.contains(active)), cls: [...active.classList].find((c) => c.startsWith("f-")), selStart: active.selectionStart }
+    : null;
+  box.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <h3 style="margin:0">Sheets</h3>
+      <button id="sheetsModalClose" class="ghost-btn" aria-label="Close">${iconHtml("x")}</button>
+    </div>
+    <p style="margin-top:0;color:var(--text-secondary,#888);font-size:13px">
+      A sheet is a printable page -- size, orientation, print scale, and a title block -- exported to PDF independently of the live drawing.
+    </p>
+    <div class="sheets-list"></div>
+    <button id="sheetsAddBtn" style="width:100%;margin-top:4px">${iconHtml("plus")}New sheet</button>
+  `;
+  box.querySelector("#sheetsModalClose").onclick = closeSheetsModal;
+  box.querySelector("#sheetsAddBtn").onclick = () => { addSheet(`Sheet ${sheets.length + 1}`); renderSheetsModal(); };
+  const list = box.querySelector(".sheets-list");
+  if (sheets.length === 0) {
+    list.innerHTML = '<div class="empty-hint">No sheets yet -- add one to set up a print layout and title block.</div>';
+    return;
+  }
+  sheets.forEach(([id, props]) => list.appendChild(renderSheetCard(id, props)));
+  if (activeInfo && activeInfo.cardIndex >= 0) {
+    const revived = list.children[activeInfo.cardIndex]?.querySelector(`.${activeInfo.cls}`);
+    if (revived) {
+      revived.focus();
+      if (typeof activeInfo.selStart === "number" && revived.setSelectionRange) {
+        try { revived.setSelectionRange(activeInfo.selStart, activeInfo.selStart); } catch { /* not a text-selectable input type */ }
+      }
+    }
+  }
+}
+
+document.getElementById("sheetsBtn").onclick = openSheetsModal;
 
 // -- dimension annotations (Phase 13) --------------------------------------------
 // A dimension references its two anchors by (path_id, node_id) -- the
@@ -3366,6 +3558,7 @@ function buildCommands() {
     clickCmd("downloadPngBtn", "Export .png (current view)", "File", "", "file"),
     clickCmd("downloadPngFitBtn", "Export .png (fit to content)", "File", "", "file"),
     clickCmd("importBtn", "Import SVG/DXF", "File", "", "upload"),
+    clickCmd("sheetsBtn", "Sheets (page setup, title block, PDF export)", "File", "", "file"),
 
     clickCmd("shareBtn", "Copy full-access invite link", "Room", "", "link"),
     clickCmd("shareViewOnlyBtn", "Copy view-only invite link", "Room", "", "eye"),
@@ -4394,6 +4587,7 @@ function renderAll() {
   renderMeasurePanel();
   renderDimensionPanel();
   renderPresenceList();
+  renderSheetsModal();
 }
 
 setInterval(() => {

@@ -55,6 +55,10 @@ dependencies = [
     # bar trimesh itself is held to.
     "manifold3d>=3.0",
     "shapely>=2.0",
+    # Part 7 C3: sheets/title blocks/PDF export -- pure-Python, no system
+    # library (unlike a cairosvg/weasyprint route), same "just works
+    # everywhere this project already runs" bar ezdxf/shapely are held to.
+    "reportlab>=4.0",
 ]
 
 [project.urls]

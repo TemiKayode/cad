@@ -798,6 +798,88 @@ def test_remove_group_deletes_it():
     assert doc.group_list() == []
 
 
+# -- print sheets (Part 7 C3) -------------------------------------------------
+
+
+def test_add_sheet_only_writes_name_up_front():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    sid, ops = doc.add_sheet("Sheet 1")
+    for op in ops:
+        doc.apply(op)
+    assert doc.sheet_list() == [{"id": sid, "name": "Sheet 1"}]
+
+
+def test_set_sheet_prop_adds_fields_independently():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    sid, ops = doc.add_sheet("Sheet 1")
+    for op in ops:
+        doc.apply(op)
+    doc.apply(doc.set_sheet_prop(sid, "page_size", "a3"))
+    doc.apply(doc.set_sheet_prop(sid, "title", "My Drawing"))
+    entry = doc.sheet_list()[0]
+    assert entry["page_size"] == "a3"
+    assert entry["title"] == "My Drawing"
+    assert entry["name"] == "Sheet 1"
+
+
+def test_sheets_merge_field_wise_so_concurrent_edits_to_different_fields_both_survive():
+    """A title block's fields (drawn_by, revision, ...) are independently
+    editable by different collaborators -- each is its own LWWMap entry,
+    the same `layer_props` shape, not one atomic dict write that would
+    let a concurrent edit to one field clobber a concurrent edit to
+    another."""
+    doc_a = DrawingDocument(LamportClock(actor="a"))
+    sid, ops = doc_a.add_sheet("Sheet 1")
+    for op in ops:
+        doc_a.apply(op)
+    doc_b = DrawingDocument(LamportClock(actor="b"))
+    doc_b.merge(doc_a)
+
+    doc_a.apply(doc_a.set_sheet_prop(sid, "revision", "A"))
+    doc_b.apply(doc_b.set_sheet_prop(sid, "drawn_by", "Alice"))
+
+    changed = doc_a.merge(doc_b)
+    assert changed
+    entry = doc_a.sheet_list()[0]
+    assert entry["revision"] == "A"
+    assert entry["drawn_by"] == "Alice"
+
+
+def test_sheets_survive_serialization_roundtrip():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    sid, ops = doc.add_sheet("Sheet 1")
+    for op in ops:
+        doc.apply(op)
+    doc.apply(doc.set_sheet_prop(sid, "orientation", "portrait"))
+    restored = DrawingDocument.from_bytes(LamportClock(actor="b"), doc.to_bytes())
+    entry = restored.sheet_list()[0]
+    assert entry["id"] == sid
+    assert entry["orientation"] == "portrait"
+
+
+def test_sheets_default_to_empty_when_absent_from_an_old_snapshot():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    d = doc.to_dict()
+    del d["sheets"]
+    del d["sheet_props"]
+    restored = DrawingDocument.from_dict(LamportClock(actor="b"), d)
+    assert restored.sheet_list() == []
+    # still a real, usable component afterward, not a stub
+    sid, ops = restored.add_sheet("Sheet 1")
+    for op in ops:
+        restored.apply(op)
+    assert restored.sheet_list() == [{"id": sid, "name": "Sheet 1"}]
+
+
+def test_remove_sheet_deletes_it():
+    doc = DrawingDocument(LamportClock(actor="a"))
+    sid, ops = doc.add_sheet("Sheet 1")
+    for op in ops:
+        doc.apply(op)
+    doc.apply(doc.remove_sheet(sid))
+    assert doc.sheet_list() == []
+
+
 def test_layer_list_and_path_list_preserve_creation_order():
     """Regression test: layer_list/path_list used to iterate
     LWWElementSet.to_set() (a real Python `set`, which does not

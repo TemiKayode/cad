@@ -50,6 +50,7 @@ CommentId = str
 DimId = str
 ConstraintId = str
 GroupId = str
+SheetId = str
 Point = tuple[float, float]
 
 # Document units (Phase 11): stored/CRDT geometry is always in raw
@@ -300,7 +301,7 @@ def bake_path_transform(path_dict: dict) -> dict:
 class DocOp:
     """Routable envelope around one op from one of the document's sub-CRDTs."""
 
-    target: str  # "layer" | "layer_prop" | "path_index" | "path_prop" | "path_geom" | "comment" | "presence" | "setting"
+    target: str  # "layer" | "layer_prop" | "path_index" | "path_prop" | "path_geom" | "comment" | "presence" | "setting" | "dimension" | "constraint" | "group" | "sheet" | "sheet_prop"
     payload: dict
     scope: Optional[str] = None  # layer_id / path_id, when the target needs one
 
@@ -359,6 +360,19 @@ class DrawingDocument:
         # itself just tracks which group ids currently exist, mirroring
         # `layers` -- existence only, no per-group properties needed.
         self.groups: LWWElementSet[GroupId] = LWWElementSet(clock)
+        # Print sheets (Part 7 C3): existence + per-sheet field map,
+        # mirroring `layers`/`layer_props` exactly -- a title block's
+        # fields (title/drawn_by/date/drawing_number/revision/notes) and
+        # a sheet's page setup (page_size/orientation/margin_mm/
+        # scale_mode/scale_ratio) are independently editable by different
+        # collaborators, so each field is its own LWWMap entry rather
+        # than one atomic dict write (which would let a concurrent edit
+        # to "date" silently clobber a concurrent edit to "title").
+        # Defaults for any field not yet set are applied by the reader
+        # (`sheet_list`), not baked in at creation time, same as
+        # `layer_props` never writes a default `visible`/`color`.
+        self.sheets: LWWElementSet[SheetId] = LWWElementSet(clock)
+        self.sheet_props: dict[SheetId, LWWMap] = {}
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -376,6 +390,11 @@ class DrawingDocument:
         if path_id not in self.paths:
             self.paths[path_id] = RGA(self.clock)
         return self.paths[path_id]
+
+    def _sheet_props(self, sheet_id: SheetId) -> LWWMap:
+        if sheet_id not in self.sheet_props:
+            self.sheet_props[sheet_id] = LWWMap(self.clock)
+        return self.sheet_props[sheet_id]
 
     # -- layers -----------------------------------------------------------------
     def add_layer(self, name: str, layer_id: LayerId | None = None) -> tuple[LayerId, list[DocOp]]:
@@ -399,6 +418,29 @@ class DrawingDocument:
 
     def remove_group(self, group_id: GroupId) -> DocOp:
         return DocOp("group", self.groups.remove(group_id).to_dict())
+
+    # -- print sheets (Part 7 C3) --------------------------------------------------
+    def add_sheet(self, name: str, sheet_id: SheetId | None = None) -> tuple[SheetId, list[DocOp]]:
+        """Only `name` is required up front -- every other field (page
+        setup, title block text) is set afterward via `set_sheet_prop`
+        and defaulted at read time by `sheet_list` (see `SHEET_DEFAULTS`
+        in `crdt_cad.export.pdf_io`), the same "don't write defaults the
+        reader already knows how to fill in" choice `add_layer` makes
+        for `visible`/`color`."""
+        sheet_id = sheet_id or new_id("sheet")
+        ops = [DocOp("sheet", self.sheets.add(sheet_id).to_dict())]
+        ops.append(DocOp("sheet_prop", self._sheet_props(sheet_id).set("name", name).to_dict(), scope=sheet_id))
+        return sheet_id, ops
+
+    def remove_sheet(self, sheet_id: SheetId) -> DocOp:
+        return DocOp("sheet", self.sheets.remove(sheet_id).to_dict())
+
+    def set_sheet_prop(self, sheet_id: SheetId, key: str, value: Any) -> DocOp:
+        op = self._sheet_props(sheet_id).set(key, value)
+        return DocOp("sheet_prop", op.to_dict(), scope=sheet_id)
+
+    def sheet_list(self) -> list[dict]:
+        return [{"id": sid, **dict(self._sheet_props(sid).items())} for sid in self.sheets]
 
     # -- paths ------------------------------------------------------------------
     def add_path(
@@ -627,6 +669,11 @@ class DrawingDocument:
             return self.constraints.apply(LWWOp.from_dict(op.payload))
         if op.target == "group":
             return self.groups.apply(LWWOp.from_dict(op.payload))
+        if op.target == "sheet":
+            return self.sheets.apply(LWWOp.from_dict(op.payload))
+        if op.target == "sheet_prop":
+            assert op.scope is not None
+            return self._sheet_props(op.scope).apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown doc op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -649,6 +696,10 @@ class DrawingDocument:
         changed |= self.dimensions.merge(other.dimensions)
         changed |= self.constraints.merge(other.constraints)
         changed |= self.groups.merge(other.groups)
+        changed |= self.sheets.merge(other.sheets)
+        for sheet_id in set(self.sheet_props) | set(other.sheet_props):
+            if sheet_id in other.sheet_props:
+                changed |= self._sheet_props(sheet_id).merge(other.sheet_props[sheet_id])
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -738,6 +789,9 @@ class DrawingDocument:
         vc = vc.merge(self.dimensions.frontier())
         vc = vc.merge(self.constraints.frontier())
         vc = vc.merge(self.groups.frontier())
+        vc = vc.merge(self.sheets.frontier())
+        for m in self.sheet_props.values():
+            vc = vc.merge(m.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[DocOp]:
@@ -755,6 +809,9 @@ class DrawingDocument:
         out += [DocOp("dimension", op.to_dict()) for op in self.dimensions.ops_since(vc)]
         out += [DocOp("constraint", op.to_dict()) for op in self.constraints.ops_since(vc)]
         out += [DocOp("group", op.to_dict()) for op in self.groups.ops_since(vc)]
+        out += [DocOp("sheet", op.to_dict()) for op in self.sheets.ops_since(vc)]
+        for sheet_id, m in self.sheet_props.items():
+            out += [DocOp("sheet_prop", op.to_dict(), scope=sheet_id) for op in m.ops_since(vc)]
         return out
 
     # -- serialization --------------------------------------------------------------
@@ -771,6 +828,8 @@ class DrawingDocument:
             "dimensions": self.dimensions.to_dict(),
             "constraints": self.constraints.to_dict(),
             "groups": self.groups.to_dict(),
+            "sheets": self.sheets.to_dict(),
+            "sheet_props": {sid: m.to_dict() for sid, m in self.sheet_props.items()},
         }
 
     @staticmethod
@@ -793,6 +852,11 @@ class DrawingDocument:
         doc.constraints = LWWMap.from_dict(clock, d["constraints"]) if "constraints" in d else LWWMap(clock)
         # Same backward-compat default for "groups" (Phase 15).
         doc.groups = LWWElementSet.from_dict(clock, d["groups"]) if "groups" in d else LWWElementSet(clock)
+        # Same backward-compat default for "sheets" (Part 7 C3).
+        doc.sheets = LWWElementSet.from_dict(clock, d["sheets"]) if "sheets" in d else LWWElementSet(clock)
+        doc.sheet_props = (
+            {sid: LWWMap.from_dict(clock, m) for sid, m in d["sheet_props"].items()} if "sheet_props" in d else {}
+        )
         return doc
 
     def to_bytes(self) -> bytes:

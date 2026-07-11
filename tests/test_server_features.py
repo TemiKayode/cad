@@ -69,6 +69,54 @@ def test_export_drawing_dxf_is_readable():
     assert len(paths[0]) == 3
 
 
+def test_export_drawing_pdf_without_a_sheet_yet_returns_404():
+    client = _client()
+    with client.websocket_connect("/ws/exportpdfnosheet") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        _draw_something(ws)
+
+    resp = client.get("/api/rooms/exportpdfnosheet/export/pdf")
+    assert resp.status_code == 404
+
+
+def test_export_drawing_pdf_renders_the_sheet(tmp_path):
+    client = _client()
+    with client.websocket_connect("/ws/exportpdf") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        doc = _draw_something(ws)
+        sheet_id, sheet_ops = doc.add_sheet("Sheet 1")
+        sheet_ops.append(doc.set_sheet_prop(sheet_id, "title", "My Drawing"))
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in sheet_ops]})
+
+    resp = client.get("/api/rooms/exportpdf/export/pdf")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/pdf")
+    assert "attachment" in resp.headers["content-disposition"]
+    assert resp.content[:4] == b"%PDF"
+
+
+def test_export_drawing_pdf_selects_sheet_by_id_and_falls_back_for_a_stale_one():
+    client = _client()
+    with client.websocket_connect("/ws/exportpdfmulti") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        doc = _draw_something(ws)
+        sheet_a, ops_a = doc.add_sheet("Sheet A")
+        sheet_b, ops_b = doc.add_sheet("Sheet B")
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in [*ops_a, *ops_b]]})
+
+    resp_b = client.get(f"/api/rooms/exportpdfmulti/export/pdf?sheet_id={sheet_b}")
+    assert resp_b.status_code == 200
+    assert "Sheet_B" in resp_b.headers["content-disposition"]
+
+    # a stale/unknown sheet_id falls back to the first sheet rather than 404ing
+    resp_stale = client.get("/api/rooms/exportpdfmulti/export/pdf?sheet_id=sheet_does_not_exist")
+    assert resp_stale.status_code == 200
+    assert "Sheet_A" in resp_stale.headers["content-disposition"]
+
+
 def test_export_mesh_json_and_stl():
     client = _client()
     mesh = MeshCRDT(LamportClock(actor="a"))

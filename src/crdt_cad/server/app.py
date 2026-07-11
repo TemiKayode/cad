@@ -100,6 +100,7 @@ from crdt_cad.crdt.clock import LamportClock, VectorClock
 from crdt_cad.crdt.document import DocOp, DrawingDocument, bake_path_transform
 from crdt_cad.crdt.mesh import MeshCRDT, MeshOp
 from crdt_cad.export.dxf_io import drawing_from_dxf_bytes, drawing_to_dxf_bytes
+from crdt_cad.export.pdf_io import sheet_to_pdf_bytes
 from crdt_cad.export.step_export import mesh_to_step_bytes
 from crdt_cad.export.stl_export import mesh_to_stl
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
@@ -1807,6 +1808,26 @@ async def export_drawing_dxf(room_id: str) -> Response:
     layer_order = [layer["id"] for layer in room.doc.layer_list()]
     data = drawing_to_dxf_bytes(paths, units=units, dimensions=room.doc.dimension_list(), layer_order=layer_order)
     return _attachment(data, "application/dxf", f"{room_id}.dxf")
+
+
+@app.get("/api/rooms/{room_id}/export/pdf", dependencies=[Depends(require_room_access("drawing"))])
+async def export_drawing_pdf(room_id: str, sheet_id: str | None = None) -> Response:
+    """Renders one sheet (Part 7 C3 -- page setup + title block, see
+    `DrawingDocument.sheets`/`sheet_props`) to PDF. `sheet_id` picks
+    which sheet when a room has more than one; omitted (or a stale id
+    a concurrent delete removed) falls back to the first sheet in
+    creation order, same "don't error on a race, degrade to something
+    reasonable" choice the rest of this room's export endpoints make."""
+    room = await drawing_room_manager.get_or_create(room_id)
+    sheets = room.doc.sheet_list()
+    if not sheets:
+        raise HTTPException(status_code=404, detail="this room has no sheets yet -- create one first")
+    sheet = next((s for s in sheets if s["id"] == sheet_id), sheets[0])
+    paths = [bake_path_transform(p) for p in room.doc.path_list()]
+    layer_order = [layer["id"] for layer in room.doc.layer_list()]
+    data = sheet_to_pdf_bytes(paths, sheet, dimensions=room.doc.dimension_list(), layer_order=layer_order)
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", sheet.get("name") or "sheet")
+    return _attachment(data, "application/pdf", f"{room_id}-{safe_name}.pdf")
 
 
 class ImportResult(BaseModel):
