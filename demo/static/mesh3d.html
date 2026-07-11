@@ -116,6 +116,24 @@
         </div>
         <input id="importStepFileInput" type="file" accept=".step,.stp" style="display:none" />
 
+        <div class="section-title" title="Combine two placed objects into one solid via a real geometric boolean">Boolean</div>
+        <div class="tool-row">
+          <select id="boolObjectA" style="flex:1"></select>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <select id="boolObjectB" style="flex:1"></select>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <select id="boolOp" style="flex:1">
+            <option value="union">Union (A + B)</option>
+            <option value="subtract">Subtract (A - B)</option>
+            <option value="intersect">Intersect (A &amp; B)</option>
+          </select>
+        </div>
+        <div class="tool-row" style="margin-top:6px">
+          <button id="boolApplyBtn" style="width:100%">Apply</button>
+        </div>
+
         <div class="section-title"><svg class="icon"><use href="#icon-sparkles"></use></svg>AI Generate</div>
         <div class="tool-row">
           <input id="genPromptInput" type="text" style="flex:1" placeholder="e.g. a wooden table, or a 4 bedroom house with a gable roof" />
@@ -144,6 +162,8 @@
 
         <div class="section-title">Selected Face</div>
         <div id="facePanel"><div class="empty-hint">Select a face (click one of its edges/fill in Move tool) to extrude it.</div></div>
+
+        <div id="parametricPanelWrap" style="display:none" title="Flag-gated prototype (CRDT_CAD_PARAMETRIC_PROTOTYPE) -- see docs/brep_design.md"></div>
 
         <div class="section-title">Comments</div>
         <div id="commentList"><div class="empty-hint">No face selected.</div></div>

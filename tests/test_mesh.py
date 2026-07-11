@@ -232,6 +232,60 @@ def test_generation_included_in_frontier_and_ops_since():
     assert mesh.frontier().get("bot") > frontier_before.get("bot")
 
 
+# -- parametric objects (Part 7 C6, flag-gated prototype) ---------------------
+
+
+def test_set_parametric_object_and_read():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    record = {"kind": "box", "width": 2.0, "height": 1.0, "depth": 3.0, "center": [0.0, 0.0, 0.0], "scene_object": "obj_1"}
+    mesh.set_parametric_object("param_1", record)
+    assert mesh.parametric_object_list() == [{"id": "param_1", **record}]
+
+
+def test_set_parametric_object_overwrites_wholesale():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    mesh.set_parametric_object("param_1", {"kind": "box", "width": 2.0, "height": 1.0, "depth": 3.0, "center": [0, 0, 0], "scene_object": "obj_1"})
+    mesh.set_parametric_object("param_1", {"kind": "box", "width": 5.0, "height": 1.0, "depth": 3.0, "center": [0, 0, 0], "scene_object": "obj_1"})
+    assert mesh.parametric_object_list()[0]["width"] == 5.0
+
+
+def test_parametric_object_merge_and_serialization_roundtrip():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    record = {"kind": "box", "width": 2.0, "height": 1.0, "depth": 3.0, "center": [0, 0, 0], "scene_object": "obj_1"}
+    mesh.set_parametric_object("param_1", record)
+
+    other = MeshCRDT(LamportClock(actor="b"))
+    other.merge(mesh)
+    assert other.parametric_object_list() == [{"id": "param_1", **record}]
+
+    restored = MeshCRDT.from_bytes(LamportClock(actor="c"), mesh.to_bytes())
+    assert restored.parametric_object_list() == [{"id": "param_1", **record}]
+
+
+def test_parametric_object_default_to_empty_when_absent_from_an_old_snapshot():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    d = mesh.to_dict()
+    del d["parametric_objects"]
+    restored = MeshCRDT.from_dict(LamportClock(actor="b"), d)
+    assert restored.parametric_object_list() == []
+
+
+def test_remove_parametric_object_deletes_it():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    mesh.set_parametric_object("param_1", {"kind": "box", "width": 1.0, "height": 1.0, "depth": 1.0, "center": [0, 0, 0], "scene_object": "obj_1"})
+    mesh.apply(mesh.remove_parametric_object("param_1"))
+    assert mesh.parametric_object_list() == []
+
+
+def test_parametric_object_included_in_frontier_and_ops_since():
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    frontier_before = mesh.frontier()
+    mesh.set_parametric_object("param_1", {"kind": "box", "width": 1.0, "height": 1.0, "depth": 1.0, "center": [0, 0, 0], "scene_object": "obj_1"})
+    delta = mesh.ops_since(frontier_before)
+    assert any(op.target == "parametric_object" for op in delta)
+    assert mesh.frontier().get("a") > frontier_before.get("a")
+
+
 # -- comments (Part 6 P5) -----------------------------------------------------
 
 

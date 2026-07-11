@@ -43,6 +43,7 @@ const state = {
   invalidFaces: new Set(),  // face ids currently flagged by a validity_warning (see syncScene)
   generations: new Map(),   // generationId -> {prompt, generator_name, spec, ...} (Phase G4)
   comments: new Map(),      // commentId -> {face_id, text, author} (Part 6 P5)
+  parametricObjects: new Map(), // parametricId -> {kind, width, height, depth, center, scene_object} (Part 7 C6 prototype)
 };
 
 const ui = {
@@ -121,6 +122,7 @@ function observeSnapshotCounters(doc) {
   scanEntries(doc.presence);
   scanEntries(doc.generations);
   scanEntries(doc.comments);
+  scanEntries(doc.parametric_objects);
   clock.observe(maxCounter);
 }
 
@@ -146,6 +148,8 @@ function loadSnapshot(doc) {
   if (doc.generations) for (const e of doc.generations.entries) if (!e.d) state.generations.set(e.k, e.v);
   state.comments.clear();
   if (doc.comments) for (const e of doc.comments.entries) if (!e.d) state.comments.set(e.k, e.v);
+  state.parametricObjects.clear();
+  if (doc.parametric_objects) for (const e of doc.parametric_objects.entries) if (!e.d) state.parametricObjects.set(e.k, e.v);
   syncScene();
 }
 
@@ -177,6 +181,8 @@ function applyOp(op) {
     if (!p.d) state.generations.set(p.k, p.v); else state.generations.delete(p.k);
   } else if (op.target === "comment") {
     if (!p.d) state.comments.set(p.k, p.v); else state.comments.delete(p.k);
+  } else if (op.target === "parametric_object") {
+    if (!p.d) state.parametricObjects.set(p.k, p.v); else state.parametricObjects.delete(p.k);
   }
 }
 
@@ -221,6 +227,12 @@ function setGenerationOp(generationId, record) {
 }
 function removeGenerationOp(generationId) {
   return { target: "generation", payload: lwwOp(clock.tick(), generationId, null, true) };
+}
+function setParametricObjectOp(parametricId, record) {
+  return { target: "parametric_object", payload: lwwOp(clock.tick(), parametricId, record, false) };
+}
+function removeParametricObjectOp(parametricId) {
+  return { target: "parametric_object", payload: lwwOp(clock.tick(), parametricId, null, true) };
 }
 
 // -- comments (Part 6 P5) -- mirrors sketch.js's addComment/removeComment,
@@ -1264,12 +1276,129 @@ function pushRingEdges(ops, subEntries, ring) {
 
 /** Applies every op in a builder's result locally, sends them as one
  * batch, and records one composite undo entry -- shared by all four
- * primitive builders below, mirroring extrudeFace's own tail exactly. */
+ * primitive builders below, mirroring extrudeFace's own tail exactly.
+ * Every face the builder just created is also tagged with one fresh,
+ * shared `scene_object` id (Part 7 C6) -- the same tag the AI scene
+ * generator already uses to group a multi-face object's faces
+ * together, here reused as this project's one "which faces make up
+ * one logical object" primitive so the Boolean tool has something to
+ * select a whole placed primitive by. */
 function commitPrimitive({ ops, subEntries }) {
+  const sceneObjectId = "obj_" + rid();
+  for (const entry of subEntries) {
+    if (entry.kind === "face_add") ops.push(setFacePropOp(entry.faceId, "scene_object", sceneObjectId));
+  }
   for (const op of ops) applyOp(op);
   sendOps(ops);
   pushUndo({ kind: "composite", entries: subEntries });
   syncScene();
+  return sceneObjectId;
+}
+
+// -- flag-gated parametric-primitive prototype (Part 7 C6) ---------------------
+// See docs/brep_design.md for the full "why only this, why not a real
+// B-Rep/parametric kernel" writeup. This is deliberately narrow: only
+// Box, only three dimensions, no feature history/dependency graph --
+// a bounded demonstration that "the parameters are the source of
+// truth, the mesh is a disposable rebuild of them" is achievable
+// without the larger rewrite that a general system would need, not a
+// claim that this *is* that general system.
+
+let parametricPrototypeEnabled = false;
+fetch("/api/config")
+  .then((r) => r.json())
+  .then((cfg) => {
+    parametricPrototypeEnabled = !!cfg.parametric_prototype_enabled;
+    renderPanels();
+  })
+  .catch(() => {}); // config fetch failing just means the prototype stays off, never a hard error
+
+function registerParametricBox(sceneObjectId, center, width, height, depth) {
+  const parametricId = "param_" + rid();
+  const op = setParametricObjectOp(parametricId, { kind: "box", width, height, depth, center, scene_object: sceneObjectId });
+  applyOp(op);
+  sendOps([op]);
+}
+
+/** The live parametric_objects record for whichever object the
+ * currently-selected face belongs to, or null if that object isn't a
+ * parametric one (an ordinary primitive/AI-generated/hand-built face,
+ * or no face selected at all). */
+function selectedParametricObject() {
+  if (!ui.selectedFace) return null;
+  const sceneObject = state.faceProps.get(ui.selectedFace)?.scene_object;
+  if (!sceneObject) return null;
+  for (const [id, record] of state.parametricObjects) {
+    if (record.scene_object === sceneObject) return { id, ...record };
+  }
+  return null;
+}
+
+/** Deletes every currently-live face/vertex tagged with `sceneObjectId`
+ * and rebuilds it from scratch via buildBoxOps at the new dimensions,
+ * re-tagged with the *same* scene_object id (so anything else that
+ * refers to this object by that id -- the Boolean tool's dropdown, a
+ * comment anchored to one of its faces via face_id... though an
+ * old face_id itself won't survive a regenerate, same caveat a real
+ * parametric system would need a stable-feature-reference scheme to
+ * avoid) keeps working. Client-side only, no server round trip --
+ * `clock` is already kept ahead of every actor's counters via
+ * `observeSnapshotCounters`/`applyOp`'s own `clock.observe` calls, so
+ * (unlike the boolean endpoint's *fresh, throwaway* server-side clock)
+ * there's no risk of a remove op losing an LWW tie-break here. */
+function regenerateParametricBox(parametricId, width, height, depth) {
+  const record = state.parametricObjects.get(parametricId);
+  if (!record) return;
+  const sceneObjectId = record.scene_object;
+  const ops = [];
+  const consumedVertexIds = new Set();
+  for (const faceId of state.faceIndex) {
+    if (state.faceProps.get(faceId)?.scene_object !== sceneObjectId) continue;
+    for (const v of liveValues(state.faceNodes.get(faceId))) consumedVertexIds.add(v);
+    ops.push(removeFaceOp(faceId));
+  }
+  // Only drop a vertex no other *surviving* face still references --
+  // mirrors the boolean endpoint's identical safety check server-side.
+  const stillReferenced = new Set();
+  for (const faceId of state.faceIndex) {
+    if (state.faceProps.get(faceId)?.scene_object === sceneObjectId) continue;
+    for (const v of liveValues(state.faceNodes.get(faceId))) stillReferenced.add(v);
+  }
+  for (const v of consumedVertexIds) if (!stillReferenced.has(v)) ops.push(removeVertexOp(v));
+
+  const { ops: buildOps, subEntries } = buildBoxOps(record.center, width, height, depth);
+  for (const entry of subEntries) {
+    if (entry.kind === "face_add") buildOps.push(setFacePropOp(entry.faceId, "scene_object", sceneObjectId));
+  }
+  ops.push(...buildOps);
+  ops.push(setParametricObjectOp(parametricId, { ...record, width, height, depth }));
+
+  for (const op of ops) applyOp(op);
+  sendOps(ops);
+  syncScene();
+  renderPanels();
+}
+
+function renderParametricPanel() {
+  const wrap = document.getElementById("parametricPanelWrap");
+  if (!wrap) return;
+  const obj = parametricPrototypeEnabled ? selectedParametricObject() : null;
+  if (!obj) { wrap.style.display = "none"; return; }
+  wrap.style.display = "";
+  wrap.innerHTML = `
+    <div class="section-title">Parametric Box</div>
+    <div class="field-row"><label>Width</label><input id="paramWidth" type="number" min="0.1" step="0.5" value="${obj.width}" style="width:70px"/></div>
+    <div class="field-row"><label>Height</label><input id="paramHeight" type="number" min="0.1" step="0.5" value="${obj.height}" style="width:70px"/></div>
+    <div class="field-row"><label>Depth</label><input id="paramDepth" type="number" min="0.1" step="0.5" value="${obj.depth}" style="width:70px"/></div>
+    <button id="paramRegenerateBtn" style="width:100%;margin-top:4px">Regenerate</button>
+  `;
+  wrap.querySelector("#paramRegenerateBtn").onclick = () => {
+    const width = parseFloat(document.getElementById("paramWidth").value) || obj.width;
+    const height = parseFloat(document.getElementById("paramHeight").value) || obj.height;
+    const depth = parseFloat(document.getElementById("paramDepth").value) || obj.depth;
+    regenerateParametricBox(obj.id, width, height, depth);
+    showToast("Parametric Box regenerated", "success");
+  };
 }
 
 /** `segments` evenly-spaced points around a horizontal circle of the
@@ -1788,7 +1917,17 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
     // a plain vertex does -- consistent anchor across all four kinds.
     const center = snapPosition3D([round(pt.x), 0, round(pt.z)], null);
     const f = primitiveFields || PRIMITIVE_DEFAULTS[ui.tool];
-    if (ui.tool === "box") commitPrimitive(buildBoxOps(center, f.width, f.height, f.depth));
+    if (ui.tool === "box") {
+      const sceneObjectId = commitPrimitive(buildBoxOps(center, f.width, f.height, f.depth));
+      // Part 7 C6, flag-gated prototype: a Box placed while the flag is
+      // on also gets a `parametric_objects` record, so it can be
+      // resized-in-place later (see regenerateParametricBox) instead of
+      // staying a dumb, one-shot mesh forever like every other
+      // primitive here. Deliberately just Box, not all four primitives
+      // -- see docs/brep_design.md for why this stays a narrow, honest
+      // prototype rather than a general parametric system.
+      if (parametricPrototypeEnabled) registerParametricBox(sceneObjectId, center, f.width, f.height, f.depth);
+    }
     else if (ui.tool === "cylinder") commitPrimitive(buildCylinderOps(center, f.radius, f.height, Math.max(3, Math.round(f.segments))));
     else if (ui.tool === "pyramid") commitPrimitive(buildPyramidOps(center, f.radius, f.height, Math.max(3, Math.round(f.segments))));
     else if (ui.tool === "plane") commitPrimitive(buildPlaneOps(center, f.width, f.depth));
@@ -1927,6 +2066,7 @@ function buildCommands() {
     clickCmd("downloadGlbBtn", "Export .glb", "File", "", "file"),
     clickCmd("downloadThreeMfBtn", "Export .3mf", "File", "", "file"),
     clickCmd("importStepBtn", "Import STEP", "File", "", "upload"),
+    clickCmd("boolApplyBtn", "Apply boolean (Union/Subtract/Intersect)", "Tools", "", "box"),
 
     (() => {
       const el = document.getElementById("genPromptInput");
@@ -2041,7 +2181,91 @@ function renderPanels() {
   renderFaceList();
   renderPresenceList();
   renderGenerationList();
+  renderBooleanPanel();
+  renderParametricPanel();
 }
+
+// -- 3D booleans (Part 7 C6) -------------------------------------------------
+// Operates on "objects" -- every face sharing the same `scene_object`
+// face_prop, the same grouping tag the AI scene generator already uses
+// for a multi-face generated object (Part 6 G2), now also stamped onto
+// every parametric primitive's faces at creation (see commitPrimitive)
+// so a hand-placed Box/Cylinder/Pyramid/Plane is a selectable "object"
+// too. A face with no scene_object at all (an object built by hand
+// face-by-face, or extruded, never tagged) isn't selectable here --
+// narrower than "any arbitrary face selection," but avoids needing a
+// new multi-face selection UI (this project's 3D side only ever
+// tracks one `ui.selectedFace` today) just for this one tool.
+
+/** Every distinct scene_object id currently present among live faces,
+ * with the face ids belonging to each -- computed fresh on every
+ * render rather than incrementally maintained, the same "simplicity
+ * over premature optimization" choice sketch.js's own
+ * definitionPathIdForComponent (Part 7 C5) makes. */
+function sceneObjectGroups() {
+  const groups = new Map();
+  for (const id of state.faceIndex) {
+    const sceneObject = state.faceProps.get(id)?.scene_object;
+    if (!sceneObject) continue;
+    if (!groups.has(sceneObject)) groups.set(sceneObject, []);
+    groups.get(sceneObject).push(id);
+  }
+  return groups;
+}
+
+function renderBooleanPanel() {
+  const selA = document.getElementById("boolObjectA");
+  const selB = document.getElementById("boolObjectB");
+  if (!selA || !selB) return;
+  // Preserve each dropdown's current selection across a re-render (this
+  // is called from renderPanels on every op, local or remote) so
+  // picking Object A doesn't get reset by an unrelated face edit
+  // elsewhere in the room.
+  const prevA = selA.value, prevB = selB.value;
+  const groups = sceneObjectGroups();
+  const optionsHtml = groups.size
+    ? [...groups.entries()]
+        .map(([id, faceIds], i) => `<option value="${id}">Object ${i + 1} (${faceIds.length} face${faceIds.length === 1 ? "" : "s"})</option>`)
+        .join("")
+    : '<option value="">(no boolean-eligible objects yet -- place a primitive)</option>';
+  selA.innerHTML = optionsHtml;
+  selB.innerHTML = optionsHtml;
+  if (groups.has(prevA)) selA.value = prevA;
+  if (groups.has(prevB)) selB.value = prevB;
+}
+
+async function applyMeshBoolean() {
+  const selA = document.getElementById("boolObjectA");
+  const selB = document.getElementById("boolObjectB");
+  const op = document.getElementById("boolOp").value;
+  const groups = sceneObjectGroups();
+  const aFaceIds = groups.get(selA.value);
+  const bFaceIds = groups.get(selB.value);
+  if (!aFaceIds || !bFaceIds) {
+    showToast("Pick two different objects first", "error");
+    return;
+  }
+  if (selA.value === selB.value) {
+    showToast("Object A and Object B must be different", "error");
+    return;
+  }
+  try {
+    const resp = await fetch(withToken(`/api/mesh/${encodeURIComponent(room)}/boolean`, "mesh", room), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ op, a_face_ids: aFaceIds, b_face_ids: bFaceIds }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    const result = await resp.json();
+    showToast(`${op[0].toUpperCase()}${op.slice(1)} applied -- ${result.face_count} face(s)`, "success");
+  } catch (err) {
+    showToast(`Boolean failed: ${err.message}`, "error");
+  }
+}
+document.getElementById("boolApplyBtn").onclick = applyMeshBoolean;
 
 // -- comments panel (Part 6 P5) -- mirrors sketch.js's renderSelectionPanel's
 // comment section, filtered by the selected face instead of the selected path.

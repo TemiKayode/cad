@@ -326,6 +326,113 @@ def test_import_mesh_step_rejects_a_malformed_file():
     assert resp.status_code == 400
 
 
+def test_api_config_exposes_parametric_prototype_flag(monkeypatch):
+    client = _client()
+    monkeypatch.delenv("CRDT_CAD_PARAMETRIC_PROTOTYPE", raising=False)
+    assert client.get("/api/config").json() == {"parametric_prototype_enabled": False}
+    monkeypatch.setenv("CRDT_CAD_PARAMETRIC_PROTOTYPE", "1")
+    assert client.get("/api/config").json() == {"parametric_prototype_enabled": True}
+
+
+def _cube_face_ids(mesh, x0, y0, z0, x1, y1, z1, prefix):
+    ops = [
+        mesh.add_vertex(f"{prefix}0", (x0, y0, z0)), mesh.add_vertex(f"{prefix}1", (x1, y0, z0)),
+        mesh.add_vertex(f"{prefix}2", (x1, y1, z0)), mesh.add_vertex(f"{prefix}3", (x0, y1, z0)),
+        mesh.add_vertex(f"{prefix}4", (x0, y0, z1)), mesh.add_vertex(f"{prefix}5", (x1, y0, z1)),
+        mesh.add_vertex(f"{prefix}6", (x1, y1, z1)), mesh.add_vertex(f"{prefix}7", (x0, y1, z1)),
+    ]
+    faces = {
+        f"{prefix}bottom": [f"{prefix}0", f"{prefix}3", f"{prefix}2", f"{prefix}1"],
+        f"{prefix}top": [f"{prefix}4", f"{prefix}5", f"{prefix}6", f"{prefix}7"],
+        f"{prefix}front": [f"{prefix}0", f"{prefix}1", f"{prefix}5", f"{prefix}4"],
+        f"{prefix}back": [f"{prefix}3", f"{prefix}7", f"{prefix}6", f"{prefix}2"],
+        f"{prefix}left": [f"{prefix}0", f"{prefix}4", f"{prefix}7", f"{prefix}3"],
+        f"{prefix}right": [f"{prefix}1", f"{prefix}2", f"{prefix}6", f"{prefix}5"],
+    }
+    face_ids = list(faces.keys())
+    for fid, loop in faces.items():
+        ops.extend(mesh.add_face(fid, loop))
+    return ops, face_ids
+
+
+def test_mesh_boolean_subtract_replaces_operands_with_a_clean_result():
+    client = _client()
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    ops_a, faces_a = _cube_face_ids(mesh, 0, 0, 0, 2, 2, 2, "a")
+    ops_b, faces_b = _cube_face_ids(mesh, 1, 0, 0, 3, 2, 2, "b")
+    with client.websocket_connect("/ws/mesh/meshboolean") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in [*ops_a, *ops_b]]})
+
+    resp = client.post("/api/mesh/meshboolean/boolean", json={"op": "subtract", "a_face_ids": faces_a, "b_face_ids": faces_b})
+    assert resp.status_code == 200
+    assert resp.json() == {"vertex_count": 8, "face_count": 12}
+
+    exported = client.get("/api/mesh/meshboolean/export/json").json()
+    live_vertices = [e for e in exported["vertices"]["entries"] if not e.get("d")]
+    live_faces = [e for e in exported["face_index"]["entries"] if not e.get("d")]
+    assert len(live_vertices) == 8  # old 16 fully replaced by the result's own 8
+    assert len(live_faces) == 12  # triangulated box, not the original 12 quads
+
+
+def test_mesh_boolean_leaves_an_unrelated_face_and_its_shared_vertex_untouched():
+    """A vertex the boolean's two operands *and* a third, uninvolved face
+    all reference must survive -- the "only delete a vertex nothing else
+    still needs" safety check."""
+    client = _client()
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    ops_a, faces_a = _cube_face_ids(mesh, 0, 0, 0, 2, 2, 2, "a")
+    ops_b, faces_b = _cube_face_ids(mesh, 1, 0, 0, 3, 2, 2, "b")
+    # a third face that reuses vertex a0 (0,0,0), shared with operand A
+    extra_ops = [
+        mesh.add_vertex("extra1", (5.0, 5.0, 5.0)),
+        mesh.add_vertex("extra2", (6.0, 5.0, 5.0)),
+    ]
+    extra_ops.extend(mesh.add_face("extra_face", ["a0", "extra1", "extra2"]))
+    with client.websocket_connect("/ws/mesh/meshboolean2") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in [*ops_a, *ops_b, *extra_ops]]})
+
+    resp = client.post("/api/mesh/meshboolean2/boolean", json={"op": "subtract", "a_face_ids": faces_a, "b_face_ids": faces_b})
+    assert resp.status_code == 200
+
+    exported = client.get("/api/mesh/meshboolean2/export/json").json()
+    live_vertex_ids = {e["k"] for e in exported["vertices"]["entries"] if not e.get("d")}
+    assert "a0" in live_vertex_ids  # still referenced by extra_face, must survive
+    live_face_ids = {e["k"] for e in exported["face_index"]["entries"] if not e.get("d")}
+    assert "extra_face" in live_face_ids
+
+
+def test_mesh_boolean_rejects_unknown_op():
+    client = _client()
+    resp = client.post("/api/mesh/meshbooleanbadop/boolean", json={"op": "bogus", "a_face_ids": ["x"], "b_face_ids": ["y"]})
+    assert resp.status_code == 400
+
+
+def test_mesh_boolean_rejects_an_empty_operand():
+    client = _client()
+    resp = client.post("/api/mesh/meshbooleanempty/boolean", json={"op": "union", "a_face_ids": [], "b_face_ids": ["y"]})
+    assert resp.status_code == 400
+
+
+def test_mesh_boolean_non_overlapping_intersect_returns_400():
+    client = _client()
+    mesh = MeshCRDT(LamportClock(actor="a"))
+    ops_a, faces_a = _cube_face_ids(mesh, 0, 0, 0, 2, 2, 2, "a")
+    ops_c, faces_c = _cube_face_ids(mesh, 100, 100, 100, 102, 102, 102, "c")
+    with client.websocket_connect("/ws/mesh/meshbooleannooverlap") as ws:
+        ws.send_json({"type": "hello", "actor": "a"})
+        ws.receive_json()
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in [*ops_a, *ops_c]]})
+
+    resp = client.post(
+        "/api/mesh/meshbooleannooverlap/boolean", json={"op": "intersect", "a_face_ids": faces_a, "b_face_ids": faces_c}
+    )
+    assert resp.status_code == 400
+
+
 # -- import ---------------------------------------------------------------------
 
 

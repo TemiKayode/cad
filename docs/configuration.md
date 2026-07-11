@@ -103,6 +103,12 @@ otherwise lazily create the accounts schema even in a tokens-only
 deployment. Reports are reviewed and resolved from the `/admin` panel
 (`GET /api/admin/reports`, `POST /api/admin/reports/{id}/resolve`).
 
+## Experimental (flag-gated prototypes)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CRDT_CAD_PARAMETRIC_PROTOTYPE` | unset (off) | Part 7 C6's narrow parametric-Box prototype -- see `docs/brep_design.md` for what this is and isn't. Unset: `GET /api/config` reports `parametric_prototype_enabled: false`, the 3D demo never shows the "Parametric Box" panel, and a placed Box is the same one-shot, non-editable-after-placement mesh every other primitive already is. Set (any non-empty value): a placed Box also gets a `parametric_objects` CRDT record (width/height/depth/center) and a Width/Height/Depth/"Regenerate" panel when one of its faces is selected -- editing a dimension deletes and rebuilds just that object's mesh from the new parameters, in place. |
+
 ## Rate limits and resource ceilings
 
 | Variable | Default | Effect |

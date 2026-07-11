@@ -107,6 +107,7 @@ from crdt_cad.export.step_export import mesh_from_step_bytes, mesh_to_step_bytes
 from crdt_cad.export.stl_export import mesh_to_stl
 from crdt_cad.export.svg_io import drawing_from_svg_string, drawing_to_svg_string
 from crdt_cad.geometry.constraints import Constraint, Sketch
+from crdt_cad.geometry.mesh_boolean import compute_mesh_boolean
 from crdt_cad.geometry.mesh_validity import check_mesh_validity
 from crdt_cad.geometry.modify import OffsetError, offset_path
 from crdt_cad.geometry.validity import GeometryError, validate_new_point
@@ -151,6 +152,17 @@ DATABASE_URL = os.environ.get("CRDT_CAD_DATABASE_URL")
 QUOTA_GENERATIONS_PER_DAY = int(os.environ.get("CRDT_CAD_QUOTA_GENERATIONS_PER_DAY", "0"))
 QUOTA_SHARE_LINKS_PER_DAY = int(os.environ.get("CRDT_CAD_QUOTA_SHARE_LINKS_PER_DAY", "0"))
 QUOTA_OWNED_DOCUMENTS = int(os.environ.get("CRDT_CAD_QUOTA_OWNED_DOCUMENTS", "0"))
+
+
+def parametric_prototype_enabled() -> bool:
+    """Part 7 C6's flag-gated parametric-primitive prototype (see
+    `docs/brep_design.md` for what this is and isn't) -- a live
+    function reading the env var fresh per call (`billing_enabled`'s
+    shape, not a module constant read once at import), so tests can
+    toggle it via monkeypatch without a module reload. Off by default:
+    a deployment that never sets `CRDT_CAD_PARAMETRIC_PROTOTYPE` never
+    sees the Parametric Box tool at all."""
+    return bool(os.environ.get("CRDT_CAD_PARAMETRIC_PROTOTYPE"))
 
 # CRDT_CAD_DATABASE_URL opts into Postgres -- the one persistence backend
 # that lets more than one server *process* share room state (see
@@ -694,6 +706,18 @@ async def health() -> dict:
         "connections": drawing_room_manager.connection_count() + mesh_room_manager.connection_count(),
         "served_by": POD_NAME,
     }
+
+
+@app.get("/api/config")
+async def public_config() -> dict:
+    """Server-controlled feature flags the frontend needs to know about
+    before it can decide what UI to show -- unauthenticated and cheap
+    (booleans only, no per-room or per-user state), the same "static
+    files can't template server config in, so fetch it once at load"
+    reasoning that motivated this over baking a flag into `mesh3d.html`
+    directly. Currently just Part 7 C6's parametric prototype; a
+    natural home for any future purely-client-visible flag."""
+    return {"parametric_prototype_enabled": parametric_prototype_enabled()}
 
 
 @app.get("/metrics")
@@ -1985,6 +2009,95 @@ async def import_mesh_step(room_id: str, request: Request) -> ImportMeshResult:
             ops.append(scratch.add_edge(a, b))
     await room.commit_ops_batched(ops, actor=DEFAULT_ACTOR_ID)
     return ImportMeshResult(vertex_count=len(mesh.vertices), face_count=len(mesh.faces))
+
+
+class MeshBooleanRequest(BaseModel):
+    op: str
+    a_face_ids: list[str]
+    b_face_ids: list[str]
+
+
+@app.post(
+    "/api/mesh/{room_id}/boolean",
+    response_model=ImportMeshResult,
+    dependencies=[Depends(require_editor_access("mesh"))],
+)
+async def mesh_boolean_op(room_id: str, req: MeshBooleanRequest) -> ImportMeshResult:
+    """Part 7 C6: real mesh boolean (union/subtract/intersect) via
+    `compute_mesh_boolean` (trimesh/manifold3d) -- see
+    `docs/brep_design.md` for why this operates on the mesh's current
+    flat vertex/face-loop representation rather than a topological
+    B-Rep. `a_face_ids`/`b_face_ids` name the two operand face sets
+    (the client resolves "which faces belong to this object" itself,
+    e.g. via a shared `scene_object` face_prop -- this endpoint doesn't
+    need to know how the client picked them). Both operand face sets
+    (and every vertex only *they* reference -- a vertex a still-live
+    face outside the operation also uses is never deleted) are removed
+    and replaced by the boolean result, minted with fresh ids and
+    tagged with one new shared `scene_object` id, the same "give the
+    result of a compound edit a fresh identity" choice `import_mesh_step`
+    already makes. Runs off the event loop (real geometry computation)
+    via asyncio.to_thread, same as STEP export/import."""
+    if req.op not in ("union", "subtract", "intersect"):
+        raise HTTPException(status_code=400, detail=f"unknown boolean op {req.op!r}")
+    if not req.a_face_ids or not req.b_face_ids:
+        raise HTTPException(status_code=400, detail="both operands need at least one face selected")
+
+    room = await mesh_room_manager.get_or_create(room_id)
+    all_positions = room.doc.vertex_positions()
+    all_faces = room.doc.face_loops()
+    a_faces = {fid: all_faces[fid] for fid in req.a_face_ids if fid in all_faces}
+    b_faces = {fid: all_faces[fid] for fid in req.b_face_ids if fid in all_faces}
+    a_vertex_ids = {v for loop in a_faces.values() for v in loop}
+    b_vertex_ids = {v for loop in b_faces.values() for v in loop}
+    a_positions = {v: all_positions[v] for v in a_vertex_ids if v in all_positions}
+    b_positions = {v: all_positions[v] for v in b_vertex_ids if v in all_positions}
+
+    try:
+        result = await asyncio.to_thread(compute_mesh_boolean, req.op, a_positions, a_faces, b_positions, b_faces)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # A remove op only wins its LWW comparison against the target's
+    # existing add op if its own (counter, actor) sorts higher -- and
+    # counter is compared first (see clock.py's OpId docstring). Unlike
+    # generate_edit_ops_from_interpretation (which only ever edits
+    # DEFAULT_ACTOR_ID's *own* prior AI-generated geometry, so seeding
+    # the scratch clock from DEFAULT_ACTOR_ID's own frontier alone is
+    # safe), a boolean's operands can be *any* actor's geometry --
+    # someone's hand-placed Box, another actor's earlier boolean result,
+    # etc. -- so the scratch clock must start past the highest counter
+    # *any* actor has reached, not just this one's own.
+    start_counter = max(room.doc.frontier().counters.values(), default=0)
+    clock = LamportClock(actor=DEFAULT_ACTOR_ID, counter=start_counter)
+    scratch = MeshCRDT(clock)
+    ops: list[MeshOp] = []
+    consumed_face_ids = set(req.a_face_ids) | set(req.b_face_ids)
+    for face_id in consumed_face_ids:
+        if face_id in all_faces:
+            ops.append(scratch.remove_face(face_id))
+    still_referenced: set[str] = set()
+    for face_id, loop in all_faces.items():
+        if face_id not in consumed_face_ids:
+            still_referenced.update(loop)
+    for vertex_id in (a_vertex_ids | b_vertex_ids) - still_referenced:
+        ops.append(scratch.remove_vertex(vertex_id))
+
+    vertex_ids = {old: mesh_new_id("v") for old in result.vertices}
+    for old, pos in result.vertices.items():
+        ops.append(scratch.add_vertex(vertex_ids[old], pos))
+    fresh_scene_object = mesh_new_id("obj")
+    for loop in result.faces.values():
+        remapped = [vertex_ids[v] for v in loop]
+        face_id = mesh_new_id("f")
+        ops.extend(scratch.add_face(face_id, remapped))
+        ops.append(scratch.set_face_prop(face_id, "scene_object", fresh_scene_object))
+        for i in range(len(remapped)):
+            a, b = remapped[i], remapped[(i + 1) % len(remapped)]
+            ops.append(scratch.add_edge(a, b))
+
+    await room.commit_ops_batched(ops, actor=DEFAULT_ACTOR_ID)
+    return ImportMeshResult(vertex_count=len(result.vertices), face_count=len(result.faces))
 
 
 # ---------------------------------------------------------------------------

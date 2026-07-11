@@ -71,7 +71,7 @@ def decode_edge(key: str) -> Edge:
 class MeshOp:
     """A routable envelope around one op from one of the mesh's sub-CRDTs."""
 
-    target: str  # "vertex" | "edge" | "face_index" | "face_geom" | "face_prop" | "comment" | "presence" | "generation"
+    target: str  # "vertex" | "edge" | "face_index" | "face_geom" | "face_prop" | "comment" | "presence" | "generation" | "parametric_object"
     payload: dict
     face_id: Optional[FaceId] = None
 
@@ -109,6 +109,19 @@ class MeshCRDT:
         # primary selectable/addressable object the way a path is for
         # DrawingDocument.
         self.comments: LWWMap[CommentId, dict] = LWWMap(clock)
+        # Part 7 C6, flag-gated prototype (CRDT_CAD_PARAMETRIC_PROTOTYPE):
+        # a parametric object's *current* defining parameters, keyed by a
+        # stable id independent of any specific face/vertex's lifecycle
+        # (its mesh gets deleted and rebuilt from scratch on every
+        # regenerate, but this record persists across that). Whole-record
+        # LWW (like `generations`, not a per-field split like `face_props`)
+        # -- a "regenerate" edit always replaces every parameter together
+        # as one coherent shape, never patches one dimension in isolation.
+        # Payload: {"kind": "box", "width", "height", "depth", "center":
+        # [x,y,z], "scene_object"} -- `scene_object` names which
+        # `face_prop` tag the object's current mesh carries, the same
+        # grouping tag booleans (this same phase) select objects by.
+        self.parametric_objects: LWWMap[str, dict] = LWWMap(clock)
         self._undo: list[dict] = []
         self._redo: list[dict] = []
 
@@ -219,6 +232,17 @@ class MeshCRDT:
 
     def generations_dict(self) -> dict[str, dict]:
         return dict(self.generations.items())
+
+    # -- local mutation: parametric objects (Part 7 C6 prototype) ------------
+    def set_parametric_object(self, parametric_id: str, record: dict) -> MeshOp:
+        op = self.parametric_objects.set(parametric_id, record)
+        return MeshOp("parametric_object", op.to_dict())
+
+    def remove_parametric_object(self, parametric_id: str) -> MeshOp:
+        return MeshOp("parametric_object", self.parametric_objects.delete(parametric_id).to_dict())
+
+    def parametric_object_list(self) -> list[dict]:
+        return [{"id": pid, **payload} for pid, payload in self.parametric_objects.items()]
 
     # -- local mutation: comments (Part 6 P5) ---------------------------------
     def add_comment(self, face_id: FaceId, text: str, author: str) -> tuple[CommentId, MeshOp]:
@@ -403,6 +427,8 @@ class MeshCRDT:
             return self.generations.apply(LWWOp.from_dict(op.payload))
         if op.target == "comment":
             return self.comments.apply(LWWOp.from_dict(op.payload))
+        if op.target == "parametric_object":
+            return self.parametric_objects.apply(LWWOp.from_dict(op.payload))
         raise ValueError(f"unknown mesh op target: {op.target}")
 
     # -- state-based merge ------------------------------------------------------
@@ -420,6 +446,7 @@ class MeshCRDT:
         changed |= self.presence.merge(other.presence)
         changed |= self.generations.merge(other.generations)
         changed |= self.comments.merge(other.comments)
+        changed |= self.parametric_objects.merge(other.parametric_objects)
         return changed
 
     # -- reads ------------------------------------------------------------------
@@ -452,6 +479,7 @@ class MeshCRDT:
         vc = vc.merge(self.presence.frontier())
         vc = vc.merge(self.generations.frontier())
         vc = vc.merge(self.comments.frontier())
+        vc = vc.merge(self.parametric_objects.frontier())
         return vc
 
     def ops_since(self, vc: VectorClock) -> list[MeshOp]:
@@ -468,6 +496,7 @@ class MeshCRDT:
         out += [MeshOp("presence", op.to_dict()) for op in self.presence.ops_since(vc)]
         out += [MeshOp("generation", op.to_dict()) for op in self.generations.ops_since(vc)]
         out += [MeshOp("comment", op.to_dict()) for op in self.comments.ops_since(vc)]
+        out += [MeshOp("parametric_object", op.to_dict()) for op in self.parametric_objects.ops_since(vc)]
         return out
 
     # -- reads: presence ------------------------------------------------------
@@ -485,6 +514,7 @@ class MeshCRDT:
             "presence": self.presence.to_dict(),
             "generations": self.generations.to_dict(),
             "comments": self.comments.to_dict(),
+            "parametric_objects": self.parametric_objects.to_dict(),
         }
 
     @staticmethod
@@ -506,6 +536,8 @@ class MeshCRDT:
             mesh.generations = LWWMap.from_dict(clock, d["generations"])
         if "comments" in d:
             mesh.comments = LWWMap.from_dict(clock, d["comments"])
+        if "parametric_objects" in d:
+            mesh.parametric_objects = LWWMap.from_dict(clock, d["parametric_objects"])
         return mesh
 
     def to_bytes(self) -> bytes:

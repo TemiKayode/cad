@@ -34,9 +34,14 @@ import trimesh
 Position = tuple[float, float, float]
 
 
-def _triangulated_trimesh(
+def triangulated_trimesh(
     vertex_positions: dict[str, Position], face_loops: dict[str, list[str]]
 ) -> trimesh.Trimesh | None:
+    """`MeshCRDT.vertex_positions()`/`face_loops()` -> a real
+    `trimesh.Trimesh`, fan-triangulating each face loop. Shared with
+    `geometry.mesh_boolean` (Part 7 C6) -- boolean operations need the
+    exact same conversion this module's own glTF/3MF export already
+    does, not a second implementation of it."""
     ids = list(vertex_positions.keys())
     if not ids:
         return None
@@ -58,7 +63,7 @@ def mesh_to_glb_bytes(vertex_positions: dict[str, Position], face_loops: dict[st
     """Returns binary glTF (`.glb`) bytes, or `b""` if there's nothing
     exportable (no face has 3+ live vertices -- the same "skip it" rule
     every other mesh exporter in this project applies)."""
-    mesh = _triangulated_trimesh(vertex_positions, face_loops)
+    mesh = triangulated_trimesh(vertex_positions, face_loops)
     if mesh is None:
         return b""
     return trimesh.exchange.gltf.export_glb(mesh)
@@ -67,7 +72,7 @@ def mesh_to_glb_bytes(vertex_positions: dict[str, Position], face_loops: dict[st
 def mesh_to_3mf_bytes(vertex_positions: dict[str, Position], face_loops: dict[str, list[str]]) -> bytes:
     """Returns 3MF (a zip container) bytes, or `b""` if there's nothing
     exportable."""
-    mesh = _triangulated_trimesh(vertex_positions, face_loops)
+    mesh = triangulated_trimesh(vertex_positions, face_loops)
     if mesh is None:
         return b""
     data = mesh.export(file_type="3mf")
