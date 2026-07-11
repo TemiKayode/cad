@@ -2928,6 +2928,126 @@ async function offsetSelectedPath(distance, closed) {
   showUndoToast("Path offset", () => { removePath(id); renderAll(); });
 }
 
+/** Pure geometry: the tangent points and a polyline-approximated
+ * rounding arc for filleting the corner at `pCorner` (between segments
+ * to `pPrev` and `pNext`) with the given radius. A polyline
+ * approximation (segments, not a bezier) is deliberate -- it needs only
+ * point-on-circle sampling, not bezier tangent-length magic numbers,
+ * trading a small amount of true curve smoothness for being much
+ * easier to get (and verify) correct; C2 ("first-class arcs") is where
+ * a true arc/bezier representation belongs, not a C1 corner tool.
+ * Throws a plain, user-facing-message Error if the radius doesn't fit
+ * (larger than either adjacent segment) or the corner is degenerate
+ * (nearly straight, or folds back on itself). */
+function computeFillet(pPrev, pCorner, pNext, radius, segments = 16) {
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
+  const add2 = (a, b) => [a[0] + b[0], a[1] + b[1]];
+  const scale2 = (a, s) => [a[0] * s, a[1] * s];
+  const len2 = (a) => Math.hypot(a[0], a[1]);
+  const normalize2 = (a) => { const l = len2(a); return l < 1e-9 ? [0, 0] : [a[0] / l, a[1] / l]; };
+  const dot2 = (a, b) => a[0] * b[0] + a[1] * b[1];
+
+  const dir1 = normalize2(sub(pPrev, pCorner));
+  const dir2 = normalize2(sub(pNext, pCorner));
+  if (len2(dir1) < 1e-9 || len2(dir2) < 1e-9) throw new Error("degenerate segment at this corner");
+  const cosTheta = Math.max(-1, Math.min(1, dot2(dir1, dir2)));
+  const theta = Math.acos(cosTheta);
+  if (theta > Math.PI - 1e-4) throw new Error("this corner is nearly straight -- nothing to fillet");
+  if (theta < 1e-4) throw new Error("this corner folds back on itself -- can't fillet");
+
+  const tangentDist = radius / Math.tan(theta / 2);
+  if (tangentDist > len2(sub(pPrev, pCorner)) || tangentDist > len2(sub(pNext, pCorner))) {
+    throw new Error(`radius ${radius} is too large for these segments -- try a smaller radius`);
+  }
+
+  const t1 = add2(pCorner, scale2(dir1, tangentDist));
+  const t2 = add2(pCorner, scale2(dir2, tangentDist));
+  const bisector = normalize2(add2(dir1, dir2));
+  const center = add2(pCorner, scale2(bisector, radius / Math.sin(theta / 2)));
+
+  const a1 = Math.atan2(t1[1] - center[1], t1[0] - center[0]);
+  const a2 = Math.atan2(t2[1] - center[1], t2[0] - center[0]);
+  // Shortest angular path from a1 to a2, normalized to (-pi, pi] -- this
+  // always corresponds to the fillet's own sweep (pi - theta), which is
+  // provably always shorter than the "long way" (pi + theta).
+  let delta = a2 - a1;
+  while (delta > Math.PI) delta -= 2 * Math.PI;
+  while (delta < -Math.PI) delta += 2 * Math.PI;
+
+  const arcPoints = [];
+  for (let i = 1; i < segments; i++) {
+    const a = a1 + (delta * i) / segments;
+    arcPoints.push([center[0] + radius * Math.cos(a), center[1] + radius * Math.sin(a)]);
+  }
+  return { t1, t2, arcPoints };
+}
+
+/** Deletes every node in `nodeIds` and inserts `points` right after
+ * `afterId`, as one batch -- the shared primitive filletPathVertex uses
+ * both to apply a fillet (replace 1 corner point with N tangent/arc
+ * points) and, with the argument order swapped, to undo one (replace
+ * those N points with the original 1). Returns the new points' node
+ * ids, in order. */
+function replacePathPoints(pathId, nodeIds, afterId, points) {
+  const ops = nodeIds.map((id) => {
+    const op = { target: "path_geom", scope: pathId, payload: rgaDeleteOp(id, clock.tick()) };
+    applyOp(op);
+    return op;
+  });
+  const newIds = [];
+  let prevId = afterId;
+  for (const pt of points) {
+    const newId = clock.tick();
+    const op = { target: "path_geom", scope: pathId, payload: rgaInsertOp(newId, prevId, pt) };
+    applyOp(op);
+    ops.push(op);
+    newIds.push(newId);
+    prevId = newId;
+  }
+  sendOps(ops);
+  return newIds;
+}
+
+/** Applies a fillet at vertex index `vertexIndex` of `pathId` (an
+ * interior vertex only -- the first/last point of an open path has no
+ * "corner" to round). CRDT-wise this is delete-the-corner-point +
+ * insert-the-replacement-points -- see replacePathPoints above, which
+ * this also uses (with the args swapped) to build the toast's one-
+ * click undo, since a "delete 1 point, insert N" edit isn't one of the
+ * whole-path-add/remove/single-prop-change kinds undo()/redo() know
+ * how to reverse (Ctrl+Z is a no-op for a fillet, a known, accepted gap
+ * matching the mirror/array/offset tools above). A curve segment
+ * (Phase 8) attached to the old corner point id is orphaned the same
+ * accepted way movePathPoint's own doc comment already describes.
+ * Shows a toast and returns false if the radius doesn't fit. */
+function filletPathVertex(pathId, vertexIndex, radius) {
+  const entries = liveEntries(state.pathNodes.get(pathId));
+  if (vertexIndex <= 0 || vertexIndex >= entries.length - 1) {
+    showToast("Only an interior vertex can be filleted", "error");
+    return false;
+  }
+  const pPrev = entries[vertexIndex - 1].v;
+  const pCorner = entries[vertexIndex].v;
+  const pNext = entries[vertexIndex + 1].v;
+  let fillet;
+  try {
+    fillet = computeFillet(pPrev, pCorner, pNext, radius);
+  } catch (err) {
+    showToast(err.message, "error");
+    return false;
+  }
+
+  const oldNodeId = entries[vertexIndex].id;
+  const afterId = entries[vertexIndex - 1].id;
+  const newIds = replacePathPoints(pathId, [oldNodeId], afterId, [fillet.t1, ...fillet.arcPoints, fillet.t2]);
+  renderAll();
+  showUndoToast("Fillet applied", () => {
+    replacePathPoints(pathId, newIds, afterId, [pCorner]);
+    renderAll();
+  });
+  return true;
+}
+
 function deleteSelection() {
   const ids = [...ui.selectedPaths];
   if (!ids.length) return;
@@ -4026,6 +4146,21 @@ function renderSelectionPanel() {
       <button id="selOffsetApply">Apply</button>
     </div>`
     : "";
+  // Fillet only applies to a freehand/polygon path's own interior
+  // vertices (a shape primitive's corners aren't stored as points at
+  // all -- rounding those is a different, not-yet-built tool).
+  const interiorVertexCount = props.shape ? 0 : Math.max(0, liveEntries(state.pathNodes.get(pathId)).length - 2);
+  const filletHtml = interiorVertexCount > 0
+    ? `
+    <div class="field-row" style="margin-top:6px"><label>Fillet corner</label></div>
+    <div class="tool-row">
+      <select id="selFilletVertex" style="width:70px">
+        ${Array.from({ length: interiorVertexCount }, (_, i) => `<option value="${i + 1}">Corner ${i + 1}</option>`).join("")}
+      </select>
+      <input id="selFilletRadius" type="number" min="0.01" step="1" value="5" style="width:56px" title="Radius" />
+      <button id="selFilletApply">Apply</button>
+    </div>`
+    : "";
   panel.innerHTML = `
     <div class="field-row"><label>Color</label><input id="selColor" type="text" value="${escapeHtml(props.color || "#ffffff")}" style="width:90px"/></div>
     ${typeSpecificFields}
@@ -4035,6 +4170,7 @@ function renderSelectionPanel() {
     ${ungroupButton}
     ${modifyPanelHtml("sel")}
     ${offsetHtml}
+    ${filletHtml}
     <button class="danger" id="selDelete" style="width:100%;margin-top:6px">Delete path</button>
   `;
   wireModifyPanel("sel");
@@ -4043,6 +4179,14 @@ function renderSelectionPanel() {
       const distance = parseFloat(document.getElementById("selOffsetDist").value) || 0;
       const closed = document.getElementById("selOffsetClosed").checked;
       offsetSelectedPath(distance, closed);
+    };
+  }
+  if (interiorVertexCount > 0) {
+    document.getElementById("selFilletApply").onclick = () => {
+      const vertexIndex = parseInt(document.getElementById("selFilletVertex").value, 10);
+      const radius = parseFloat(document.getElementById("selFilletRadius").value) || 0;
+      if (radius <= 0) { showToast("Radius must be positive", "error"); return; }
+      filletPathVertex(pathId, vertexIndex, radius);
     };
   }
   document.getElementById("selColor").onchange = (e) => setPathProp(pathId, "color", e.target.value);
