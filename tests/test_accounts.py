@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from crdt_cad.persistence.accounts import InMemoryAccountStore, SQLiteAccountStore
 from crdt_cad.server import app as app_module
 from crdt_cad.server import auth
+from crdt_cad.server import security
 
 client = TestClient(app_module.app)
 
@@ -197,6 +198,41 @@ def test_unconfigured_oauth_provider_404s(monkeypatch):
     assert client.get("/api/auth/oauth/google/start", follow_redirects=False).status_code == 404
 
 
+def test_generate_rate_limit_is_keyed_by_account_not_shared_ip(monkeypatch):
+    """Part 7 audit response: the per-IP `/generate` limiter predates
+    accounts mode and would under-limit (or, seen from the other side,
+    over-limit) any group of signed-in users sharing one IP -- a NAT'd
+    office or school. Two different signed-in users hitting this from
+    the *same* TestClient (same "IP") must each get their own budget."""
+    _enable_accounts(monkeypatch)
+    monkeypatch.setattr(security, "generate_rate_limiter", security.PerKeyRateLimiter(rate=0.0, capacity=1.0))
+    store = auth.get_account_store()
+
+    def _sign_in_new_client(email: str) -> TestClient:
+        c = TestClient(app_module.app)
+        resp = c.post("/api/auth/request-link", json={"email": email})
+        c.get(resp.json()["dev_link"], follow_redirects=False)
+        return c
+
+    alice = _sign_in_new_client("alice-gen@example.com")
+    bob = _sign_in_new_client("bob-gen@example.com")
+    alice_id = alice.get("/api/auth/me").json()["user"]["user_id"]
+    bob_id = bob.get("/api/auth/me").json()["user"]["user_id"]
+    # claim-on-first-touch normally happens over the WS "hello" a real
+    # client sends on room open -- claimed directly here since these
+    # REST-only calls never open one, same shortcut test_room_permissions.py
+    # uses for its own store-level setup.
+    store.claim_room("mesh", "acctgenroom1", alice_id, visibility="public")
+    store.claim_room("mesh", "acctgenroom2", alice_id, visibility="public")
+    store.claim_room("mesh", "acctgenroom3", bob_id, visibility="public")
+
+    assert alice.post("/api/mesh/acctgenroom1/generate", json={"prompt": "a 1 bedroom house"}).status_code == 200
+    assert alice.post("/api/mesh/acctgenroom2/generate", json={"prompt": "a 1 bedroom house"}).status_code == 429
+    # Bob, same TestClient "IP" as Alice, still has his own full budget --
+    # proves the key is Bob's account id, not the shared IP.
+    assert bob.post("/api/mesh/acctgenroom3/generate", json={"prompt": "a 1 bedroom house"}).status_code == 200
+
+
 # -- the store itself (both concrete backends behave identically) ---------------
 
 
@@ -222,3 +258,28 @@ def test_store_user_and_session_lifecycle(backend, tmp_path):
     store.touch_session("hash-live")
     assert store.delete_user_sessions(user["user_id"]) == 1  # dead one already reaped
     assert store.get_session("hash-live") is None
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_delete_expired_sessions_bulk_reaps_without_a_read(backend, tmp_path):
+    """Part 7 audit response: `get_session`'s lazy reaping only clears a
+    session that's actually looked up again -- an abandoned session
+    nobody ever reads would otherwise sit in the table forever. This is
+    the periodic-sweep path (`_session_sweep_loop` in app.py), so it
+    must remove an expired session that was *never read*, not rely on
+    the lazy path having already cleaned it up."""
+    store = InMemoryAccountStore() if backend == "memory" else SQLiteAccountStore(tmp_path / "accounts.db")
+    user = store.create_or_get_user("sweep@example.com")
+
+    import time as _time
+
+    now = _time.time()
+    store.create_session("hash-expired-1", user["user_id"], expires_at=now - 10)
+    store.create_session("hash-expired-2", user["user_id"], expires_at=now - 1)
+    store.create_session("hash-live", user["user_id"], expires_at=now + 3600)
+
+    removed = store.delete_expired_sessions(now=now)
+    assert removed == 2
+    assert store.get_session("hash-live")["user_id"] == user["user_id"]
+    # a second sweep finds nothing left to remove -- idempotent
+    assert store.delete_expired_sessions(now=now) == 0

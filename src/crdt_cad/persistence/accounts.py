@@ -104,6 +104,17 @@ class AccountStore:
         """Sign out everywhere. Returns how many sessions were removed."""
         raise NotImplementedError
 
+    def delete_expired_sessions(self, now: Optional[float] = None) -> int:
+        """Bulk-reaps every session past its `expires_at`, independent of
+        `get_session`'s lazy per-read reaping -- a session nobody has
+        touched since it expired (an abandoned browser tab, a bookmark
+        to a link that was never followed again) would otherwise sit in
+        the table forever on a busy deployment, since `get_session`
+        only reaps the *one row it happened to look up*. Called by a
+        periodic sweep in `app.py`, not on the request path. Returns how
+        many rows were removed."""
+        raise NotImplementedError
+
     # -- room ownership & per-user grants (Part 6, P2) ---------------------
 
     def claim_room(self, kind: str, room_id: str, owner_user_id: str, visibility: str = "private") -> bool:
@@ -475,6 +486,13 @@ class InMemoryAccountStore(AccountStore):
 
     def delete_user_sessions(self, user_id: str) -> int:
         doomed = [h for h, s in self._sessions.items() if s["user_id"] == user_id]
+        for h in doomed:
+            del self._sessions[h]
+        return len(doomed)
+
+    def delete_expired_sessions(self, now: Optional[float] = None) -> int:
+        cutoff = now if now is not None else time.time()
+        doomed = [h for h, s in self._sessions.items() if s["expires_at"] < cutoff]
         for h in doomed:
             del self._sessions[h]
         return len(doomed)
@@ -1097,6 +1115,12 @@ class SQLiteAccountStore(AccountStore):
     def delete_user_sessions(self, user_id: str) -> int:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            return cur.rowcount
+
+    def delete_expired_sessions(self, now: Optional[float] = None) -> int:
+        cutoff = now if now is not None else time.time()
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM sessions WHERE expires_at < ?", (cutoff,))
             return cur.rowcount
 
     # -- room ownership & per-user grants -----------------------------------
@@ -1897,6 +1921,16 @@ class PostgresAccountStore(AccountStore):
         async def _go():
             async with self._pool.acquire() as conn:
                 result = await conn.execute("DELETE FROM sessions WHERE user_id = $1", user_id)
+                return int(result.rsplit(" ", 1)[1])
+
+        return self._call(_go())
+
+    def delete_expired_sessions(self, now: Optional[float] = None) -> int:
+        cutoff = now if now is not None else time.time()
+
+        async def _go():
+            async with self._pool.acquire() as conn:
+                result = await conn.execute("DELETE FROM sessions WHERE expires_at < $1", cutoff)
                 return int(result.rsplit(" ", 1)[1])
 
         return self._call(_go())

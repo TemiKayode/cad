@@ -117,12 +117,19 @@ from crdt_cad.server import billing
 from crdt_cad.server import metrics
 from crdt_cad.server import pubsub
 from crdt_cad.server import security
+from crdt_cad.server.logging_config import configure_logging
 
 logger = logging.getLogger("crdt_cad.server")
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 
 SNAPSHOT_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_SNAPSHOT_INTERVAL_SECONDS", "30"))
 VERSION_CHECKPOINT_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_VERSION_CHECKPOINT_INTERVAL_SECONDS", "300"))
+# Accounts mode only (see _session_sweep_loop): `get_session` already
+# reaps a session lazily the moment something happens to read it, but an
+# abandoned session nobody ever looks up again would sit in the table
+# forever on a busy deployment without this -- same "bound an otherwise-
+# unbounded table" reasoning as CRDT_CAD_MAX_VERSIONS_PER_ROOM above.
+SESSION_SWEEP_INTERVAL_SECONDS = float(os.environ.get("CRDT_CAD_SESSION_SWEEP_INTERVAL_SECONDS", "3600"))
 GENERATION_TIMEOUT_SECONDS = float(os.environ.get("CRDT_CAD_GENERATION_TIMEOUT_SECONDS", "60"))
 GENERATION_OPS_BATCH_SIZE = int(os.environ.get("CRDT_CAD_GENERATION_BATCH_SIZE", "150"))
 # Floor on how often live-edit traffic may trigger a durable persist per
@@ -598,9 +605,29 @@ async def _graceful_shutdown() -> None:
                     pass  # already disconnecting/disconnected -- nothing to clean up
 
 
+async def _session_sweep_loop() -> None:
+    """Bulk-reaps expired sessions on a timer (SESSION_SWEEP_INTERVAL_SECONDS)
+    -- see that constant's own comment for why `get_session`'s lazy
+    per-read reaping isn't enough on its own. Only ever runs the actual
+    query while accounts mode is on; `_lifespan` doesn't even start this
+    loop otherwise, so a tokens-only deployment is byte-for-byte
+    unaffected, same as every other accounts-gated feature in this file."""
+    while True:
+        await asyncio.sleep(SESSION_SWEEP_INTERVAL_SECONDS)
+        try:
+            removed = await asyncio.to_thread(auth.get_account_store().delete_expired_sessions)
+            if removed:
+                logger.info("session sweep: removed %d expired session(s)", removed)
+        except Exception:
+            logger.exception("session sweep failed")
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    sweep_task = asyncio.create_task(_session_sweep_loop()) if auth.accounts_enabled() else None
     yield
+    if sweep_task is not None:
+        sweep_task.cancel()
     await _graceful_shutdown()
 
 
@@ -2172,13 +2199,16 @@ class GenerateBudgetResult(BaseModel):
 )
 async def generate_budget(room_id: str, request: Request) -> GenerateBudgetResult:
     """Phase G5 cost guardrail: lets the UI show remaining generation
-    budget *before* a surprise 429, not after. Per-IP, not per-room
-    (`room_id` is only in the URL for consistency with every other mesh
-    endpoint) -- a pure peek (`PerKeyRateLimiter.remaining`), never
-    spends a token itself, safe to poll as often as the UI wants."""
-    client_ip = security.client_ip(request)
+    budget *before* a surprise 429, not after. Per-account when signed
+    in, per-IP otherwise -- same key `generate_mesh` actually enforces
+    against, not per-room (`room_id` is only in the URL for consistency
+    with every other mesh endpoint) -- a pure peek
+    (`PerKeyRateLimiter.remaining`), never spends a token itself, safe
+    to poll as often as the UI wants."""
+    current_user = auth.current_user(request)
+    rate_limit_key = current_user["user_id"] if current_user else security.client_ip(request)
     return GenerateBudgetResult(
-        remaining=security.generate_rate_limiter.remaining(client_ip),
+        remaining=security.generate_rate_limiter.remaining(rate_limit_key),
         capacity=security.generate_rate_limiter.capacity(),
         per_minute=security.generate_per_minute(),
     )
@@ -2315,20 +2345,27 @@ async def generate_mesh(room_id: str, req: GenerateMeshRequest, request: Request
     wrapped in both a timeout (a hung LLM call can't tie up a thread-pool
     slot forever) and a real cancellation path (Phase G5: an aborted
     client request actually stops the request, see `_run_cancellable`).
-    Rate-limited per client IP (``CRDT_CAD_GENERATE_PER_MINUTE``, default
+    Rate-limited per client (``CRDT_CAD_GENERATE_PER_MINUTE``, default
     6/min, remaining budget peekable via ``GET .../generate/budget``)
     since each call burns real LLM spend and/or CPU time -- unlike the
     other endpoints in this module, this limit applies unconditionally,
     even when room auth is off, because the resource cost is real
     regardless of whether the deployment cares about access control.
+    Keyed by account id when signed in, client IP otherwise -- an IP-only
+    key predates accounts mode and under-limits any NAT'd group (a
+    school, an office) sharing one address, since they'd all share one
+    bucket; a signed-in user gets their own bucket regardless of who
+    else is behind the same IP. `GET .../generate/budget` mirrors this
+    same choice so what it reports matches what's actually enforced.
     """
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt must not be empty")
 
-    client_ip = security.client_ip(request)
-    if not security.generate_rate_limiter.allow(client_ip):
+    current_user = auth.current_user(request)
+    rate_limit_key = current_user["user_id"] if current_user else security.client_ip(request)
+    if not security.generate_rate_limiter.allow(rate_limit_key):
         raise HTTPException(status_code=429, detail="generation rate limit exceeded -- try again shortly")
-    _enforce_daily_quota(auth.current_user(request), "generation", QUOTA_GENERATIONS_PER_DAY, "AI generation")
+    _enforce_daily_quota(current_user, "generation", QUOTA_GENERATIONS_PER_DAY, "AI generation")
 
     room = await mesh_room_manager.get_or_create(room_id)
     request_start = time.monotonic()

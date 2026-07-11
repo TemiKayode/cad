@@ -1,5 +1,7 @@
 import sys
 
+import pytest
+
 from crdt_cad.ai.house_spec import HouseSpec
 from crdt_cad.ai.mesh_repair import _fan_triangulate_fallback, repair_for_printing
 from crdt_cad.ai.procedural_house import build_house_mesh
@@ -36,6 +38,7 @@ def test_poisson_reconstruction_produces_a_denser_watertight_resurfacing():
     """Confirms poisson_reconstruct is a real, working opt-in path, and
     documents *why* it defaults to off: it resamples the whole surface,
     producing many more triangles than the crisp input had."""
+    pytest.importorskip("pymeshlab")
     mesh = build_house_mesh(HouseSpec(bedrooms=4, floors=1))
     plain_vertices, plain_triangles = repair_for_printing(mesh.vertices, mesh.faces)
     poisson_vertices, poisson_triangles = repair_for_printing(
@@ -70,7 +73,7 @@ def test_repair_gracefully_falls_back_on_pymeshlab_internal_error(monkeypatch):
     """If pymeshlab is installed but the repair pipeline itself raises
     (a real filter error, bad params, etc.), repair_for_printing must
     still return a usable result rather than propagating the exception."""
-    import pymeshlab
+    pymeshlab = pytest.importorskip("pymeshlab")
 
     class ExplodingMeshSet(pymeshlab.MeshSet):
         def add_mesh(self, *args, **kwargs):

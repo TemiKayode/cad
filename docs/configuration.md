@@ -33,6 +33,7 @@ you add a new one, add a row here too.
 | `CRDT_CAD_AUTH_MODE` | `tokens` | `accounts` enables user accounts (magic-link + OAuth sign-in, server-side sessions). The default keeps every account feature inert -- no schema created, sign-in routes 404, zero behavior change. Accounts mode **requires `CRDT_CAD_SECRET`** (magic links are signed with it). |
 | `CRDT_CAD_MAGIC_LINK_MAX_AGE_SECONDS` | `900` (15 min) | How long a sign-in link stays valid. |
 | `CRDT_CAD_SESSION_MAX_AGE_SECONDS` | `2592000` (30 days) | How long a session cookie stays valid. Sessions are server-side; sign-out deletes the row, not just the cookie. |
+| `CRDT_CAD_SESSION_SWEEP_INTERVAL_SECONDS` | `3600` (1h) | How often a background task bulk-deletes expired session rows, on top of `get_session`'s existing lazy per-read reaping (which only clears a session that's actually looked up again -- an abandoned session otherwise sits in the table forever on a busy deployment). The task itself only starts when `CRDT_CAD_AUTH_MODE=accounts`. |
 | `CRDT_CAD_AUTH_DEV_ECHO` | unset (off) | Dev only: when no SMTP is configured, also return the magic link in the API response. **Never enable on a public deployment** -- it lets any visitor obtain a sign-in link for any address. Without it, a no-SMTP deployment only logs links server-side. |
 | `CRDT_CAD_SMTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_FROM` / `_STARTTLS` | unset / `587` / – / – / user@host / `1` | SMTP delivery for magic-link e-mails. Unset host = console-echo mode (see above). |
 | `CRDT_CAD_OAUTH_GOOGLE_CLIENT_ID` / `_CLIENT_SECRET` | unset | Enables "Continue with Google" (needs the `accounts` extra: `pip install crdt-cad[accounts]`). Redirect URI: `<base>/api/auth/oauth/google/callback`. |
@@ -135,6 +136,7 @@ deployment. Reports are reviewed and resolved from the `/admin` panel
 |---|---|---|
 | `CRDT_CAD_STATIC_DIR` | `<repo>/demo/static` | Where the demo HTML/JS/CSS assets are served from. Set explicitly by the Dockerfile, since a non-editable `pip install .` copies the package into site-packages, where the repo-relative default resolves nowhere useful. |
 | `CRDT_CAD_DOMAIN` | `localhost` | Read by `Caddyfile` (not the Python app) -- the domain Caddy requests a certificate for. `localhost` falls back to a local self-signed cert. |
+| `CRDT_CAD_LOG_FORMAT` | `text` | `json` switches server logs to one-JSON-object-per-line, for a hosted deployment shipping logs somewhere that parses JSON (CloudWatch, Loki, Datadog, ...). Plain text otherwise -- no behavior change for local development. |
 
 ## Test-only (not read by the deployed app)
 

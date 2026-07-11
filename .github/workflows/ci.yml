@@ -7,17 +7,49 @@ on:
 
 jobs:
   test:
-    name: pytest + ruff
+    name: pytest + ruff + mypy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          version: "latest"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-      - run: pip install -e ".[dev]"
-      - run: pytest tests/ -v
-      - run: ruff check .
+      # --locked fails the build outright if uv.lock is out of sync with
+      # pyproject.toml, instead of silently resolving a different set of
+      # versions than whatever was last tested and committed -- this is
+      # the actual reproducibility guarantee a lockfile exists to provide.
+      - run: uv sync --locked --extra dev
+      - run: uv run pytest tests/ -v
+      - run: uv run ruff check .
+      # Gradual-adoption mode (see pyproject.toml's [tool.mypy]): reports
+      # real findings without blocking merges yet, since this is the
+      # first pass over a codebase that's never been type-checked before.
+      # Flip off continue-on-error once the backlog it surfaces is clear.
+      - run: uv run mypy src
+        continue-on-error: true
+
+  perf-regression:
+    name: perf regression check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --extra dev
+      # Canary, not a tight gate: CI runners have very different hardware
+      # from whatever machine recorded docs/perf_baseline.json, so the
+      # default 3x tolerance only catches an actual multi-x regression
+      # (e.g. someone reintroducing the "walk every path every frame"
+      # bug this baseline exists to guard against), not routine noise --
+      # see bench_large_doc.py's own --check-baseline docstring.
+      - run: uv run python scripts/bench_large_doc.py --check-baseline docs/perf_baseline.json
 
   e2e:
     name: e2e (Playwright)
@@ -25,21 +57,30 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v8
+        with:
+          version: "latest"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-      - run: pip install -e ".[dev]"
-      - run: playwright install --with-deps chromium
-      - run: pytest tests/e2e -m e2e -v
+      - run: uv sync --locked --extra dev
+      - run: uv run playwright install --with-deps chromium
+      - run: uv run pytest tests/e2e -m e2e -v
 
   docker:
-    name: docker build
+    name: docker build + scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - run: docker build -t crdt-cad:ci .
+      - name: Scan image for known vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: crdt-cad:ci
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0" # report-only for now -- see AUDIT.md item 6
 
   k8s-smoke:
     name: k8s smoke test (kind, Mode A)

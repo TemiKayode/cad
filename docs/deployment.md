@@ -13,6 +13,12 @@ end-to-end (Phase 19.1): real HTTPS, `wss://` through the proxy, the
 room-token auth flow, and the rate limiter correctly reading the real
 client IP instead of Caddy's own (see "Client IP behind a proxy" below).
 
+The image itself (`Dockerfile`) is a hardened multi-stage build: the
+compiler toolchain needed to build a couple of wheels never reaches
+the final image, and the app process runs as an unprivileged `app`
+user, not root -- a repo audit's finding (2026-07-11, `AUDIT.md`),
+verified with a real `docker build` + `docker run` afterward.
+
 1. **Provision a VM** with a public IP and ports 80/443 reachable
    (any $5/mo box works -- this app is CPU-light at rest). Point a DNS
    `A` record at it now if you have a domain; Caddy needs to be able to

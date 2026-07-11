@@ -40,6 +40,8 @@ python -m venv .venv
 
 Everything above works with zero configuration. A few heavier, genuinely optional capabilities are separate extras so the default install stays lean: `pip install crdt-cad[postgres]` (shared room state across processes), `[redis]` (cross-process broadcast fan-out), `[step]` (STEP export), `[meshy]` (the hosted mesh-generation adapter), `[accounts]` (OAuth sign-in). None of them change default behavior when omitted.
 
+For a byte-for-byte reproducible install (what CI actually runs against), use [`uv`](https://docs.astral.sh/uv/) with the committed lockfile instead: `uv sync --locked --extra dev`. Every REST endpoint has interactive docs at `/docs` (Swagger UI, generated directly from the FastAPI route definitions — nothing to keep in sync by hand) once the server is running.
+
 ### Docker
 
 ```bash
@@ -249,6 +251,8 @@ scripts/
   load_test.py         N rooms x M WS clients load/soak driver
   backup_sqlite.py     online-backup-API SQLite backups
   k8s_smoke_test.py    post-deploy WebSocket round-trip check
+  bench_large_doc.py       backend CRDT/serialize/persist benchmarks (+ CI perf-regression gate)
+  bench_frontend_render.py 2D render() timing + 3D FPS against a real browser
 demo/static/
   common.js            relay client, P2PManager, actor identity, shared UI helpers
   home.html/home.js         workspace home page (rooms, sharing, organizations + SSO)
@@ -260,6 +264,8 @@ docs/
   deployment.md        VPS/Caddy runbook, Fly.io, backups, monitoring, load-test findings
   configuration.md     every CRDT_CAD_* env var
   design-system.md     design-token rationale
+  perf_benchmarks.md   large-document benchmarks, budgets, and LOD (Part 7 C8)
+  perf_baseline.json   committed baseline the CI perf-regression job compares against
 Dockerfile, docker-compose.yml            local dev stack
 docker-compose.prod.yml, Caddyfile        production TLS stack
 docker-compose.monitoring.yml, monitoring/  optional Prometheus + Grafana
@@ -267,6 +273,14 @@ fly.toml               Fly.io config
 k8s/                   kind-validated manifests + README.md
 .github/workflows/     ci.yml (pytest/ruff/e2e/Docker/kind smoke), release.yml (GHCR on tags)
 ```
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup and what a PR
+needs; [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) for community
+standards; [`SECURITY.md`](SECURITY.md) to report a vulnerability
+privately rather than through a public issue;
+[`CHANGELOG.md`](CHANGELOG.md) for what shipped when.
 
 ## License
 

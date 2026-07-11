@@ -83,6 +83,17 @@ redis = [
 step = [
     "build123d>=0.11",
 ]
+print = [
+    # 3D-print mesh repair (crdt_cad.ai.mesh_repair) -- lazily imported,
+    # already gracefully falls back to a plain fan-triangulation when
+    # this isn't installed, so this extra is purely to opt into the real
+    # non-manifold-repair/Poisson-reconstruction path instead of that
+    # fallback. Found undeclared during a repo audit (2026-07-11): the
+    # module always assumed it might be absent, but two tests assumed it
+    # *was* present with no `importorskip` guard, which would have
+    # errored on a fresh CI checkout the moment CI's billing lock clears.
+    "pymeshlab>=2023.12",
+]
 meshy = [
     "requests>=2.31",
     # Phase G7: the mesh-budget pipeline decimates an imported diffusion
@@ -118,6 +129,8 @@ dev = [
     "requests>=2.31",
     "fast_simplification>=0.1.7",
     "stripe>=10.0",
+    "mypy>=1.10",
+    "pymeshlab>=2023.12",
 ]
 
 [tool.pytest.ini_options]
@@ -148,3 +161,18 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.mypy]
+# Gradual/permissive mode (audit-recommended, "start permissive, ratchet
+# per-module"): catches real type errors (wrong arg counts, undefined
+# names, etc.) without requiring every third-party import to ship
+# stubs or every function to already be fully annotated -- ratchet
+# per-module by removing an entry below once it's been cleaned up,
+# rather than trying to fix the whole codebase in one pass.
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = false
+disable_error_code = ["import-untyped"]

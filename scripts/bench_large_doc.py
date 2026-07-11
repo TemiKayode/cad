@@ -23,7 +23,9 @@ trusting whatever's written in the docs.
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -128,37 +130,92 @@ def _print_table(title: str, rows: list[dict]) -> None:
         )
 
 
+def _run_all(tmpdir: Path) -> dict:
+    drawing_rows = [
+        _bench(
+            _build_drawing,
+            lambda d: d.to_bytes(),
+            lambda data: DrawingDocument.from_bytes(LamportClock(actor="bench2"), data),
+            lambda d: d.to_dict(),
+            n,
+            "drawing",
+            tmpdir,
+        )
+        for n in PATH_COUNTS
+    ]
+    mesh_rows = [
+        _bench(
+            _build_mesh,
+            lambda d: d.to_bytes(),
+            lambda data: MeshCRDT.from_bytes(LamportClock(actor="bench2"), data),
+            lambda d: d.to_dict(),
+            n,
+            "mesh",
+            tmpdir,
+        )
+        for n in FACE_COUNTS
+    ]
+    return {"drawing": drawing_rows, "mesh": mesh_rows}
+
+
+_TIMING_KEYS = ("build_ms", "serialize_ms", "deserialize_ms", "json_export_ms", "persist_ms", "load_ms")
+
+
+def _check_baseline(results: dict, baseline_path: Path, tolerance: float) -> bool:
+    """Canary, not a tight gate: CI runners have wildly different
+    hardware from whatever machine recorded the baseline, so this only
+    catches an actual regression (something got several times slower),
+    not routine noise. Returns True if everything's within tolerance."""
+    baseline = json.loads(baseline_path.read_text())
+    ok = True
+    for kind in ("drawing", "mesh"):
+        baseline_by_n = {row["n"]: row for row in baseline[kind]}
+        for row in results[kind]:
+            base_row = baseline_by_n.get(row["n"])
+            if base_row is None:
+                continue
+            for key in _TIMING_KEYS:
+                limit = base_row[key] * tolerance
+                if row[key] > limit:
+                    ok = False
+                    print(
+                        f"REGRESSION: {kind} n={row['n']} {key}={row[key]:.1f}ms "
+                        f"> baseline {base_row[key]:.1f}ms x{tolerance} = {limit:.1f}ms"
+                    )
+    return ok
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="print results as JSON instead of a table")
+    parser.add_argument(
+        "--check-baseline",
+        type=Path,
+        default=None,
+        help="compare against a baseline JSON file (e.g. docs/perf_baseline.json) and exit 1 on regression",
+    )
+    parser.add_argument("--tolerance", type=float, default=3.0, help="allowed multiple of the baseline before failing")
+    parser.add_argument("--write-baseline", type=Path, default=None, help="write results as a new baseline JSON file")
+    args = parser.parse_args()
+
     with tempfile.TemporaryDirectory() as tmp:
-        tmpdir = Path(tmp)
+        results = _run_all(Path(tmp))
 
-        drawing_rows = [
-            _bench(
-                _build_drawing,
-                lambda d: d.to_bytes(),
-                lambda data: DrawingDocument.from_bytes(LamportClock(actor="bench2"), data),
-                lambda d: d.to_dict(),
-                n,
-                "drawing",
-                tmpdir,
-            )
-            for n in PATH_COUNTS
-        ]
-        _print_table("2D drawing documents, by path count", drawing_rows)
+    if args.write_baseline:
+        args.write_baseline.write_text(json.dumps(results, indent=2) + "\n")
+        print(f"wrote baseline to {args.write_baseline}")
+        return
 
-        mesh_rows = [
-            _bench(
-                _build_mesh,
-                lambda d: d.to_bytes(),
-                lambda data: MeshCRDT.from_bytes(LamportClock(actor="bench2"), data),
-                lambda d: d.to_dict(),
-                n,
-                "mesh",
-                tmpdir,
-            )
-            for n in FACE_COUNTS
-        ]
-        _print_table("3D mesh documents, by face count", mesh_rows)
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        _print_table("2D drawing documents, by path count", results["drawing"])
+        _print_table("3D mesh documents, by face count", results["mesh"])
+
+    if args.check_baseline:
+        if not _check_baseline(results, args.check_baseline, args.tolerance):
+            sys.exit(1)
+        print(f"\nAll metrics within {args.tolerance}x of baseline ({args.check_baseline}).")
 
 
 if __name__ == "__main__":
