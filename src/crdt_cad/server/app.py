@@ -2689,34 +2689,45 @@ async def ws_mesh_endpoint(websocket: WebSocket, room_id: str) -> None:
 
 
 def _validate_op(room: Room, op) -> Optional[str]:
-    """Pre-commit geometry validity **gate** for 2D path point inserts --
-    the only place an op can be refused before it's ever applied.
+    """Pre-commit **gate** for ops that can still be safely refused before
+    they're ever applied: 2D path point inserts (geometry validity) and,
+    since Part 7 C8, a genuinely new path/face pushing a room over its
+    configured size budget.
 
     Returns a rejection reason string if ``op`` should be refused, else
-    None. Only ``path_geom`` inserts on drawing rooms are gated. Mesh
-    rooms have no equivalent pre-commit gate -- a CRDT merge can't be
-    rejected without breaking convergence, which is exactly why mesh
-    cross-component consistency (manifoldness, winding, degenerate
-    faces) is instead checked *after* merging and surfaced as a
-    `validity_warning` (see `_check_and_broadcast_mesh_validity` and
-    `crdt_cad.geometry.mesh_validity`), not enforced here. Zero-length
+    None. Everything here only fires on ops a client is *submitting for
+    the first time* -- never on an already-applied remote op arriving via
+    merge, which can't be rejected without breaking convergence (the same
+    reasoning `_check_and_broadcast_mesh_validity`'s docstring gives for
+    why mesh cross-component consistency is instead checked *after*
+    merging and surfaced as a warning, not enforced here). Zero-length
     segments are always rejected; self-intersection is only enforced for
     paths created with the strict "Polygon" tool (freehand pen strokes
     crossing themselves is normal and shouldn't be blocked).
     """
-    if room.kind != "drawing" or not isinstance(op, DocOp):
-        return None
-    if op.target != "path_geom" or op.payload.get("t") != "ins":
+    if room.kind == "drawing" and isinstance(op, DocOp):
+        if op.target == "path_index" and not op.payload.get("d"):
+            max_paths = security.max_paths_per_room()
+            if max_paths and op.payload.get("k") not in room.doc.path_index and len(room.doc.path_index) >= max_paths:
+                return f"room already has the maximum of {max_paths} paths -- delete some before adding more"
+            return None
+        if op.target != "path_geom" or op.payload.get("t") != "ins":
+            return None
+        path_id = op.scope
+        assert path_id is not None
+        existing_points = room.doc.path_points(path_id)
+        strict = bool(room.doc.path_props_dict(path_id).get("strict"))
+        try:
+            validate_new_point(existing_points, tuple(op.payload["v"]), check_self_intersection=strict)
+        except GeometryError as exc:
+            return str(exc)
         return None
 
-    path_id = op.scope
-    assert path_id is not None
-    existing_points = room.doc.path_points(path_id)
-    strict = bool(room.doc.path_props_dict(path_id).get("strict"))
-    try:
-        validate_new_point(existing_points, tuple(op.payload["v"]), check_self_intersection=strict)
-    except GeometryError as exc:
-        return str(exc)
+    if room.kind == "mesh" and isinstance(op, MeshOp) and op.target == "face_index" and not op.payload.get("d"):
+        max_faces = security.max_faces_per_room()
+        if max_faces and op.payload.get("k") not in room.doc.face_index and len(room.doc.face_index) >= max_faces:
+            return f"room already has the maximum of {max_faces} faces -- delete some before adding more"
+
     return None
 
 

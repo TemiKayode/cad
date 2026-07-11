@@ -120,6 +120,8 @@ deployment. Reports are reviewed and resolved from the `/admin` panel
 | `CRDT_CAD_MAX_WS_MESSAGE_BYTES` | `2000000` (2MB) | Max raw WebSocket frame size before the connection is closed (`WS_CLOSE_MESSAGE_TOO_LARGE`). |
 | `CRDT_CAD_MAX_ROOMS_PER_SERVER` | `500` | Max distinct rooms one process will create; further `get_or_create` calls raise `RoomLimitExceeded`. |
 | `CRDT_CAD_MAX_CLIENTS_PER_ROOM` | `50` | Max simultaneous WebSocket connections in one room (`WS_CLOSE_TOO_MANY_CLIENTS` beyond this). |
+| `CRDT_CAD_MAX_PATHS_PER_ROOM` | `0` (unlimited) | Soft ceiling on a drawing room's live path count -- a genuinely *new* path is rejected once reached (existing paths and edits to them are unaffected; deleting one frees the slot). Never rejects an already-merged remote op, only a client's own new submission. |
+| `CRDT_CAD_MAX_FACES_PER_ROOM` | `0` (unlimited) | The mesh-room equivalent of `CRDT_CAD_MAX_PATHS_PER_ROOM`, gating new faces the same way. |
 | `CRDT_CAD_GENERATE_PER_MINUTE` | `6` | Per-client-IP steady rate for `/api/mesh/{room}/generate` (AI mesh generation -- real LLM spend/CPU cost per call). |
 | `CRDT_CAD_GENERATE_BURST` | `3` | Per-client-IP burst capacity for the same limiter. |
 | `CRDT_CAD_GENERATION_TIMEOUT_SECONDS` | `60` | Max time a single AI generation call may run before the request fails with 504. |

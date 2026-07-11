@@ -295,6 +295,26 @@ def max_versions_per_room() -> int:
     return int(os.environ.get("CRDT_CAD_MAX_VERSIONS_PER_ROOM", "20"))
 
 
+def max_paths_per_room() -> int:
+    """Part 7 C8 (large-doc budgets): soft ceiling on a drawing room's
+    *live* path count, `0` (the default) meaning unlimited -- same
+    convention as the quota functions in `auth.py`. Enforced in
+    `app.py`'s `_validate_op`, the one existing pre-commit gate: a
+    genuinely new path is refused (never a merge of an already-applied
+    remote op, which can't be rejected without breaking convergence,
+    same reasoning `_validate_op`'s own docstring already gives for why
+    mesh rooms have no pre-commit gate at all). Deleting paths already
+    over budget always still works -- this bounds further *growth*, it
+    is not retroactive."""
+    return int(os.environ.get("CRDT_CAD_MAX_PATHS_PER_ROOM", "0"))
+
+
+def max_faces_per_room() -> int:
+    """Part 7 C8: the mesh-room equivalent of `max_paths_per_room`,
+    gating new `face_index` adds the same way."""
+    return int(os.environ.get("CRDT_CAD_MAX_FACES_PER_ROOM", "0"))
+
+
 class RoomLimitExceeded(Exception):
     """Raised by ``RoomManager.get_or_create`` when creating a brand new
     room would exceed :func:`max_rooms_per_server`. Never raised for an

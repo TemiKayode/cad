@@ -12,7 +12,8 @@ from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from crdt_cad.crdt.clock import LamportClock
-from crdt_cad.crdt.document import DrawingDocument
+from crdt_cad.crdt.document import DocOp, DrawingDocument, new_id as doc_new_id
+from crdt_cad.crdt.mesh import MeshCRDT, MeshOp, new_id as mesh_new_id
 from crdt_cad.server import app as app_module
 from crdt_cad.server import security
 from crdt_cad.server.app import app
@@ -20,6 +21,20 @@ from crdt_cad.server.app import app
 
 def _client() -> TestClient:
     return TestClient(app)
+
+
+def _new_path_index_op(actor="path-budget-actor") -> dict:
+    """A single real `path_index` add op for a fresh path id -- cheap to
+    mint repeatedly for the document-size-budget tests below, mirroring
+    `_one_layer_op`'s reasoning for why a hand-rolled fake payload isn't
+    used instead."""
+    doc = DrawingDocument(LamportClock(actor=actor))
+    return DocOp("path_index", doc.path_index.add(doc_new_id("path")).to_dict()).to_dict()
+
+
+def _new_face_index_op(actor="face-budget-actor") -> dict:
+    mesh = MeshCRDT(LamportClock(actor=actor))
+    return MeshOp("face_index", mesh.face_index.add(mesh_new_id("face")).to_dict()).to_dict()
 
 
 def _one_layer_op() -> dict:
@@ -385,6 +400,70 @@ def test_ws_max_rooms_per_server(monkeypatch):
             with client.websocket_connect("/ws/anotherroom") as ws2:
                 ws2.receive_json()
         assert exc_info.value.code == app_module.WS_CLOSE_SERVER_AT_CAPACITY
+
+
+def test_default_room_size_budgets_are_unlimited():
+    assert security.max_paths_per_room() == 0
+    assert security.max_faces_per_room() == 0
+
+
+def test_ws_rejects_new_path_over_the_configured_budget(monkeypatch):
+    monkeypatch.setenv("CRDT_CAD_MAX_PATHS_PER_ROOM", "2")
+    client = _client()
+    with client.websocket_connect("/ws/pathbudgetroom") as ws:
+        _hello(ws)
+        ws.receive_json()  # snapshot
+
+        ws.send_json({"type": "ops", "ops": [_new_path_index_op(), _new_path_index_op()]})
+
+        ws.send_json({"type": "ops", "ops": [_new_path_index_op()]})
+        reply = ws.receive_json()
+        assert reply["type"] == "rejected"
+        assert "maximum of 2 paths" in reply["reason"]
+
+
+def test_ws_new_path_budget_allows_growth_again_after_a_delete(monkeypatch):
+    monkeypatch.setenv("CRDT_CAD_MAX_PATHS_PER_ROOM", "1")
+    client = _client()
+    doc = DrawingDocument(LamportClock(actor="path-budget-actor"))
+    layer_id, layer_ops = doc.add_layer("L")
+    path_id, path_ops = doc.add_path(layer_id, [(0.0, 0.0), (1.0, 1.0)])
+
+    with client.websocket_connect("/ws/pathbudgetroom2") as ws:
+        _hello(ws)
+        ws.receive_json()  # snapshot
+
+        ws.send_json({"type": "ops", "ops": [op.to_dict() for op in [*layer_ops, *path_ops]]})
+
+        ws.send_json({"type": "ops", "ops": [_new_path_index_op()]})
+        reply = ws.receive_json()
+        assert reply["type"] == "rejected"
+
+        # deleting the one live path frees the slot back up -- the room's
+        # own geometry is never purged retroactively, but growth resumes.
+        ws.send_json({"type": "ops", "ops": [doc.remove_path(path_id).to_dict()]})
+        ws.send_json({"type": "ops", "ops": [_new_path_index_op()]})
+
+        # accepted -- confirm the connection is still healthy, not stuck
+        # rejecting everything after the earlier rejection.
+        ws.send_json({"type": "save"})
+        saved = ws.receive_json()
+        assert saved["type"] == "saved"
+
+
+def test_ws_rejects_new_face_over_the_configured_budget(monkeypatch):
+    monkeypatch.setenv("CRDT_CAD_MAX_FACES_PER_ROOM", "1")
+    client = _client()
+    with client.websocket_connect("/ws/mesh/facebudgetroom") as ws:
+        _hello(ws)
+        ws.receive_json()  # snapshot
+
+        ws.send_json({"type": "ops", "ops": [_new_face_index_op()]})
+
+        ws.send_json({"type": "ops", "ops": [_new_face_index_op()]})
+        reply = ws.receive_json()
+        assert reply["type"] == "rejected"
+        assert "maximum of 1 faces" in reply["reason"]
 
 
 def test_generate_endpoint_per_ip_rate_limit(monkeypatch):

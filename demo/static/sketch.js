@@ -4205,9 +4205,22 @@ function render() {
   ctx.translate(view.panX, view.panY);
   ctx.scale(view.zoom, view.zoom);
 
+  // Part 7 C8 (large-doc LOD): a document with thousands of paths would
+  // otherwise re-walk every path's full geometry every frame even when
+  // almost none of them are on screen -- `render()` had no culling at
+  // all before this. A 100px screen-space margin (converted to world
+  // units via the same screenToWorld already used for pan/zoom math)
+  // covers stroke width and selection/hover halos so nothing visibly
+  // on-screen pops away right at the edge.
+  const [cullMinX, cullMinY] = screenToWorld(-100, -100);
+  const [cullMaxX, cullMaxY] = screenToWorld(rect.width + 100, rect.height + 100);
+  const viewportWorldBounds = { minX: cullMinX, minY: cullMinY, maxX: cullMaxX, maxY: cullMaxY };
+
   for (const pathId of zOrderedPathIds()) {
     const props = state.pathProps.get(pathId) || {};
     if (ui.hiddenLayers.has(props.layer_id)) continue;
+    const bounds = pathWorldBounds(pathId, props);
+    if (bounds && !rectsIntersect(bounds, viewportWorldBounds)) continue;
     if (props.shape === "instance") {
       // Part 7 C5: resolved to already-final world coordinates (see
       // resolveInstanceGeometry) -- drawn directly, with no

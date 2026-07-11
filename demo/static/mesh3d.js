@@ -1617,6 +1617,17 @@ let pendingLoopLine = null;
 const vertexMeshes = new Map();
 const edgeLines = new Map();
 const faceMeshes = new Map();
+
+// Part 7 C8 (large-doc LOD): edge lines are pure visual overlay --
+// unlike vertex marker meshes (raycast-picked for building/dragging a
+// face, see selectVertex/dragState below) or face meshes themselves
+// (the actual visible surface), nothing ever raycasts against
+// `edgeLines`, so they're the one helper safe to drop wholesale on a
+// large scene without taking away any editing capability. Past this
+// many live faces, syncScene() stops creating/updating them (and tears
+// down any that already exist) -- roughly halves total scene object
+// count on a big mesh, since edge count runs close to 1.5x face count.
+const LOD_HIDE_EDGES_FACE_THRESHOLD = 300;
 const invalidFaceOutlines = new Map();
 
 const FACE_PALETTE = [0x4dabf7, 0x69db7c, 0xffd43b, 0xda77f2, 0xff922b, 0x38d9a9, 0xf783ac];
@@ -1688,20 +1699,25 @@ function syncScene() {
     mesh.material.color.set(vertexColor(id));
   }
 
-  for (const [key, line] of [...edgeLines]) {
-    if (!state.edges.has(key)) { scene.remove(line); edgeLines.delete(key); }
-  }
-  for (const key of state.edges) {
-    const [a, b] = decodeEdge(key);
-    const pa = state.vertices.get(a), pb = state.vertices.get(b);
-    if (!pa || !pb) continue;
-    let line = edgeLines.get(key);
-    if (!line) {
-      line = new THREE.Line(new THREE.BufferGeometry(), edgeMat);
-      scene.add(line);
-      edgeLines.set(key, line);
+  if (state.faceIndex.size > LOD_HIDE_EDGES_FACE_THRESHOLD) {
+    for (const [, line] of [...edgeLines]) scene.remove(line);
+    edgeLines.clear();
+  } else {
+    for (const [key, line] of [...edgeLines]) {
+      if (!state.edges.has(key)) { scene.remove(line); edgeLines.delete(key); }
     }
-    line.geometry.setFromPoints([new THREE.Vector3(...pa), new THREE.Vector3(...pb)]);
+    for (const key of state.edges) {
+      const [a, b] = decodeEdge(key);
+      const pa = state.vertices.get(a), pb = state.vertices.get(b);
+      if (!pa || !pb) continue;
+      let line = edgeLines.get(key);
+      if (!line) {
+        line = new THREE.Line(new THREE.BufferGeometry(), edgeMat);
+        scene.add(line);
+        edgeLines.set(key, line);
+      }
+      line.geometry.setFromPoints([new THREE.Vector3(...pa), new THREE.Vector3(...pb)]);
+    }
   }
 
   for (const [id, mesh] of [...faceMeshes]) {
