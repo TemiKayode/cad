@@ -1,0 +1,39 @@
+# Continuous deployment to Fly.io (see fly.toml + docs/deployment.md's
+# "Fly.io" section for the one-time manual setup this depends on).
+#
+# Triggered by CI succeeding on main, not by the push itself -- broken
+# code should never reach the live app just because it merged. Uses
+# `workflow_run` (not `needs:`) since CI lives in its own workflow file.
+#
+# One-time setup this workflow assumes is already done (needs real Fly
+# credentials, which aren't available in this environment -- see the
+# repo's own "Honesty note" in docs/deployment.md):
+#   fly secrets set CRDT_CAD_SECRET=<a long random string>
+#   fly volumes create crdt_cad_data --size 1 --region iad
+#   fly tokens create deploy -x 999999h     # then add the output as the
+#                                            # FLY_API_TOKEN repo secret
+#                                            # (Settings > Secrets and
+#                                            # variables > Actions)
+name: Deploy to Fly.io
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch: # manual re-deploy with no new commit
+
+jobs:
+  deploy:
+    name: fly deploy
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    concurrency:
+      group: fly-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
