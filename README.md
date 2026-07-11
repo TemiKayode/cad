@@ -33,7 +33,7 @@ A real-time, browser-based collaborative CAD engine whose geometric data is repr
 python -m venv .venv
 ./.venv/Scripts/pip install -e ".[dev]"      # Windows; use .venv/bin/pip on macOS/Linux
 
-./.venv/Scripts/python -m pytest tests/ -v   # 785 tests
+./.venv/Scripts/python -m pytest tests/ -v   # 788 tests
 
 ./.venv/Scripts/python -m uvicorn crdt_cad.server.app:app --reload
 ```
@@ -108,7 +108,7 @@ For real horizontal scale, `PostgresStore` (via `asyncpg`) and Redis pub/sub fan
 ## Import / export
 
 - **SVG**: export always; import handles lines, polylines, polygons, and paths including quadratic/cubic Bezier curves (`C`/`S`/`Q`/`T`, with correct smooth-reflection handling for the `S`/`T` variants real design tools export).
-- **DXF**: export/import via `ezdxf` — `LWPOLYLINE`/`LINE`/`POLYLINE`, with curve segments flattened to a dense sampled polyline on export.
+- **DXF**: export/import via `ezdxf` — shape primitives export as native `LINE`/`LWPOLYLINE`/`CIRCLE`/`ARC`/`ELLIPSE`/`TEXT` entities, and freehand/polygon path curve segments export as genuine `SPLINE` entities (a quadratic segment is degree-elevated to an exactly-equivalent cubic first) rather than a flattened polyline. Import reads `LWPOLYLINE`/`LINE`/`POLYLINE` back as their literal points and samples `CIRCLE`/`ARC`/`ELLIPSE`/`SPLINE` into point lists.
 - **STL**: ASCII export for the 3D mesh.
 - **STEP**: real `AP214` export via `build123d`, turning each mesh face into a planar `Face` and emitting a proper `MANIFOLD_SOLID_BREP` when the mesh closes into one watertight solid.
 
@@ -183,7 +183,7 @@ Both demos share a hand-written design token system (color for dark and light th
 ./.venv/Scripts/python -m pytest tests/ -v
 ```
 
-**785 non-browser tests**: unit tests for every CRDT type and geometry module, serialization round-trips, a full-mesh merge-convergence test for RGA, a Hypothesis property test fuzzing random concurrent insert/delete programs across three replicas, import/export round-trips for every supported format, the constraint solver's independent correctness checks, the offset tool's shapely-backed geometry (including the concave-corner case a naive implementation gets wrong), persistence save/load/restart-hydration, WebSocket protocol tests covering the relay, reconnect-with-delta, the validity gate, and the WebRTC signaling relay's targeted delivery, the full AI generation pipeline (heuristic and mocked-LLM interpretation, every generator's geometry invariants, the DSL's validation/repair/fallback loop, the 66-case eval harness), security hardening (every auth gate, every rate limit and resource ceiling actually tripping), account/permission/organization storage and REST/WS enforcement, SSO domain capture, disabled-account gating, per-user quotas, the admin panel's own access control, 3D comments and @mention notification eligibility, Stripe billing's webhook-driven plan sync and free-plan seat cap (mocked at the Stripe client boundary), GDPR export/account-deletion cascades and abuse-report moderation, and Postgres/Redis integration tests that skip cleanly when neither is reachable.
+**788 non-browser tests**: unit tests for every CRDT type and geometry module, serialization round-trips, a full-mesh merge-convergence test for RGA, a Hypothesis property test fuzzing random concurrent insert/delete programs across three replicas, import/export round-trips for every supported format (including DXF curve segments round-tripping through genuine SPLINE entities, not flattened polylines), the constraint solver's independent correctness checks, the offset tool's shapely-backed geometry (including the concave-corner case a naive implementation gets wrong), persistence save/load/restart-hydration, WebSocket protocol tests covering the relay, reconnect-with-delta, the validity gate, and the WebRTC signaling relay's targeted delivery, the full AI generation pipeline (heuristic and mocked-LLM interpretation, every generator's geometry invariants, the DSL's validation/repair/fallback loop, the 66-case eval harness), security hardening (every auth gate, every rate limit and resource ceiling actually tripping), account/permission/organization storage and REST/WS enforcement, SSO domain capture, disabled-account gating, per-user quotas, the admin panel's own access control, 3D comments and @mention notification eligibility, Stripe billing's webhook-driven plan sync and free-plan seat cap (mocked at the Stripe client boundary), GDPR export/account-deletion cascades and abuse-report moderation, and Postgres/Redis integration tests that skip cleanly when neither is reachable.
 
 **91 browser tests** (Playwright, opt-in via `pytest -m e2e`, excluded from the default run so a fresh checkout without Chromium still passes): two tabs drawing concurrently and converging; the full offline → edit both sides → reconnect → Time-Travel Merge → converge sequence; a real `RTCPeerConnection` negotiating between two headless Chrome tabs; the offline outbox surviving a hard refresh; the full account sign-in, sharing, and organization flow end to end with multiple real browser contexts; and a dedicated regression test per non-trivial bug found during development. Each spins up a real `uvicorn` subprocess against its own temp SQLite file, exercising the actual client JS against the actual relay, not an in-process test double.
 

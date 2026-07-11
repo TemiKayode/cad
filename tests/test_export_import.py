@@ -249,12 +249,12 @@ def test_dxf_roundtrip_multiple_paths():
     assert len(imported) == 2
 
 
-def test_dxf_export_flattens_curve_segments_into_a_denser_polyline():
-    """DXF's LWPOLYLINE has no Bezier concept -- a curve segment gets
-    sampled into 12 intermediate points (see flatten_path_to_polyline)
-    rather than being reduced to a straight line between its two
-    anchors, which would look visibly wrong for anything but a very
-    gentle curve."""
+def test_dxf_export_writes_curve_segments_as_native_spline_entities():
+    """A curve segment (Phase 8) becomes a genuine DXF `SPLINE` entity
+    (Part 7 C2), not a flattened `LWPOLYLINE` -- exactly reproducing the
+    source quadratic Bezier via degree elevation to a cubic (see
+    `_add_curve_spline` and the module docstring), rather than merely
+    approximating it with sampled points."""
     original = [
         {
             "points": [(0.0, 0.0), (10.0, 0.0)],
@@ -263,14 +263,103 @@ def test_dxf_export_flattens_curve_segments_into_a_denser_polyline():
         }
     ]
     data = drawing_to_dxf_bytes(original)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    msp = doc.modelspace()
+    splines = [e for e in msp if e.dxftype() == "SPLINE"]
+    assert len(splines) == 1
+    spline = splines[0]
+    assert spline.dxf.degree == 3
+    # the quadratic (0,0)-(5,10)-(10,0) degree-elevates to an exact cubic
+    # whose two interior control points sit 2/3 of the way from each
+    # anchor to the original quadratic control point.
+    cps = list(spline.control_points)
+    assert len(cps) == 4
+    assert cps[0][0] == pytest.approx(0.0) and cps[0][1] == pytest.approx(0.0)
+    assert cps[1][0] == pytest.approx(10.0 / 3) and cps[1][1] == pytest.approx(20.0 / 3)
+    assert cps[2][0] == pytest.approx(20.0 / 3) and cps[2][1] == pytest.approx(20.0 / 3)
+    assert cps[3][0] == pytest.approx(10.0) and cps[3][1] == pytest.approx(0.0)
+
     imported = drawing_from_dxf_bytes(data)
     assert len(imported) == 1
-    assert len(imported[0]) == 13  # 1 start anchor + 12 sampled points
-    # the midpoint of a quadratic through (0,0)-(5,10)-(10,0) bulges well
-    # above a straight line's y=0 -- confirms real sampling happened, not
-    # just a pass-through of the two anchors.
-    mid = imported[0][6]
-    assert mid[1] > 3.0
+    # flattening the SPLINE back on import still bulges well above a
+    # straight line's y=0 -- confirms the reload path samples the real
+    # curve, not just the two anchors.
+    assert max(y for _, y in imported[0]) > 3.0
+    assert imported[0][0] == pytest.approx((0.0, 0.0))
+    assert imported[0][-1] == pytest.approx((10.0, 0.0))
+
+
+def test_dxf_export_keeps_straight_runs_as_one_polyline_around_a_curve():
+    """A path with straight segments on either side of one curve segment
+    emits two `LWPOLYLINE` runs plus a `SPLINE` in between, rather than
+    exploding every straight segment into its own entity."""
+    original = [
+        {
+            "points": [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0)],
+            "point_ids": ["n0", "n1", "n2", "n3"],
+            "curve:n2": {"kind": "quad", "c": (15.0, 10.0)},
+        }
+    ]
+    data = drawing_to_dxf_bytes(original)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    msp = doc.modelspace()
+    kinds = [e.dxftype() for e in msp]
+    assert kinds.count("SPLINE") == 1
+    assert kinds.count("LWPOLYLINE") == 2
+
+
+def test_dxf_export_cubic_curve_segment_round_trips_exactly():
+    """A cubic curve segment needs no degree elevation -- its own two
+    control points map straight onto the SPLINE's interior controls."""
+    original = [
+        {
+            "points": [(0.0, 0.0), (10.0, 0.0)],
+            "point_ids": ["n0", "n1"],
+            "curve:n1": {"kind": "cubic", "c1": (2.0, 8.0), "c2": (8.0, 8.0)},
+        }
+    ]
+    data = drawing_to_dxf_bytes(original)
+    doc = ezdxf.read(io.StringIO(data.decode("utf-8")))
+    msp = doc.modelspace()
+    spline = next(e for e in msp if e.dxftype() == "SPLINE")
+    cps = list(spline.control_points)
+    assert len(cps) == 4
+    assert cps[1][0] == pytest.approx(2.0) and cps[1][1] == pytest.approx(8.0)
+    assert cps[2][0] == pytest.approx(8.0) and cps[2][1] == pytest.approx(8.0)
+
+
+def test_dxf_import_samples_circle_arc_ellipse_and_spline_entities():
+    """`CIRCLE`/`ARC`/`ELLIPSE`/`SPLINE` entities are no longer silently
+    dropped on import (Part 7 C2) -- each comes back as a sampled point
+    list."""
+    doc = ezdxf.new(setup=True)
+    msp = doc.modelspace()
+    msp.add_circle((0, 0), 5)
+    msp.add_arc((0, 0), 5, start_angle=0, end_angle=90)
+    msp.add_ellipse((0, 0), major_axis=(5, 0, 0), ratio=0.5)
+    msp.add_spline([(0, 0), (5, 10), (10, 0)])
+    buf = io.StringIO()
+    doc.write(buf)
+    data = buf.getvalue().encode("utf-8")
+
+    imported = drawing_from_dxf_bytes(data)
+    assert len(imported) == 4
+    circle, arc, ellipse, spline = imported
+
+    assert len(circle) == 64
+    assert all(abs((x**2 + y**2) ** 0.5 - 5) < 1e-6 for x, y in circle)
+
+    assert len(arc) >= 9
+    assert arc[0] == pytest.approx((5.0, 0.0), abs=1e-6)
+    assert arc[-1] == pytest.approx((0.0, 5.0), abs=1e-6)
+
+    assert ellipse[0] == pytest.approx((5.0, 0.0), abs=1e-6)
+    assert ellipse[len(ellipse) // 2] == pytest.approx((-5.0, 0.0), abs=1e-6)
+    assert max(abs(y) for _, y in ellipse) == pytest.approx(2.5, abs=1e-6)
+
+    assert len(spline) > 2
+    assert spline[0] == pytest.approx((0.0, 0.0), abs=1e-6)
+    assert spline[-1] == pytest.approx((10.0, 0.0), abs=1e-6)
 
 
 def test_dxf_export_shape_primitives_as_native_entities():

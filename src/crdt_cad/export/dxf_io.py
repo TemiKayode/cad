@@ -6,20 +6,40 @@ matching native DXF entity instead (``LINE``, a closed ``LWPOLYLINE``
 for a rectangle, ``CIRCLE``, ``ELLIPSE``, ``ARC``), so the exported file
 is a faithful, editable shape in any real CAD tool rather than always a
 flattened polyline. Import reads ``LWPOLYLINE``, ``LINE``, and legacy
-``POLYLINE`` entities back into plain point lists (shape primitives do
-not currently round-trip back into ``props["shape"]`` on import -- see
-the module's Phase 11 note below).
+``POLYLINE`` entities back into plain point lists; ``CIRCLE``, ``ARC``,
+``ELLIPSE``, and ``SPLINE`` entities (Part 7 C2 -- entity kinds this
+module's own export now writes, and any real CAD tool's export commonly
+contains) are sampled into plain point lists too rather than silently
+dropped, using ``.vertices()`` at fixed angle/param steps for the first
+three (degrees for ``CIRCLE``/``ARC``, radians for ``ELLIPSE`` -- an
+``ezdxf`` API asymmetry worth noting) and ``.flattening()`` for
+``SPLINE``. None of these four round-trip back into ``props["shape"]``
+or a curve ``path_prop`` on import (see the module's Phase 11 and Part 7
+C2 notes below) -- they come back as plain geometry, editable but no
+longer tagged as the shape/curve kind they started as.
 
-``LWPOLYLINE`` has no Bezier concept, so a freehand/polygon path's curve
-segments (Phase 8; see ``crdt_cad.crdt.document``'s module docstring)
-are flattened into a dense sampled polyline via
-``flatten_path_to_polyline`` before export -- an approximation, not a
-re-derivation of true curve geometry, but a faithful-looking one at 12
-samples per segment. DXF import does not reconstruct curves from the
-flattened result (there's no marker in the DXF distinguishing "this was
-originally a curve" from "this was always a polyline") -- reimporting a
-DXF this project exported gets back a denser polyline, not the original
-Bezier.
+A freehand/polygon path's curve segments (Phase 8; see
+``crdt_cad.crdt.document``'s module docstring) export as genuine DXF
+``SPLINE`` entities (Part 7 C2), not a flattened polyline approximation
+-- a run of consecutive straight segments becomes one ``LWPOLYLINE``,
+and each curve segment its own ``SPLINE``, interleaved in the path's
+own point order. A quadratic ("quad") segment is degree-elevated to an
+equivalent cubic first (``ezdxf.math.quadratic_to_cubic_bezier`` --
+exactly reproduces the original curve, not an approximation of it),
+since DXF splines are conventionally cubic; either kind then converts
+via ``ezdxf.math.bezier_to_bspline`` into a clamped B-spline with the
+same control points and a Bezier-style knot vector
+(``[0,0,0,0,1,1,1,1]``) -- confirmed to reproduce the original Bezier
+exactly (not just visually close), by actually building a spline this
+way, writing it, reloading it, and sampling the reloaded curve's
+midpoint against the source Bezier's own midpoint. DXF import does not
+reconstruct a path's curve segments from a ``SPLINE`` entity it reads
+(round-tripping a spline back into this project's own Bezier
+``path_prop`` representation is a further step this phase doesn't
+take) -- a ``SPLINE`` entity in an imported file is sampled into plain
+points instead, the same "flatten what we can't natively represent"
+choice this project already makes elsewhere (HATCH boundaries,
+Measure's Area mode).
 
 Document units (Phase 11) scale every exported coordinate by
 ``1/px_per_unit(units)`` and set the ``$INSUNITS`` header variable
@@ -69,8 +89,9 @@ import io
 import math
 
 import ezdxf
+import ezdxf.math as ezmath
 
-from crdt_cad.crdt.document import flatten_path_to_polyline, px_per_unit
+from crdt_cad.crdt.document import curve_prop_key, flatten_path_to_polyline, px_per_unit
 
 Point = tuple[float, float]
 
@@ -166,6 +187,62 @@ def _add_dimension_entity(msp, dim: dict, scale: float) -> bool:
     return True
 
 
+def _add_curve_spline(msp, p0: Point, seg: dict, p1: Point, dxfattribs: dict) -> None:
+    """Adds one curve segment (Phase 8's `{"kind": "cubic"|"quad", ...}`
+    payload -- see this module's docstring) as a genuine DXF `SPLINE`
+    entity, exactly reproducing the source Bezier (not approximating
+    it): a quadratic segment is degree-elevated to an equivalent cubic
+    first, then converted to a clamped B-spline via
+    `ezdxf.math.bezier_to_bspline` -- see the module docstring for how
+    this was confirmed exact, not just visually close."""
+    if seg["kind"] == "cubic":
+        bezier = ezmath.Bezier4P([ezmath.Vec2(*p0), ezmath.Vec2(*seg["c1"]), ezmath.Vec2(*seg["c2"]), ezmath.Vec2(*p1)])
+    else:
+        quad = ezmath.Bezier3P([ezmath.Vec2(*p0), ezmath.Vec2(*seg["c"]), ezmath.Vec2(*p1)])
+        bezier = ezmath.quadratic_to_cubic_bezier(quad)
+    bspline = ezmath.bezier_to_bspline([bezier])
+    spline = msp.add_spline(dxfattribs=dxfattribs)
+    spline.dxf.degree = bspline.degree
+    spline.control_points = list(bspline.control_points)
+    spline.knots = list(bspline.knots())
+
+
+def _add_path_stroke_entities(msp, points: list[Point], point_ids: list, props: dict, scale: float, dxfattribs: dict) -> None:
+    """Emits the DXF entities for one freehand/polygon path's stroke --
+    a run of consecutive straight segments becomes one `LWPOLYLINE`,
+    and each curve segment (Phase 8) its own `SPLINE` (see
+    `_add_curve_spline`), interleaved in the path's own point order.
+    Coordinates are scaled by `scale` (document units) before either
+    entity is built -- a spline's control points need the same
+    unit conversion an `LWPOLYLINE`'s vertices already get."""
+    if len(points) < 2:
+        return
+    scaled = [(p[0] * scale, p[1] * scale) for p in points]
+    pending: list[Point] = [scaled[0]]
+
+    def flush_polyline() -> None:
+        if len(pending) >= 2:
+            msp.add_lwpolyline(list(pending), dxfattribs=dxfattribs)
+        pending.clear()
+
+    for i in range(1, len(points)):
+        node_id = point_ids[i] if point_ids and i < len(point_ids) else None
+        seg = props.get(curve_prop_key(node_id)) if node_id is not None else None
+        if seg is not None and seg.get("kind") in ("cubic", "quad"):
+            flush_polyline()
+            scaled_seg = dict(seg)
+            if seg["kind"] == "cubic":
+                scaled_seg["c1"] = (seg["c1"][0] * scale, seg["c1"][1] * scale)
+                scaled_seg["c2"] = (seg["c2"][0] * scale, seg["c2"][1] * scale)
+            else:
+                scaled_seg["c"] = (seg["c"][0] * scale, seg["c"][1] * scale)
+            _add_curve_spline(msp, scaled[i - 1], scaled_seg, scaled[i], dxfattribs)
+            pending.append(scaled[i])
+        else:
+            pending.append(scaled[i])
+    flush_polyline()
+
+
 def _add_shape_entity(msp, shape: dict, scale: float) -> bool:
     """Adds the native DXF entity matching `shape["shape"]`, scaled by
     `scale`, plus a HATCH fill (if `fill` is set and the kind has a
@@ -238,9 +315,14 @@ def drawing_to_dxf_bytes(
         pts = p.get("points", [])
         if len(pts) < 2:
             continue
+        _add_path_stroke_entities(msp, pts, p.get("point_ids"), p, scale, {"layer": "0", **_dash_dxfattribs(p)})
+        # HATCH only needs an approximate boundary polygon (see the
+        # module docstring's note on HATCH/Area already flattening
+        # curves) -- unrelated to the stroke itself now being real
+        # SPLINE entities above, so this keeps using the flattened
+        # polyline purely to bound the fill.
         flattened = flatten_path_to_polyline(pts, p.get("point_ids"), p)
         scaled = [(x * scale, y * scale) for x, y in flattened]
-        msp.add_lwpolyline(scaled, dxfattribs={"layer": "0", **_dash_dxfattribs(p)})
         # A freehand/polygon path is only meaningfully fillable when
         # it's actually closed (first point == last point) -- an open
         # path has no well-defined interior to hatch.
@@ -254,6 +336,19 @@ def drawing_to_dxf_bytes(
 
 
 def drawing_from_dxf_bytes(data: bytes) -> list[list[Point]]:
+    """`LWPOLYLINE`/`LINE`/`POLYLINE` come back as their own literal
+    points. `CIRCLE`/`ARC`/`ELLIPSE`/`SPLINE` -- entity kinds this
+    project's own export now writes (Part 7 C2) and any real CAD tool's
+    export commonly contains -- are sampled into a plain point list
+    rather than silently dropped, the same "flatten what we can't
+    natively reconstruct into `props['shape']`/a curve `path_prop`"
+    choice `_shape_fill_boundary`'s own HATCH boundaries already make;
+    reconstructing a genuine shape primitive or Bezier curve from one of
+    these on import is a further round-trip step this phase doesn't
+    take (see the module docstring). Any other entity kind (`TEXT`,
+    `HATCH`, `DIMENSION`, ...) is still silently skipped, unchanged
+    from before this phase.
+    """
     text = data.decode("utf-8", errors="replace")
     doc = ezdxf.read(io.StringIO(text))
     msp = doc.modelspace()
@@ -271,4 +366,20 @@ def drawing_from_dxf_bytes(data: bytes) -> list[list[Point]]:
             )
         elif kind == "POLYLINE":
             paths.append([(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices])
+        elif kind == "CIRCLE":
+            angles = [360.0 * i / 64 for i in range(64)]
+            paths.append([(pt.x, pt.y) for pt in entity.vertices(angles)])
+        elif kind == "ARC":
+            start, end = entity.dxf.start_angle, entity.dxf.end_angle
+            sweep = (end - start) % 360 or 360.0
+            samples = max(8, round(32 * sweep / 360))
+            angles = [start + sweep * i / samples for i in range(samples + 1)]
+            paths.append([(pt.x, pt.y) for pt in entity.vertices(angles)])
+        elif kind == "ELLIPSE":
+            start, end = entity.dxf.start_param, entity.dxf.end_param
+            sweep = (end - start) % (2 * math.pi) or 2 * math.pi
+            params = [start + sweep * i / 64 for i in range(65)]
+            paths.append([(pt.x, pt.y) for pt in entity.vertices(params)])
+        elif kind == "SPLINE":
+            paths.append([(pt.x, pt.y) for pt in entity.flattening(0.1)])
     return paths
