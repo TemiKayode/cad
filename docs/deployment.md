@@ -83,14 +83,26 @@ fly volumes create crdt_cad_data --size 1 --region <your region>
 fly deploy
 ```
 
-**Honesty note:** `fly.toml` was checked for valid TOML syntax and
-cross-referenced against Fly's documented v2 machine-config schema by
-hand. `flyctl config validate` itself validates against the live Fly
-platform API, which needs an authenticated account/token -- not
-available in this environment, so this config has **not been
-live-deployed or platform-validated**. Treat it as a strong starting
-point, not a verified deployment, until someone with Fly credentials
-runs:
+**Live-deployed and verified** (2026-07-11) at `cad-hxpczw.fly.dev`:
+`fly config validate` passed against the real platform API, the app and
+its 1GB `crdt_cad_data` volume exist in the `iad` region, `CRDT_CAD_SECRET`
+is set (so the app enforces real room-token auth, not open to anyone
+with the URL), and a full end-to-end check passed against the live
+instance -- `/health` ok, a real token minted via `/api/auth/token`,
+an authenticated WebSocket handshake, an op accepted and explicitly
+saved, and a *fresh* reconnect (a new WebSocket connection, no shared
+in-memory state) still seeing that op -- proving the mounted volume's
+SQLite persistence survives across connections, not just within one.
+
+**Continuous deployment**: `.github/workflows/fly-deploy.yml` redeploys
+automatically after CI passes on `main` (via `workflow_run`, so a commit
+that fails tests never reaches the live app). Needs a `FLY_API_TOKEN`
+repository secret to actually run -- generate one with
+`fly tokens create deploy -x 999999h` and add it under Settings >
+Secrets and variables > Actions. Without that secret the workflow step
+simply fails closed (no deploy), never silently no-ops.
+
+To validate config changes against the real platform yourself:
 
 ```
 fly config validate    # checks against the real platform -- needs `fly auth login` first

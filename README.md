@@ -197,7 +197,7 @@ See **`docs/deployment.md`** for the full runbook and **`docs/configuration.md`*
 
 - **Docker**: `docker compose up --build` for local dev; `docker-compose.prod.yml` + a committed Caddyfile for a single-VPS production deployment with real HTTPS, `wss://` through the proxy, and a proxy-aware rate limiter.
 - **Kubernetes**: manifests under `k8s/`, validated on a real cluster — both the default single-replica mode and a horizontally-scaled Postgres+Redis configuration, with HPA and TLS ingress. See `k8s/README.md` before touching `replicas`.
-- **Fly.io**: a ready `fly.toml` for a single always-on machine with a volume-mounted SQLite database.
+- **Fly.io**: `fly.toml` for a single always-on machine with a volume-mounted SQLite database — live-deployed and verified (real token-authenticated WebSocket session, an op saved and confirmed durable across a fresh reconnect), with CI-gated continuous deployment on every push to `main`. See `docs/deployment.md`.
 - **Backups**: `scripts/backup_sqlite.py` (SQLite online-backup API, safe against a live writer) and documented `pg_dump`/`pg_restore` for Postgres, both with automated restore tests.
 - **Graceful shutdown**: SIGTERM persists every room with unpersisted ops before the process exits, verified against a real container stop.
 - **Monitoring**: `/metrics` is real `prometheus_client` output (connections, ops relayed, geometry rejections, merge latency, AI generation outcomes/latency), with a ready-made Grafana dashboard and alert rules.
